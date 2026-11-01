@@ -296,4 +296,58 @@ export function registerWriteDevTools(
       }
     }
   );
+
+  // ───────────────────────────── G7 create_transport(只在 dev 註冊)─────────────────────────────
+  if (cfg.safety.systemRole !== "dev") return;
+  server.registerTool(
+    "create_transport",
+    {
+      title: "建立 Transport Request",
+      description:
+        "為非本機 package 建立 workbench transport request,回傳 TR 編號,供 create_object / write_source 使用。" +
+        "$TMP 等本機 package 不需要 transport。只在 dev 系統且非唯讀時可用;package 必須符合 package 白名單。",
+      inputSchema: {
+        package_name: z.string().min(1).describe("要放物件的 package,例如 ZMY_PACKAGE"),
+        description: z.string().min(1).max(60).describe("TR 描述(60 字元內)"),
+        object_url: z
+          .string()
+          .optional()
+          .describe("選填:要記錄的物件 URI;省略時以 package 為參照"),
+      },
+    },
+    async ({ package_name, description, object_url }) =>
+      writes.run(async () => {
+        const packageName = package_name.toUpperCase();
+        const refUrl = object_url ?? packageUrl(packageName);
+        try {
+          assertPackageAllowed(cfg, packageName);
+          if (isLocalPackage(packageName)) {
+            return fail(new GuardViolationError(`package ${packageName} 是本機 package,不需要 transport。`));
+          }
+          const tr = await adt.createTransport(refUrl, description, packageName);
+          audit.log({
+            timestamp: new Date().toISOString(),
+            action: "create_transport",
+            objectUrl: refUrl,
+            objectName: packageName,
+            transport: tr,
+            summary: description,
+            success: !!tr,
+          });
+          return tr
+            ? ok(`✅ 已建立 transport request ${tr}(package ${packageName}):${description}`)
+            : fail(new Error("SAP 沒有回傳 transport 編號。"));
+        } catch (e) {
+          audit.log({
+            timestamp: new Date().toISOString(),
+            action: "create_transport",
+            objectUrl: refUrl,
+            objectName: packageName,
+            success: false,
+            error: e instanceof Error ? e.message : String(e),
+          });
+          return fail(e);
+        }
+      })
+  );
 }

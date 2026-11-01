@@ -70,6 +70,10 @@ export function translateAdtError(err: unknown): AdtErrorInfo {
         "若帳號已被鎖,請用同一 client 的管理者帳號以 SU01 解鎖。",
     };
   }
+  // 安全護欄的拒絕(白名單、唯讀、參數檢查)是本機判斷,不是 ADT 失敗,原文即是可行動的說明
+  if (err instanceof Error && err.name === "GuardViolationError") {
+    return { message: `已拒絕:${err.message}` };
+  }
   const raw = describeError(err);
   const lower = raw.toLowerCase();
 

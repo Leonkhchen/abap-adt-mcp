@@ -144,6 +144,8 @@ export interface AdtService {
   classComponents(objectUrl: string): Promise<ClassComponent>;
   /** 執行 class 的 IF_OO_ADT_CLASSRUN~MAIN,回傳 out->write 的輸出 */
   runClass(className: string): Promise<string>;
+  /** 建立 workbench transport request,回傳 TR 編號;refUrl 為相關物件(或 package)的 URI */
+  createTransport(refUrl: string, description: string, packageName: string): Promise<string>;
   /** 取得目前登入的使用者帳號 */
   username(): string;
   /** 取得系統 base URL(供診斷訊息使用) */
@@ -449,6 +451,10 @@ export class RealAdtService implements AdtService {
 
   async runClass(className: string) {
     return this.guard(() => this.client.runClass(className.toUpperCase()));
+  }
+
+  async createTransport(refUrl: string, description: string, packageName: string) {
+    return this.guard(() => this.client.createTransport(refUrl, description, packageName.toUpperCase()));
   }
 
   async createObject(o: NewObjectSpec & { transport?: string }) {

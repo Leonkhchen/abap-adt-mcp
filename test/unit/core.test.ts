@@ -79,6 +79,7 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     whereUsed: vi.fn(async () => ({ objects: [], snippets: [] })),
     findDefinition: vi.fn(async () => ({ identifier: "x", url: "", line: 0, column: 0, sourceLine: "" })),
     runClass: vi.fn(async () => ""),
+    createTransport: vi.fn(async () => ""),
     classComponents: vi.fn(async () => ({ "adtcore:name": "ZCL_X", "adtcore:type": "CLAS/OC", visibility: "public", links: [], components: [] }) as never),
     username: () => "DEVELOPER",
     baseUrl: () => "https://sap.example.com:44300",
@@ -705,6 +706,43 @@ describe("run_class", () => {
   });
 });
 
+// ───────────────────────── create_transport(G7)─────────────────────────
+
+describe("create_transport", () => {
+  const toolNames = async (cfg: ReturnType<typeof makeConfig>) => {
+    const server = new McpServer({ name: "unit", version: "0" });
+    registerTools(server, mockAdt(), cfg, new AuditLogger(""));
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverT);
+    const client = new Client({ name: "c", version: "0" });
+    await client.connect(clientT);
+    return (await client.listTools()).tools.map((t) => t.name);
+  };
+
+  it("只在 dev 且非唯讀時註冊", async () => {
+    expect(await toolNames(makeConfig())).toContain("create_transport");
+    expect(await toolNames(makeConfig({ ABAP_MCP_SYSTEM_ROLE: "qa" }))).not.toContain("create_transport");
+    expect(await toolNames(makeConfig({ ABAP_MCP_READONLY: "true" }))).not.toContain("create_transport");
+    expect(await toolNames(makeConfig({ ABAP_MCP_SYSTEM_ROLE: "prod" }))).not.toContain("create_transport");
+  });
+
+  it("以 package 為參照建立並回傳 TR 編號", async () => {
+    const adt = mockAdt({ createTransport: vi.fn(async () => "A4HK900123") });
+    const call = await connectTools(adt);
+    const r = await call("create_transport", { package_name: "zpkg", description: "demo" });
+    expect(r.text).toContain("A4HK900123");
+    expect(adt.createTransport).toHaveBeenCalledWith("/sap/bc/adt/packages/zpkg", "demo", "ZPKG");
+  });
+
+  it("本機 package 或白名單外 package → 拒絕", async () => {
+    const adt = mockAdt();
+    const call = await connectTools(adt);
+    expect((await call("create_transport", { package_name: "$TMP", description: "d" })).text).toContain("不需要 transport");
+    expect((await call("create_transport", { package_name: "SAPPKG", description: "d" })).text).toContain("package 白名單");
+    expect(adt.createTransport).not.toHaveBeenCalled();
+  });
+});
+
 // ───────────────────────── 寫入互斥(F1)─────────────────────────
 
 describe("寫入類操作依序執行", () => {
@@ -988,6 +1026,12 @@ describe("translateAdtError", () => {
     expect(info.message).toContain("ECONNREFUSED");
     expect(info.suggestion).toContain("a4h-start.bat");
     expect(JSON.stringify(info)).not.toContain("TopSecret");
+  });
+
+  it("安全護欄的拒絕不會被關鍵字誤分類(例如含 transport 字樣)", () => {
+    const info = translateAdtError(new GuardViolationError("package $TMP 是本機 package,不需要 transport。"));
+    expect(info.message).toBe("已拒絕:package $TMP 是本機 package,不需要 transport。");
+    expect(info.suggestion).toBeUndefined();
   });
 
   it("SAP 的 does not exist 訊息 → 物件不存在的建議", () => {
