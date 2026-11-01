@@ -98,6 +98,9 @@ export type AppConfig = {
   };
 };
 
+/** 允許使用 http:// 的本機主機名稱(URL.hostname 的 IPv6 會帶中括號) */
+const LOCAL_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
+
 /** 載入並驗證設定;驗證失敗時丟出含中文說明的錯誤 */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const parsed = ConfigSchema.safeParse(env);
@@ -108,6 +111,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error(`環境變數設定錯誤:\n${msgs}\n請參考 .env.example`);
   }
   const c = parsed.data;
+
+  // 安全規則:http(明文,帳密以 Basic auth 傳送)只允許連本機,其餘一律要求 https
+  const url = new URL(c.SAP_URL);
+  if (url.protocol === "http:" && !LOCAL_HOSTS.includes(url.hostname)) {
+    throw new Error(
+      `環境變數設定錯誤:\n  - SAP_URL: ${c.SAP_URL} 使用 http:// 明文連線,帳號密碼可能被竊聽。` +
+        `http:// 只允許 localhost / 127.0.0.1 / ::1(本機系統),其他主機請改用 https://(例如 https://host:44300)。`
+    );
+  }
 
   // 安全規則:prod 系統一律強制唯讀,無法以環境變數覆寫
   const effectiveReadonly = c.ABAP_MCP_SYSTEM_ROLE === "prod" ? true : c.ABAP_MCP_READONLY;

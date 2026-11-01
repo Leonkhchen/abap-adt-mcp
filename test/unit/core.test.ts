@@ -235,6 +235,19 @@ describe("loadConfig", () => {
     expect(cfg.safety.allowedPrefixes).toEqual(["Z", "Y", "$"]);
   });
 
+  it("http:// 只允許本機(C2)", () => {
+    for (const url of ["http://localhost:50000", "http://127.0.0.1:50000", "http://[::1]:50000"]) {
+      expect(makeConfig({ SAP_URL: url }).sap.url).toBe(url);
+    }
+  });
+
+  it("http:// 連遠端主機時丟出中文錯誤要求改用 https(C2)", () => {
+    for (const url of ["http://sap.example.com:8000", "http://10.0.0.5:50000", "http://localhost.evil.com"]) {
+      expect(() => makeConfig({ SAP_URL: url })).toThrow(/https/);
+    }
+    expect(() => makeConfig({ SAP_URL: "http://sap.example.com:8000" })).toThrow(/明文/);
+  });
+
   it("可自訂前綴白名單", () => {
     const cfg = makeConfig({ ABAP_MCP_ALLOWED_PREFIXES: "ZFI, ztest" });
     expect(cfg.safety.allowedPrefixes).toEqual(["ZFI", "ZTEST"]);
