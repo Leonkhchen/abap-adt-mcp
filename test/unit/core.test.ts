@@ -32,7 +32,8 @@ import { AuditLogger } from "../../src/safety/audit.js";
 import { VERSION } from "../../src/version.js";
 import { SerialQueue } from "../../src/safety/serialQueue.js";
 import { bdefCreateBody, newObjectUrl, parseValidation } from "../../src/adt/objectTypes.js";
-import { formatAtcResult, formatUnitTestResults } from "../../src/tools/formatters.js";
+import { formatAtcResult, formatUnitTestResults, formatWhereUsed } from "../../src/tools/formatters.js";
+import { parseUsageReferences, parseUsageSnippets, usageSnippetsBody } from "../../src/adt/whereUsed.js";
 import type { UnitTestClass } from "abap-adt-api";
 
 // ───────────────────────── 測試用假物件 ─────────────────────────
@@ -69,6 +70,7 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     createObject: vi.fn(async () => {}),
     runUnitTests: vi.fn(async () => []),
     runAtc: vi.fn(async () => ({ checkVariant: "V", infos: [], findings: [] })),
+    whereUsed: vi.fn(async () => ({ objects: [], snippets: [] })),
     username: () => "DEVELOPER",
     baseUrl: () => "https://sap.example.com:44300",
     ...overrides,
@@ -538,6 +540,58 @@ describe("run_atc", () => {
   });
 });
 
+// ───────────────────────── where_used(G4)─────────────────────────
+
+describe("where_used", () => {
+  const fixture = (n: string) => fs.readFileSync(path.resolve("test/unit/fixtures", n), "utf8");
+
+  it("解析 A4H 的 usageReferences(小寫 prefix),只留實際使用處", () => {
+    const objs = parseUsageReferences(fixture("where-used-refs.a4h.xml"));
+    expect(objs).toHaveLength(1);
+    expect(objs[0]).toMatchObject({
+      uri: "/sap/bc/adt/oo/classes/zcl_mcp_expg/includes/testclasses",
+      name: "Local Test Classes",
+      packageName: "$TMP",
+      usageInformation: "gradeDirect,includeTest",
+    });
+    expect(objs[0].objectIdentifier).toContain("\\TY:ZCL_MCP_EXPG\\ME:ADD");
+  });
+
+  it("解析 usageSnippets(大寫 prefix)並還原 XML entity", () => {
+    const snips = parseUsageSnippets(fixture("where-used-snippets.a4h.xml"));
+    expect(snips).toHaveLength(2);
+    expect(snips[0].uri).toBe("/sap/bc/adt/oo/classes/zcl_mcp_expg/includes/testclasses#start=9,67;end=9,70");
+    expect(snips[0].content).toBe("cl_abap_unit_assert=>assert_equals( act = NEW zcl_mcp_expg( )->add( a = 1 b = 2 ) exp = 3 ).");
+  });
+
+  it("snippet 請求帶上 objectIdentifier 並跳脫", () => {
+    expect(usageSnippetsBody(["A;\\TY:X<1>"])).toContain('<usagereferences:objectIdentifier optional="false">A;\\TY:X&lt;1&gt;</usagereferences:objectIdentifier>');
+  });
+
+  it("格式化:列出物件與行號;沒有結果時明確說明;超過上限截斷", () => {
+    const r = {
+      objects: parseUsageReferences(fixture("where-used-refs.a4h.xml")),
+      snippets: parseUsageSnippets(fixture("where-used-snippets.a4h.xml")),
+    };
+    const text = formatWhereUsed("ADD", r);
+    expect(text).toContain("共 2 處(1 個物件)");
+    expect(text).toContain("第 9 行:cl_abap_unit_assert=>");
+    expect(text).toContain("第 13 行:");
+    expect(formatWhereUsed("X", { objects: [], snippets: [] })).toContain("找不到 X 的使用處");
+    expect(formatWhereUsed("ADD", r, 1)).toContain("僅顯示前 1 筆");
+    expect(formatWhereUsed("ADD", r, 1)).not.toContain("第 13 行");
+  });
+
+  it("工具:位置轉成 source URI 與 0 起算欄位", async () => {
+    const adt = mockAdt();
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" }));
+    await call("where_used", { object_url: "/sap/bc/adt/oo/classes/zcl_x", line: 4, column: 13 });
+    expect(adt.whereUsed).toHaveBeenCalledWith("/sap/bc/adt/oo/classes/zcl_x/source/main", 4, 12);
+    await call("where_used", { object_url: "/sap/bc/adt/oo/classes/zcl_x" });
+    expect(adt.whereUsed).toHaveBeenLastCalledWith("/sap/bc/adt/oo/classes/zcl_x", undefined, undefined);
+  });
+});
+
 // ───────────────────────── 寫入互斥(F1)─────────────────────────
 
 describe("寫入類操作依序執行", () => {
@@ -821,6 +875,13 @@ describe("translateAdtError", () => {
     expect(info.message).toContain("ECONNREFUSED");
     expect(info.suggestion).toContain("a4h-start.bat");
     expect(JSON.stringify(info)).not.toContain("TopSecret");
+  });
+
+  it("5xx → 提示可能是 SAP 端逾時與縮小範圍", () => {
+    const info = translateAdtError(Object.assign(new Error("Request failed with status code 500"), { status: 500 }));
+    expect(info.message).toContain("SAP 伺服器錯誤(500)");
+    expect(info.suggestion).toContain("逾時");
+    expect(info.suggestion).toContain("where-used");
   });
 
   it("沒有任何訊息的錯誤也不會回傳空白描述", () => {

@@ -130,6 +130,15 @@ export function translateAdtError(err: unknown): AdtErrorInfo {
       suggestion: "可用 list_transports 查詢可用的 transport request,或確認物件的 package 是否需要 TR(本機物件 $TMP 不需要)。",
     };
   }
+  const status = httpStatus(err);
+  if (status !== undefined && status >= 500) {
+    return {
+      message: `SAP 伺服器錯誤(${status}):${raw}`,
+      suggestion:
+        "若等了數分鐘才出現,多半是 SAP 端處理逾時:例如 where-used 查詢整個標準物件(結果太多,請改查特定方法)、" +
+        "或系統剛啟動後第一次執行 ATC / 啟用 CDS(稍後重試通常就會成功)。其他情況可在 SAP 的 ST22 查看 dump。",
+    };
+  }
 
   return { message: `ADT 操作失敗:${raw}` };
 }

@@ -10,7 +10,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { AdtService } from "../adt/client.js";
 import { CREATABLE_TYPES, isLocalPackage, newObjectUrl, packageUrl } from "../adt/objectTypes.js";
-import { formatAtcResult, formatUnitTestResults } from "./formatters.js";
+import { formatAtcResult, formatUnitTestResults, formatWhereUsed } from "./formatters.js";
 import type { AppConfig } from "../config.js";
 import type { AuditLogger } from "../safety/audit.js";
 import { assertPackageAllowed, assertWriteAllowed, GuardViolationError } from "../safety/guards.js";
@@ -76,10 +76,47 @@ export function registerAnalysisTools(server: McpServer, adt: AdtService): void 
       }
     }
   );
+
+  // ───────────────────────────── G4 where_used ─────────────────────────────
+  server.registerTool(
+    "where_used",
+    {
+      title: "查詢使用處(where-used)",
+      description:
+        "查詢物件或其中某個元件(方法、屬性等)被哪些程式使用,回傳使用處的物件與程式碼行,最多 50 筆。" +
+        "只給 object_url 時查整個物件;要查某個方法,請另給該方法名稱所在的 line 與 column(1 起算,可先用 read_source 看行號)。" +
+        "注意:SAP 不會列出物件內部自己呼叫自己的地方;查詢廣泛使用的標準物件整體可能數分鐘後逾時,請改查特定元件。",
+      inputSchema: {
+        object_url: z.string().describe("物件 URI 或 source URI,例如 /sap/bc/adt/oo/classes/zcl_demo"),
+        ...positionSchema,
+      },
+    },
+    async ({ object_url, line, column }) => {
+      try {
+        if (column && !line) return fail(new GuardViolationError("給 column 時必須同時給 line。"));
+        let url = object_url;
+        // 指定位置時要用 source URI(位置是相對於原始碼)
+        if (line && !/\/source\/[^/]+$|\/includes\/[^/]+$/.test(url)) url = `${url.replace(/\/$/, "")}/source/main`;
+        const r = await adt.whereUsed(url, line, line ? (column ?? 1) - 1 : undefined);
+        const target = line ? `${object_url} 第 ${line} 行${column ? `第 ${column} 欄` : ""}的元件` : object_url;
+        return ok(formatWhereUsed(target, r, WHERE_USED_MAX));
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
 }
 
 /** run_atc 回傳 finding 上限 */
 const ATC_MAX_FINDINGS = 100;
+/** where_used 回傳筆數上限 */
+const WHERE_USED_MAX = 50;
+
+/** AI 給的位置(1 起算的行與欄)→ ADT 位置(行 1 起算、欄 0 起算) */
+const positionSchema = {
+  line: z.number().int().positive().optional().describe("選填:元件所在行(1 起算),例如方法定義那一行"),
+  column: z.number().int().positive().optional().describe("選填:元件名稱開頭的欄位(1 起算,同編輯器顯示);需搭配 line"),
+};
 
 /** 寫入/執行類工具(呼叫端只在非唯讀模式時呼叫) */
 export function registerWriteDevTools(

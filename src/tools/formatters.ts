@@ -3,6 +3,7 @@
  */
 import type { UnitTestAlert, UnitTestClass } from "abap-adt-api";
 import type { AtcResult } from "../adt/client.js";
+import type { UsageObject, UsageSnippet } from "../adt/whereUsed.js";
 import { objectNameFromUrl } from "../safety/guards.js";
 
 /** 測試類別名稱前加上所屬物件,例如 ZCL_DEMO / LTC_TEST(package 模式下才分得出來) */
@@ -54,6 +55,30 @@ export function formatUnitTestResults(classes: UnitTestClass[]): string {
   }
   for (const { c, m } of methods.filter(({ m }) => m.alerts.length === 0)) {
     out.push(`✅ ${testClassLabel(c)}->${m["adtcore:name"]}(${m.executionTime} ${m.unit})`);
+  }
+  return out.join("\n");
+}
+
+/** where-used 結果:依使用處物件分組列出程式碼行,最多 max 筆 */
+export function formatWhereUsed(
+  target: string,
+  r: { objects: UsageObject[]; snippets: UsageSnippet[] },
+  max = 50
+): string {
+  if (r.objects.length === 0) return `找不到 ${target} 的使用處。`;
+  const total = Math.max(r.snippets.length, r.objects.length);
+  const out = [`🔎 ${target} 的使用處:共 ${r.snippets.length} 處(${r.objects.length} 個物件)` + (total > max ? `,僅顯示前 ${max} 筆` : "")];
+  let shown = 0;
+  for (const o of r.objects) {
+    if (shown >= max) break;
+    out.push(`- ${o.name}${o.type ? ` [${o.type}]` : ""}${o.packageName ? `(package ${o.packageName})` : ""}\n  uri:${o.uri}`);
+    const snips = r.snippets.filter((s) => s.objectIdentifier === o.objectIdentifier);
+    if (snips.length === 0) shown++;
+    for (const s of snips) {
+      if (shown >= max) break;
+      out.push(`    ${describeLocation(s.uri).replace(/^.* (第 \d+ 行)$/, "$1")}:${s.content}`);
+      shown++;
+    }
   }
   return out.join("\n");
 }

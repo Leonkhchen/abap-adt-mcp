@@ -24,6 +24,14 @@ import * as https from "node:https";
 import type { AppConfig } from "../config.js";
 import { AuthCircuitOpenError, hasHttpStatus, isAuthFailure } from "./errors.js";
 import {
+  parseUsageReferences,
+  parseUsageSnippets,
+  usageReferencesBody,
+  usageSnippetsBody,
+  type UsageObject,
+  type UsageSnippet,
+} from "./whereUsed.js";
+import {
   bdefCreateBody,
   packageUrl,
   parseValidation,
@@ -94,6 +102,11 @@ export interface AdtService {
   runUnitTests(url: string): Promise<UnitTestClass[]>;
   /** 執行 ATC;checkVariant 省略時用系統預設(atcCustomizing 的 systemCheckVariant) */
   runAtc(url: string, checkVariant?: string, maxFindings?: number): Promise<AtcResult>;
+  /**
+   * where-used:url 為物件或 source URI;給 line/column0 時查該位置的元件(例如方法),
+   * column0 是 ADT 的 0 起算欄位
+   */
+  whereUsed(url: string, line?: number, column0?: number): Promise<{ objects: UsageObject[]; snippets: UsageSnippet[] }>;
   /** 取得目前登入的使用者帳號 */
   username(): string;
   /** 取得系統 base URL(供診斷訊息使用) */
@@ -343,6 +356,29 @@ export class RealAdtService implements AdtService {
       }))
     );
     return { checkVariant: variant, infos: run.infos, findings };
+  }
+
+  async whereUsed(url: string, line?: number, column0?: number) {
+    const headers = { "Content-Type": "application/*", Accept: "application/*" };
+    const uri = line ? `${url}#start=${line},${column0 ?? 0}` : url;
+    const refs = await this.guard(() =>
+      this.client.httpClient.request("/sap/bc/adt/repository/informationsystem/usageReferences", {
+        method: "POST",
+        qs: { uri },
+        headers,
+        body: usageReferencesBody(),
+      })
+    );
+    const objects = parseUsageReferences(String(refs.body ?? ""));
+    if (objects.length === 0) return { objects, snippets: [] };
+    const snips = await this.guard(() =>
+      this.client.httpClient.request("/sap/bc/adt/repository/informationsystem/usageSnippets", {
+        method: "POST",
+        headers,
+        body: usageSnippetsBody(objects.map((o) => o.objectIdentifier)),
+      })
+    );
+    return { objects, snippets: parseUsageSnippets(String(snips.body ?? "")) };
   }
 
   async createObject(o: NewObjectSpec & { transport?: string }) {
