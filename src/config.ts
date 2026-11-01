@@ -11,7 +11,6 @@ import * as path from "node:path";
 
 // 支援 .env 檔(開發時方便),正式使用建議直接設定環境變數
 dotenv.config({ quiet: true } as Parameters<typeof dotenv.config>[0]);
-warnIfPasswordUnquoted();
 
 /**
  * 檢查 .env 內容:SAP_PASSWORD 的值未加引號又含 # 時回傳 true。

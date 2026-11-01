@@ -8,13 +8,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { RealAdtService } from "./adt/client.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, warnIfPasswordUnquoted } from "./config.js";
 import { AuditLogger } from "./safety/audit.js";
 import { registerTools } from "./tools/registry.js";
 import { VERSION } from "./version.js";
 
 async function main() {
-  // 1. 載入設定(失敗時輸出中文錯誤說明並結束)
+  // 1. 載入設定(失敗時輸出中文錯誤說明並結束);.env 密碼含 # 未加引號時先警告
+  warnIfPasswordUnquoted();
   const cfg = loadConfig();
 
   // 2. 建立 ADT 服務與安全元件
