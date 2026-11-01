@@ -13,6 +13,7 @@ import type { AppConfig } from "../config.js";
 import { AuditLogger, diffSummary } from "../safety/audit.js";
 import { assertWriteAllowed, objectNameFromUrl } from "../safety/guards.js";
 import { lockedWrite } from "../workflows/lockedWrite.js";
+import { SerialQueue } from "../safety/serialQueue.js";
 import { VERSION } from "../version.js";
 
 /** MCP 工具回傳格式的小工具函式 */
@@ -36,6 +37,12 @@ export function registerTools(
   cfg: AppConfig,
   audit: AuditLogger
 ): void {
+  // 寫入類操作共用一個佇列依序執行,避免共用的 ADTClient 在 stateful 時被插隊(見 safety/serialQueue.ts)
+  const writes = new SerialQueue();
+  const serialized =
+    <A, R>(handler: (args: A) => Promise<R>) =>
+    (args: A) =>
+      writes.run(() => handler(args));
   // ───────────────────────────── 診斷 ─────────────────────────────
   server.registerTool(
     "ping_system",
@@ -301,7 +308,7 @@ export function registerTools(
         activate: z.boolean().optional().describe("寫入成功後立即啟用(預設 false)"),
       },
     },
-    async ({ object_url, new_source, transport, expected_current_source, skip_syntax_check, activate }) => {
+    serialized(async ({ object_url, new_source, transport, expected_current_source, skip_syntax_check, activate }) => {
       const objectName = objectNameFromUrl(object_url);
       try {
         // 安全護欄:前綴白名單等
@@ -378,7 +385,7 @@ export function registerTools(
         });
         return fail(e);
       }
-    }
+    })
   );
 
   server.registerTool(
@@ -394,7 +401,7 @@ export function registerTools(
           .describe("選填:物件名稱;省略時由 URI 推導"),
       },
     },
-    async ({ object_url, object_name }) => {
+    serialized(async ({ object_url, object_name }) => {
       const name = (object_name ?? objectNameFromUrl(object_url)).toUpperCase();
       try {
         assertWriteAllowed(cfg, object_url);
@@ -416,6 +423,6 @@ export function registerTools(
       } catch (e) {
         return fail(e);
       }
-    }
+    })
   );
 }

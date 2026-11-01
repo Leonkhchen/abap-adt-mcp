@@ -24,6 +24,7 @@ import { session_types, type ADTClient } from "abap-adt-api";
 import { registerTools } from "../../src/tools/registry.js";
 import { AuditLogger } from "../../src/safety/audit.js";
 import { VERSION } from "../../src/version.js";
+import { SerialQueue } from "../../src/safety/serialQueue.js";
 
 // ───────────────────────── 測試用假物件 ─────────────────────────
 
@@ -224,6 +225,72 @@ describe("ALLOW_SELF_SIGNED 只作用於 ADTClient", () => {
     const used = svc.client.httpClient.httpclient.axios.defaults.httpsAgent as typeof agent;
     expect(used.options.rejectUnauthorized).toBe(false);
     expect(process.env.NODE_TLS_REJECT_UNAUTHORIZED).toBe(before);
+  });
+});
+
+// ───────────────────────── 寫入互斥(F1)─────────────────────────
+
+describe("寫入類操作依序執行", () => {
+  const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  it("SerialQueue:先進先出,前一個失敗不影響下一個", async () => {
+    const q = new SerialQueue();
+    const order: string[] = [];
+    const a = q.run(async () => { await delay(20); order.push("a"); throw new Error("a failed"); });
+    const b = q.run(async () => { order.push("b"); return "B"; });
+    await expect(a).rejects.toThrow("a failed");
+    await expect(b).resolves.toBe("B");
+    expect(order).toEqual(["a", "b"]);
+  });
+
+  it("兩個 write_source 同時送出仍依序完成,lock → write → unlock 不交錯", async () => {
+    const events: string[] = [];
+    let n = 0;
+    const adt = mockAdt({
+      lock: vi.fn(async (url: string) => {
+        events.push(`lock ${url}`);
+        await delay(15);
+        return { LOCK_HANDLE: `LH-${++n}` } as never;
+      }),
+      setObjectSource: vi.fn(async (url: string) => {
+        events.push(`write ${url}`);
+        await delay(15);
+      }),
+      unLock: vi.fn(async (url: string) => {
+        events.push(`unlock ${url}`);
+      }),
+    });
+    const call = await connectTools(adt);
+    const src = (n: string) => `/sap/bc/adt/oo/classes/${n}/source/main`;
+    const [r1, r2] = await Promise.all([
+      call("write_source", { object_url: src("zcl_a"), new_source: "A" }),
+      call("write_source", { object_url: src("zcl_b"), new_source: "B" }),
+    ]);
+    expect(r1.isError).toBe(false);
+    expect(r2.isError).toBe(false);
+    expect(events).toEqual([
+      "lock /sap/bc/adt/oo/classes/zcl_a",
+      `write ${src("zcl_a")}`,
+      "unlock /sap/bc/adt/oo/classes/zcl_a",
+      "lock /sap/bc/adt/oo/classes/zcl_b",
+      `write ${src("zcl_b")}`,
+      "unlock /sap/bc/adt/oo/classes/zcl_b",
+    ]);
+  });
+
+  it("write_source 與 activate_object 同時送出也依序執行", async () => {
+    const events: string[] = [];
+    const adt = mockAdt({
+      lock: vi.fn(async () => { events.push("lock"); await delay(15); return { LOCK_HANDLE: "LH" } as never; }),
+      unLock: vi.fn(async () => { events.push("unlock"); }),
+      activate: vi.fn(async () => { events.push("activate"); return { success: true, messages: [] } as never; }),
+    });
+    const call = await connectTools(adt);
+    await Promise.all([
+      call("write_source", { object_url: "/sap/bc/adt/oo/classes/zcl_a/source/main", new_source: "A" }),
+      call("activate_object", { object_url: "/sap/bc/adt/oo/classes/zcl_a" }),
+    ]);
+    expect(events).toEqual(["lock", "unlock", "activate"]);
   });
 });
 
