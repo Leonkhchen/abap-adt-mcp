@@ -18,7 +18,29 @@ git clone https://github.com/<your-account>/abap-adt-mcp.git
 cd abap-adt-mcp
 npm install
 npm run build
-npm test          # 應顯示 19 passed(不需要 SAP 連線)
+npm test          # 單元測試應全部通過(不需要 SAP 連線)
+```
+
+### 本機 Trial(ABAP Cloud Developer Trial / A4H)範例 `.env`
+
+```dotenv
+SAP_URL=http://localhost:50000
+SAP_USER=DEVELOPER
+SAP_PASSWORD="你的密碼"
+SAP_CLIENT=001
+SAP_LANGUAGE=EN
+ABAP_MCP_SYSTEM_ROLE=dev
+```
+
+- `http://` 只允許 `localhost` / `127.0.0.1` / `::1`;連其他主機必須用 `https://`,否則啟動時會報錯
+- 確認系統已啟動:`curl http://localhost:50000/sap/public/ping` 回 403 代表 ICM 已在服務
+- 系統未啟動時,工具會回報「無法連線」並提示執行 `a4h-start.bat` 或 `docker start a4h`
+
+有了 `.env` 之後可以直接跑整合測試(PowerShell / bash 通用):
+
+```bash
+npm run test:it          # 唯讀組
+npm run test:it:write    # 唯讀 + 寫入組($TMP 暫存 class,測完自動刪除)
 ```
 
 ### 使用 `.env` 檔(選用)
@@ -52,6 +74,29 @@ claude mcp add abap \
   --env ABAP_MCP_AUDIT_LOG="$HOME/.abap-adt-mcp/audit.jsonl" \
   -- node /絕對路徑/abap-adt-mcp/dist/index.js
 ```
+
+### 方式 A'(Windows PowerShell)
+
+PowerShell 的換行是反引號 `` ` ``,環境變數寫成 `$env:NAME`:
+
+```powershell
+# 密碼以隱藏輸入放進目前 session,不進 history
+$p = Read-Host "SAP 密碼" -AsSecureString
+$env:SAP_PASSWORD = [System.Net.NetworkCredential]::new("", $p).Password
+
+# 本機 Trial(A4H)範例
+claude mcp add abap-a4h `
+  --env SAP_URL=http://localhost:50000 `
+  --env SAP_CLIENT=001 `
+  --env SAP_USER=DEVELOPER `
+  --env "SAP_PASSWORD=$env:SAP_PASSWORD" `
+  --env SAP_LANGUAGE=EN `
+  --env ABAP_MCP_SYSTEM_ROLE=dev `
+  --env "ABAP_MCP_AUDIT_LOG=$env:USERPROFILE\.abap-adt-mcp\audit.jsonl" `
+  -- node C:\path\to\abap-adt-mcp\dist\index.js
+```
+
+> `claude mcp add --env` 會把值存進 Claude Code 的使用者設定檔(明文)。若不希望密碼留在設定檔,改用方式 B 的變數展開。
 
 ### 方式 B:專案層級 `.mcp.json`(團隊共用,密碼用變數展開)
 
