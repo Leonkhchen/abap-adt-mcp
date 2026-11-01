@@ -22,6 +22,21 @@ import {
 import * as https from "node:https";
 import type { AppConfig } from "../config.js";
 import { AuthCircuitOpenError, hasHttpStatus, isAuthFailure } from "./errors.js";
+import {
+  bdefCreateBody,
+  packageUrl,
+  parseValidation,
+  TYPE_INFO,
+  type CreatableType,
+} from "./objectTypes.js";
+
+/** 建立物件的參數 */
+export interface NewObjectSpec {
+  type: CreatableType;
+  name: string;
+  packageName: string;
+  description: string;
+}
 
 /** MCP 工具層所依賴的 ADT 操作介面(僅暴露 MVP 需要的方法) */
 export interface AdtService {
@@ -52,6 +67,10 @@ export interface AdtService {
   nodeContents(parentType: "DEVC/K", packageName: string): Promise<NodeStructure>;
   transportInfo(objSourceUrl: string, devClass?: string): Promise<TransportInfo>;
   userTransports(user: string): Promise<TransportsOfUser>;
+  /** 建立前檢查名稱是否可用;不可用時回傳 ok=false 與 SAP 的說明 */
+  validateNewObject(o: NewObjectSpec): Promise<{ ok: boolean; message: string }>;
+  /** 建立新物件(只建立空殼;原始碼另以 write_source 寫入) */
+  createObject(o: NewObjectSpec & { transport?: string }): Promise<void>;
   /** 取得目前登入的使用者帳號 */
   username(): string;
   /** 取得系統 base URL(供診斷訊息使用) */
@@ -229,5 +248,68 @@ export class RealAdtService implements AdtService {
 
   async userTransports(user: string) {
     return this.guard(() => this.client.userTransports(user));
+  }
+
+  async validateNewObject(o: NewObjectSpec) {
+    if (o.type === "BDEF/BDO") {
+      // abap-adt-api 不支援 BDEF;validation 端點以 HTTP 200 + SEVERITY 回報結果
+      const response = await this.guard(() =>
+        this.client.httpClient.request("/sap/bc/adt/bo/behaviordefinitions/validation", {
+          method: "POST",
+          qs: { objname: o.name.toUpperCase(), description: o.description, packagename: o.packageName.toUpperCase() },
+        })
+      );
+      const v = parseValidation(String(response.body ?? ""));
+      return { ok: v.severity !== "ERROR", message: v.text };
+    }
+    try {
+      await this.guard(() =>
+        this.client.validateNewObject({
+          objtype: o.type as Exclude<CreatableType, "BDEF/BDO">,
+          objname: o.name.toUpperCase(),
+          packagename: o.packageName.toUpperCase(),
+          description: o.description,
+        })
+      );
+      return { ok: true, message: "" };
+    } catch (e) {
+      // abap-adt-api 在 SEVERITY=ERROR 時丟出 adtException(無 HTTP 狀態碼),訊息即 SAP 的說明
+      if (!hasHttpStatus(e) && e instanceof Error && e.message && !isAuthFailure(e)) {
+        return { ok: false, message: e.message };
+      }
+      throw e;
+    }
+  }
+
+  async createObject(o: NewObjectSpec & { transport?: string }) {
+    const responsible = this.cfg.sap.user.toUpperCase();
+    if (o.type === "BDEF/BDO") {
+      await this.guard(() =>
+        this.client.httpClient.request(TYPE_INFO["BDEF/BDO"].collection, {
+          method: "POST",
+          body: bdefCreateBody({
+            name: o.name,
+            packageName: o.packageName,
+            description: o.description,
+            responsible,
+            language: this.cfg.sap.language || "EN",
+          }),
+          headers: { "Content-Type": "application/vnd.sap.adt.blues.v1+xml" },
+          qs: o.transport ? { corrNr: o.transport } : {},
+        })
+      );
+      return;
+    }
+    await this.guard(() =>
+      this.client.createObject({
+        objtype: o.type as Exclude<CreatableType, "BDEF/BDO">,
+        name: o.name.toUpperCase(),
+        parentName: o.packageName.toUpperCase(),
+        description: o.description,
+        parentPath: packageUrl(o.packageName),
+        responsible,
+        transport: o.transport,
+      })
+    );
   }
 }

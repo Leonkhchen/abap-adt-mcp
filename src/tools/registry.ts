@@ -8,20 +8,15 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { AdtService } from "../adt/client.js";
-import { formatErrorForAi } from "../adt/errors.js";
+import { ok, fail } from "./result.js";
 import type { AppConfig } from "../config.js";
 import { AuditLogger, diffSummary } from "../safety/audit.js";
 import { assertPackageAllowed, assertWriteAllowed, objectNameFromUrl } from "../safety/guards.js";
 import { lockedWrite } from "../workflows/lockedWrite.js";
 import { SerialQueue } from "../safety/serialQueue.js";
+import { registerWriteDevTools } from "./devTools.js";
 import { VERSION } from "../version.js";
 
-/** MCP 工具回傳格式的小工具函式 */
-const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
-const fail = (err: unknown) => ({
-  content: [{ type: "text" as const, text: formatErrorForAi(err) }],
-  isError: true,
-});
 
 /** 將物件 URI 解析為 main include 的 source URI */
 async function resolveSourceUrl(adt: AdtService, objectUrl: string): Promise<string> {
@@ -428,4 +423,7 @@ export function registerTools(
       }
     })
   );
+
+  // v0.3 開發循環的寫入/執行類工具(見 tools/devTools.ts)
+  registerWriteDevTools(server, adt, cfg, audit, writes);
 }

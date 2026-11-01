@@ -31,6 +31,7 @@ import { registerTools } from "../../src/tools/registry.js";
 import { AuditLogger } from "../../src/safety/audit.js";
 import { VERSION } from "../../src/version.js";
 import { SerialQueue } from "../../src/safety/serialQueue.js";
+import { bdefCreateBody, newObjectUrl, parseValidation } from "../../src/adt/objectTypes.js";
 
 // ───────────────────────── 測試用假物件 ─────────────────────────
 
@@ -62,6 +63,8 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     nodeContents: vi.fn(async () => ({ nodes: [] } as never)),
     transportInfo: vi.fn(async () => ({} as never)),
     userTransports: vi.fn(async () => ({ workbench: [] } as never)),
+    validateNewObject: vi.fn(async () => ({ ok: true, message: "" })),
+    createObject: vi.fn(async () => {}),
     username: () => "DEVELOPER",
     baseUrl: () => "https://sap.example.com:44300",
     ...overrides,
@@ -341,6 +344,78 @@ describe("package 白名單", () => {
     const r = await call("activate_object", { object_url: "/sap/bc/adt/oo/classes/zcl_x" });
     expect(r.isError).toBe(true);
     expect(adt.activate).not.toHaveBeenCalled();
+  });
+});
+
+// ───────────────────────── create_object(G1)─────────────────────────
+
+describe("create_object", () => {
+  it("$TMP:先 validate 再 create,回傳物件 URI", async () => {
+    const adt = mockAdt();
+    const call = await connectTools(adt);
+    const r = await call("create_object", {
+      object_type: "CLAS/OC", name: "zcl_new", package_name: "$tmp", description: "demo",
+    });
+    expect(r.isError).toBe(false);
+    expect(r.text).toContain("/sap/bc/adt/oo/classes/zcl_new");
+    const spec = { type: "CLAS/OC", name: "ZCL_NEW", packageName: "$TMP", description: "demo" };
+    expect(adt.validateNewObject).toHaveBeenCalledWith(spec);
+    expect(adt.createObject).toHaveBeenCalledWith({ ...spec, transport: undefined });
+  });
+
+  it("名稱檢查未通過 → 不建立,回傳 SAP 說明", async () => {
+    const adt = mockAdt({ validateNewObject: vi.fn(async () => ({ ok: false, message: "Class ZCL_NEW already exists" })) });
+    const call = await connectTools(adt);
+    const r = await call("create_object", { object_type: "CLAS/OC", name: "ZCL_NEW", package_name: "$TMP", description: "d" });
+    expect(r.text).toContain("already exists");
+    expect(adt.createObject).not.toHaveBeenCalled();
+  });
+
+  it("非本機 package 沒給 transport → 拒絕", async () => {
+    const adt = mockAdt();
+    const call = await connectTools(adt);
+    const r = await call("create_object", { object_type: "PROG/P", name: "ZPROG", package_name: "ZPKG", description: "d" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("transport");
+    expect(adt.validateNewObject).not.toHaveBeenCalled();
+  });
+
+  it("非本機 package 有 transport → 帶 transport 建立", async () => {
+    const adt = mockAdt();
+    const call = await connectTools(adt);
+    await call("create_object", { object_type: "INTF/OI", name: "ZIF_X", package_name: "ZPKG", description: "d", transport: "A4HK900001" });
+    expect(adt.createObject).toHaveBeenCalledWith(expect.objectContaining({ transport: "A4HK900001" }));
+  });
+
+  it("名稱前綴或 package 不在白名單 → 拒絕", async () => {
+    const adt = mockAdt();
+    const call = await connectTools(adt);
+    const r1 = await call("create_object", { object_type: "CLAS/OC", name: "CL_STD", package_name: "$TMP", description: "d" });
+    const r2 = await call("create_object", { object_type: "DDLS/DF", name: "ZI_X", package_name: "SAPPKG", description: "d", transport: "T" });
+    expect(r1.text).toContain("前綴白名單");
+    expect(r2.text).toContain("package 白名單");
+    expect(adt.createObject).not.toHaveBeenCalled();
+  });
+
+  it("唯讀模式下不註冊 create_object", async () => {
+    const server = new McpServer({ name: "unit", version: "0" });
+    registerTools(server, mockAdt(), makeConfig({ ABAP_MCP_READONLY: "true" }), new AuditLogger(""));
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverT);
+    const client = new Client({ name: "c", version: "0" });
+    await client.connect(clientT);
+    const names = (await client.listTools()).tools.map((t) => t.name);
+    expect(names).not.toContain("create_object");
+  });
+
+  it("BDEF 建立 XML 與 validation 解析", () => {
+    const xml = bdefCreateBody({ name: "zi_demo", packageName: "$tmp", description: 'a "b" <c>', responsible: "dev", language: "EN" });
+    expect(xml).toContain('adtcore:name="ZI_DEMO"');
+    expect(xml).toContain('adtcore:type="BDEF/BDO"');
+    expect(xml).toContain('<adtcore:packageRef adtcore:name="$TMP"/>');
+    expect(xml).toContain("a &quot;b&quot; &lt;c&gt;");
+    expect(parseValidation("<DATA><SEVERITY>ERROR</SEVERITY><SHORT_TEXT>exists</SHORT_TEXT></DATA>")).toEqual({ severity: "ERROR", text: "exists" });
+    expect(newObjectUrl("BDEF/BDO", "ZI_DEMO")).toBe("/sap/bc/adt/bo/behaviordefinitions/zi_demo");
   });
 });
 

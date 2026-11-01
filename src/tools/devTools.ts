@@ -1,0 +1,96 @@
+/**
+ * tools/devTools.ts — v0.3 開發循環工具
+ *
+ * 讓 AI 在 $TMP 從零完成「建立 → 寫 → 啟用 → ABAP Unit → ATC」:
+ *  - 分析類(唯讀模式也註冊):run_unit_tests、run_atc、where_used、find_definition、class_components
+ *  - 寫入/執行類(唯讀模式不註冊):create_object、run_class、create_transport
+ * 寫入類一律經 SerialQueue 依序執行,並通過名稱前綴與 package 兩道白名單。
+ */
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import type { AdtService } from "../adt/client.js";
+import { CREATABLE_TYPES, isLocalPackage, newObjectUrl } from "../adt/objectTypes.js";
+import type { AppConfig } from "../config.js";
+import type { AuditLogger } from "../safety/audit.js";
+import { assertPackageAllowed, assertWriteAllowed, GuardViolationError } from "../safety/guards.js";
+import type { SerialQueue } from "../safety/serialQueue.js";
+import { fail, ok } from "./result.js";
+
+/** 寫入/執行類工具(呼叫端只在非唯讀模式時呼叫) */
+export function registerWriteDevTools(
+  server: McpServer,
+  adt: AdtService,
+  cfg: AppConfig,
+  audit: AuditLogger,
+  writes: SerialQueue
+): void {
+  // ───────────────────────────── G1 create_object ─────────────────────────────
+  server.registerTool(
+    "create_object",
+    {
+      title: "建立 ABAP 物件",
+      description:
+        "建立新的 ABAP 物件(只建立空殼與 SAP 產生的範本,原始碼請之後用 write_source 寫入並啟用)。" +
+        "支援 CLAS/OC(class)、INTF/OI(interface)、PROG/P(program)、DDLS/DF(CDS data definition)、" +
+        "BDEF/BDO(behavior definition,名稱須與已存在的 root view entity 相同)。" +
+        "會先檢查名稱是否可用;package 不是 $TMP 等本機 package 時必須提供 transport(可用 list_transports 查詢)。",
+      inputSchema: {
+        object_type: z.enum(CREATABLE_TYPES).describe("物件類型"),
+        name: z.string().min(1).describe("物件名稱,例如 ZCL_DEMO(必須符合可寫入前綴白名單)"),
+        package_name: z.string().min(1).describe("package,例如 $TMP(必須符合 package 白名單)"),
+        description: z.string().min(1).max(60).describe("物件描述(60 字元內)"),
+        transport: z.string().optional().describe("Transport request 編號;$TMP 等本機 package 可省略"),
+      },
+    },
+    async ({ object_type, name, package_name, description, transport }) =>
+      writes.run(async () => {
+        const objectName = name.toUpperCase();
+        const packageName = package_name.toUpperCase();
+        const objectUrl = newObjectUrl(object_type, objectName);
+        try {
+          // 兩道白名單:名稱前綴 + package
+          assertWriteAllowed(cfg, objectUrl);
+          assertPackageAllowed(cfg, packageName);
+          if (!isLocalPackage(packageName) && !transport) {
+            throw new GuardViolationError(
+              `package ${packageName} 不是本機 package,必須提供 transport(可用 list_transports 查詢,或用 create_transport 建立)。`
+            );
+          }
+
+          const spec = { type: object_type, name: objectName, packageName, description };
+          const v = await adt.validateNewObject(spec);
+          if (!v.ok) {
+            return ok(`❌ 無法建立 ${objectName}:${v.message || "名稱檢查未通過"}`);
+          }
+
+          await adt.createObject({ ...spec, transport });
+          audit.log({
+            timestamp: new Date().toISOString(),
+            action: "create_object",
+            objectUrl,
+            objectName,
+            transport,
+            summary: `${object_type} 於 ${packageName}`,
+            success: true,
+          });
+          return ok(
+            `✅ 已建立 ${object_type} ${objectName}(package ${packageName}` +
+              (transport ? `,transport ${transport}` : "") +
+              `)\nuri:${objectUrl}\n` +
+              `ℹ️ 物件目前為 inactive:請用 read_source 取得範本,write_source 寫入完整原始碼後啟用。`
+          );
+        } catch (e) {
+          audit.log({
+            timestamp: new Date().toISOString(),
+            action: "create_object",
+            objectUrl,
+            objectName,
+            transport,
+            success: false,
+            error: e instanceof Error ? e.message : String(e),
+          });
+          return fail(e);
+        }
+      })
+  );
+}
