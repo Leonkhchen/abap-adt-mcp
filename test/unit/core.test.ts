@@ -15,7 +15,8 @@ import { assertWriteAllowed, objectNameFromUrl, GuardViolationError } from "../.
 import { lockedWrite, ConcurrentModificationError } from "../../src/workflows/lockedWrite.js";
 import { translateAdtError } from "../../src/adt/errors.js";
 import { diffSummary } from "../../src/safety/audit.js";
-import { RealAdtService, type AdtService } from "../../src/adt/client.js";
+import * as https from "node:https";
+import { RealAdtService, adtClientOptions, type AdtService } from "../../src/adt/client.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -189,6 +190,30 @@ describe("lock / unLock 的 session 模式", () => {
     await adt.lock("/sap/bc/adt/oo/classes/zcl_demo");
     await expect(adt.unLock("/sap/bc/adt/oo/classes/zcl_demo", "LH-1")).rejects.toThrow("unlock failed");
     expect(fake.stateful).toBe(session_types.stateless);
+  });
+});
+
+// ───────────────────────── 自簽憑證(C1)─────────────────────────
+
+describe("ALLOW_SELF_SIGNED 只作用於 ADTClient", () => {
+  it("預設不帶 httpsAgent", () => {
+    expect(adtClientOptions(makeConfig()).httpsAgent).toBeUndefined();
+  });
+
+  it("開啟時以 httpsAgent(rejectUnauthorized: false)傳給 ADTClient,且不修改 process 環境變數", () => {
+    const before = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+    const cfg = makeConfig({ ABAP_MCP_ALLOW_SELF_SIGNED: "true" });
+    const agent = adtClientOptions(cfg).httpsAgent as https.Agent & { options: https.AgentOptions };
+    expect(agent).toBeInstanceOf(https.Agent);
+    expect(agent.options.rejectUnauthorized).toBe(false);
+
+    // 實際建立 ADTClient(不連線):agent 要進到底層 axios instance
+    const svc = new RealAdtService(cfg) as unknown as {
+      client: { httpClient: { httpclient: { axios: { defaults: { httpsAgent?: https.Agent } } } } };
+    };
+    const used = svc.client.httpClient.httpclient.axios.defaults.httpsAgent as typeof agent;
+    expect(used.options.rejectUnauthorized).toBe(false);
+    expect(process.env.NODE_TLS_REJECT_UNAUTHORIZED).toBe(before);
   });
 });
 
