@@ -11,6 +11,7 @@ import { RealAdtService } from "./adt/client.js";
 import { loadConfig } from "./config.js";
 import { AuditLogger } from "./safety/audit.js";
 import { registerTools } from "./tools/registry.js";
+import { VERSION } from "./version.js";
 
 async function main() {
   // 1. 載入設定(失敗時輸出中文錯誤說明並結束)
@@ -23,7 +24,7 @@ async function main() {
   // 3. 建立 MCP server 並註冊工具
   const server = new McpServer({
     name: "abap-adt-mcp",
-    version: "0.1.0",
+    version: VERSION,
   });
   registerTools(server, adt, cfg, audit);
 
@@ -32,7 +33,7 @@ async function main() {
   await server.connect(transport);
 
   console.error(
-    `[abap-adt-mcp] 已啟動。系統:${cfg.sap.url}(角色:${cfg.safety.systemRole},` +
+    `[abap-adt-mcp] v${VERSION} 已啟動。系統:${cfg.sap.url}(角色:${cfg.safety.systemRole},` +
       `${cfg.safety.readonly ? "唯讀" : "可讀寫"})`
   );
 }

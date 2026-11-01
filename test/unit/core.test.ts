@@ -23,6 +23,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { session_types, type ADTClient } from "abap-adt-api";
 import { registerTools } from "../../src/tools/registry.js";
 import { AuditLogger } from "../../src/safety/audit.js";
+import { VERSION } from "../../src/version.js";
 
 // ───────────────────────── 測試用假物件 ─────────────────────────
 
@@ -120,6 +121,15 @@ describe("ping", () => {
     expect(r.isError).toBe(false);
     expect(r.text).toContain("SAP 連線正常");
     expect(r.text).toContain("12 ms");
+  });
+
+  it("ping_system 顯示版本,且版本取自 package.json(E2)", async () => {
+    const pkg = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8"));
+    expect(VERSION).toBe(pkg.version);
+    expect(VERSION).toBe("0.2.0");
+    const call = await connectTools(mockAdt());
+    const r = await call("ping_system");
+    expect(r.text).toContain(`版本:${VERSION}`);
   });
 
   it("ping_system 連線失敗時回傳錯誤", async () => {

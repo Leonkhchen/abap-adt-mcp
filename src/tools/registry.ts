@@ -13,6 +13,7 @@ import type { AppConfig } from "../config.js";
 import { AuditLogger, diffSummary } from "../safety/audit.js";
 import { assertWriteAllowed, objectNameFromUrl } from "../safety/guards.js";
 import { lockedWrite } from "../workflows/lockedWrite.js";
+import { VERSION } from "../version.js";
 
 /** MCP 工具回傳格式的小工具函式 */
 const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
@@ -41,7 +42,7 @@ export function registerTools(
     {
       title: "測試 SAP 連線",
       description:
-        "測試與 SAP 系統的 ADT 連線是否正常,回傳系統 URL、登入帳號與目前的安全模式。" +
+        "每次都實際連線 SAP 測試 ADT 連線是否正常,回傳回應時間、server 版本、系統 URL、登入帳號與目前的安全模式。" +
         "連線異常時會回傳診斷建議。建議在開始任何工作前先呼叫一次。",
       inputSchema: {},
     },
@@ -51,6 +52,7 @@ export function registerTools(
         return ok(
           [
             `✅ SAP 連線正常(回應時間 ${elapsedMs} ms)`,
+            `abap-adt-mcp 版本:${VERSION}`,
             `系統:${adt.baseUrl()}`,
             `使用者:${adt.username()}`,
             `系統角色:${cfg.safety.systemRole}`,

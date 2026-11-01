@@ -25,6 +25,7 @@ import { loadConfig, type AppConfig } from "../../src/config.js";
 import { RealAdtService } from "../../src/adt/client.js";
 import { AuditLogger } from "../../src/safety/audit.js";
 import { registerTools } from "../../src/tools/registry.js";
+import { VERSION } from "../../src/version.js";
 
 const RUN = process.env.ABAP_MCP_IT === "1";
 const RUN_WRITE = RUN && process.env.ABAP_MCP_IT_WRITE === "1";
@@ -36,7 +37,7 @@ type ToolResult = { text: string; isError: boolean };
 
 async function startServer(env: NodeJS.ProcessEnv, auditPath = "") {
   const cfg = loadConfig(env);
-  const server = new McpServer({ name: "abap-adt-mcp-it", version: "0.1.0" });
+  const server = new McpServer({ name: "abap-adt-mcp-it", version: VERSION });
   registerTools(server, new RealAdtService(cfg), cfg, new AuditLogger(auditPath));
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
   await server.connect(serverT);
