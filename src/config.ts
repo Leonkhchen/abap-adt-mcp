@@ -70,6 +70,8 @@ const ConfigSchema = z.object({
   ABAP_MCP_SYSTEM_ROLE: z.enum(["dev", "qa", "prod"]).optional().default("dev"),
   /** 可寫入的物件名稱前綴白名單(逗號分隔),預設 Z,Y,$ */
   ABAP_MCP_ALLOWED_PREFIXES: z.string().optional().default("Z,Y,$"),
+  /** 可寫入/建立/執行物件所在的 package 白名單(逗號分隔,* 結尾表示前綴),預設 $TMP,Z*,Y* */
+  ABAP_MCP_ALLOWED_PACKAGES: z.string().optional().default("$TMP,Z*,Y*"),
   /** 允許自簽憑證(僅限內網開發系統使用!) */
   ABAP_MCP_ALLOW_SELF_SIGNED: boolEnv(false),
   /** Audit log 檔案路徑;空字串表示停用 */
@@ -92,10 +94,19 @@ export type AppConfig = {
     readonly: boolean;
     systemRole: "dev" | "qa" | "prod";
     allowedPrefixes: string[];
+    /** package 白名單;項目以 * 結尾表示前綴比對,否則完全比對(皆為大寫) */
+    allowedPackages: string[];
     auditLogPath: string;
     maxSourceLines: number;
   };
 };
+
+/** 逗號分隔清單 → 去空白、轉大寫、去除空項目 */
+const splitList = (v: string) =>
+  v
+    .split(",")
+    .map((p) => p.trim().toUpperCase())
+    .filter(Boolean);
 
 /** 允許使用 http:// 的本機主機名稱(URL.hostname 的 IPv6 會帶中括號) */
 const LOCAL_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
@@ -135,9 +146,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     safety: {
       readonly: effectiveReadonly,
       systemRole: c.ABAP_MCP_SYSTEM_ROLE,
-      allowedPrefixes: c.ABAP_MCP_ALLOWED_PREFIXES.split(",")
-        .map((p) => p.trim().toUpperCase())
-        .filter(Boolean),
+      allowedPrefixes: splitList(c.ABAP_MCP_ALLOWED_PREFIXES),
+      allowedPackages: splitList(c.ABAP_MCP_ALLOWED_PACKAGES),
       auditLogPath: c.ABAP_MCP_AUDIT_LOG,
       maxSourceLines: c.ABAP_MCP_MAX_SOURCE_LINES,
     },

@@ -30,6 +30,8 @@ export interface AdtService {
   ping(): Promise<{ elapsedMs: number }>;
   searchObject(query: string, objType?: string, max?: number): Promise<SearchResult[]>;
   objectStructure(objectUrl: string): Promise<AbapObjectStructure>;
+  /** 取得物件所在的 package 名稱(大寫);找不到時回傳空字串 */
+  objectPackage(objectUrl: string): Promise<string>;
   /** 由物件結構推導主要 include 的 source URL */
   mainInclude(structure: AbapObjectStructure): string;
   getObjectSource(sourceUrl: string): Promise<string>;
@@ -65,6 +67,12 @@ export function adtClientOptions(cfg: AppConfig): ClientOptions {
   return cfg.sap.allowSelfSigned
     ? { httpsAgent: new https.Agent({ rejectUnauthorized: false }) }
     : {};
+}
+
+/** 從 ADT 物件 XML 取出 adtcore:packageRef 的 package 名稱 */
+export function packageFromObjectXml(xml: string): string {
+  const m = xml.match(/<adtcore:packageRef\b[^>]*\badtcore:name="([^"]*)"/);
+  return m ? m[1].toUpperCase() : "";
 }
 
 /** 連續認證失敗達此次數後斷路:不再連 SAP,避免重試把帳號鎖住(SAP 預設失敗 5 次即鎖定) */
@@ -154,6 +162,12 @@ export class RealAdtService implements AdtService {
 
   mainInclude(structure: AbapObjectStructure): string {
     return ADTClient.mainInclude(structure);
+  }
+
+  /** objectStructure 不解析 package,直接讀物件 XML 的 adtcore:packageRef */
+  async objectPackage(objectUrl: string) {
+    const response = await this.guard(() => this.client.httpClient.request(objectUrl));
+    return packageFromObjectXml(String(response.body ?? ""));
   }
 
   async getObjectSource(sourceUrl: string) {

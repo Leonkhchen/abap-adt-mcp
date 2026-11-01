@@ -11,7 +11,7 @@ import type { AdtService } from "../adt/client.js";
 import { formatErrorForAi } from "../adt/errors.js";
 import type { AppConfig } from "../config.js";
 import { AuditLogger, diffSummary } from "../safety/audit.js";
-import { assertWriteAllowed, objectNameFromUrl } from "../safety/guards.js";
+import { assertPackageAllowed, assertWriteAllowed, objectNameFromUrl } from "../safety/guards.js";
 import { lockedWrite } from "../workflows/lockedWrite.js";
 import { SerialQueue } from "../safety/serialQueue.js";
 import { VERSION } from "../version.js";
@@ -316,6 +316,8 @@ export function registerTools(
 
         const sourceUrl = await resolveSourceUrl(adt, object_url);
         const baseObjectUrl = sourceUrl.replace(/\/source\/[^/]+$/, "");
+        // 第二道白名單:物件所在 package(在鎖定前檢查)
+        assertPackageAllowed(cfg, await adt.objectPackage(baseObjectUrl));
 
         // 寫入前語法檢查(預設開啟):避免把壞掉的程式碼寫進系統
         if (!skip_syntax_check) {
@@ -406,6 +408,7 @@ export function registerTools(
       try {
         assertWriteAllowed(cfg, object_url);
         const baseObjectUrl = object_url.replace(/\/source\/[^/]+$/, "");
+        assertPackageAllowed(cfg, await adt.objectPackage(baseObjectUrl));
         const result = await adt.activate(name, baseObjectUrl);
         audit.log({
           timestamp: new Date().toISOString(),

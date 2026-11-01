@@ -11,12 +11,18 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { loadConfig, hasUnquotedHashPassword, warnIfPasswordUnquoted } from "../../src/config.js";
-import { assertWriteAllowed, objectNameFromUrl, GuardViolationError } from "../../src/safety/guards.js";
+import {
+  assertWriteAllowed,
+  assertPackageAllowed,
+  packageMatches,
+  objectNameFromUrl,
+  GuardViolationError,
+} from "../../src/safety/guards.js";
 import { lockedWrite, ConcurrentModificationError } from "../../src/workflows/lockedWrite.js";
 import { translateAdtError, AuthCircuitOpenError } from "../../src/adt/errors.js";
 import { diffSummary } from "../../src/safety/audit.js";
 import * as https from "node:https";
-import { RealAdtService, adtClientOptions, type AdtService } from "../../src/adt/client.js";
+import { RealAdtService, adtClientOptions, packageFromObjectXml, type AdtService } from "../../src/adt/client.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -45,6 +51,7 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     ping: vi.fn(async () => ({ elapsedMs: 12 })),
     searchObject: vi.fn(async () => []),
     objectStructure: vi.fn(async () => ({} as never)),
+    objectPackage: vi.fn(async () => "$TMP"),
     mainInclude: vi.fn(() => "/sap/bc/adt/oo/classes/zcl_demo/source/main"),
     getObjectSource: vi.fn(async () => "old source"),
     setObjectSource: vi.fn(async () => {}),
@@ -286,6 +293,54 @@ describe("401 斷路器", () => {
     expect(r.isError).toBe(true);
     expect(r.text).toContain("已停止連線 SAP");
     expect(r.text).toContain("重開 MCP");
+  });
+});
+
+// ───────────────────────── package 白名單(F4)─────────────────────────
+
+describe("package 白名單", () => {
+  it("預設 $TMP,Z*,Y*;可自訂", () => {
+    expect(makeConfig().safety.allowedPackages).toEqual(["$TMP", "Z*", "Y*"]);
+    expect(makeConfig({ ABAP_MCP_ALLOWED_PACKAGES: "zfi*, $tmp" }).safety.allowedPackages).toEqual(["ZFI*", "$TMP"]);
+  });
+
+  it("* 結尾為前綴比對,否則完全比對", () => {
+    expect(packageMatches("ZFI_TOOLS", "Z*")).toBe(true);
+    expect(packageMatches("$tmp", "$TMP")).toBe(true);
+    expect(packageMatches("$TMP_OTHER", "$TMP")).toBe(false);
+    expect(packageMatches("SABP_CONVERT", "Z*")).toBe(false);
+  });
+
+  it("assertPackageAllowed:白名單外或無法判斷 package 時拒絕", () => {
+    const cfg = makeConfig();
+    expect(() => assertPackageAllowed(cfg, "$TMP")).not.toThrow();
+    expect(() => assertPackageAllowed(cfg, "ZDEMO")).not.toThrow();
+    expect(() => assertPackageAllowed(cfg, "SABP_CONVERT")).toThrow(/package 白名單/);
+    expect(() => assertPackageAllowed(cfg, "$FOO")).toThrow(GuardViolationError);
+    expect(() => assertPackageAllowed(cfg, "")).toThrow(/無法判斷/);
+  });
+
+  it("packageFromObjectXml 讀出 adtcore:packageRef", () => {
+    const xml = `<class:abapClass adtcore:name="ZCL_X"><adtcore:packageRef adtcore:uri="/sap/bc/adt/packages/%24tmp" adtcore:type="DEVC/K" adtcore:name="$TMP"/></class:abapClass>`;
+    expect(packageFromObjectXml(xml)).toBe("$TMP");
+    expect(packageFromObjectXml("<x/>")).toBe("");
+  });
+
+  it("write_source:Z 開頭但 package 不在白名單 → 拒絕且不鎖定", async () => {
+    const adt = mockAdt({ objectPackage: vi.fn(async () => "SOME_SAP_PKG") });
+    const call = await connectTools(adt);
+    const r = await call("write_source", { object_url: "/sap/bc/adt/oo/classes/zcl_x/source/main", new_source: "x" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("SOME_SAP_PKG");
+    expect(adt.lock).not.toHaveBeenCalled();
+  });
+
+  it("activate_object:package 不在白名單 → 拒絕且不啟用", async () => {
+    const adt = mockAdt({ objectPackage: vi.fn(async () => "SOME_SAP_PKG") });
+    const call = await connectTools(adt);
+    const r = await call("activate_object", { object_url: "/sap/bc/adt/oo/classes/zcl_x" });
+    expect(r.isError).toBe(true);
+    expect(adt.activate).not.toHaveBeenCalled();
   });
 });
 
