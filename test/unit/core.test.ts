@@ -13,7 +13,7 @@ import * as path from "node:path";
 import { loadConfig, hasUnquotedHashPassword, warnIfPasswordUnquoted } from "../../src/config.js";
 import { assertWriteAllowed, objectNameFromUrl, GuardViolationError } from "../../src/safety/guards.js";
 import { lockedWrite, ConcurrentModificationError } from "../../src/workflows/lockedWrite.js";
-import { translateAdtError } from "../../src/adt/errors.js";
+import { translateAdtError, AuthCircuitOpenError } from "../../src/adt/errors.js";
 import { diffSummary } from "../../src/safety/audit.js";
 import * as https from "node:https";
 import { RealAdtService, adtClientOptions, type AdtService } from "../../src/adt/client.js";
@@ -225,6 +225,67 @@ describe("ALLOW_SELF_SIGNED 只作用於 ADTClient", () => {
     const used = svc.client.httpClient.httpclient.axios.defaults.httpsAgent as typeof agent;
     expect(used.options.rejectUnauthorized).toBe(false);
     expect(process.env.NODE_TLS_REJECT_UNAUTHORIZED).toBe(before);
+  });
+});
+
+// ───────────────────────── 401 斷路(F2)─────────────────────────
+
+describe("401 斷路器", () => {
+  const http = (status: number) =>
+    Object.assign(new Error(`Request failed with status code ${status}`), { status });
+
+  it("連續 2 次認證失敗後不再連 SAP,並提示修正密碼後重開 MCP", async () => {
+    const fake = fakeAdtClient();
+    fake.httpClient.request.mockRejectedValue(http(401));
+    const adt = realAdt(fake);
+    await expect(adt.ping()).rejects.toThrow("401");
+    await expect(adt.ping()).rejects.toThrow("401");
+    await expect(adt.ping()).rejects.toBeInstanceOf(AuthCircuitOpenError);
+    await expect(adt.searchObject("Z*")).rejects.toBeInstanceOf(AuthCircuitOpenError);
+    expect(fake.httpClient.request).toHaveBeenCalledTimes(2);
+    expect(fake.searchObject).not.toHaveBeenCalled();
+
+    const info = translateAdtError(new AuthCircuitOpenError(2));
+    expect(info.message).toContain("連續失敗 2 次");
+    expect(info.suggestion).toContain("修正 SAP_PASSWORD");
+    expect(info.suggestion).toContain("重開 MCP");
+  });
+
+  it("成功一次即歸零", async () => {
+    const fake = fakeAdtClient();
+    fake.httpClient.request
+      .mockRejectedValueOnce(http(401))
+      .mockResolvedValueOnce({ status: 200 })
+      .mockRejectedValueOnce(http(401));
+    const adt = realAdt(fake);
+    await expect(adt.ping()).rejects.toThrow("401");
+    await adt.ping();
+    await expect(adt.ping()).rejects.toThrow("401"); // 只算 1 次,尚未斷路
+    await expect(adt.ping()).resolves.toBeDefined();
+  });
+
+  it("非認證的 SAP 錯誤(404)也代表帳密正確而歸零;網路錯誤不計入", async () => {
+    const fake = fakeAdtClient();
+    fake.httpClient.request
+      .mockRejectedValueOnce(http(401))
+      .mockRejectedValueOnce(http(404))
+      .mockRejectedValueOnce(http(401))
+      .mockRejectedValueOnce(Object.assign(new Error(""), { parent: { code: "ECONNREFUSED" } }));
+    const adt = realAdt(fake);
+    await expect(adt.ping()).rejects.toThrow("401");
+    await expect(adt.ping()).rejects.toThrow("404");
+    await expect(adt.ping()).rejects.toThrow("401");
+    await expect(adt.ping()).rejects.toThrow(); // ECONNREFUSED:計數維持 1
+    await expect(adt.ping()).resolves.toBeDefined(); // 仍可連線
+  });
+
+  it("ping_system 在斷路時回傳提示訊息", async () => {
+    const adt = mockAdt({ ping: vi.fn(async () => { throw new AuthCircuitOpenError(2); }) });
+    const call = await connectTools(adt);
+    const r = await call("ping_system");
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("已停止連線 SAP");
+    expect(r.text).toContain("重開 MCP");
   });
 });
 

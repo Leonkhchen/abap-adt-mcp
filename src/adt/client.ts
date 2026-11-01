@@ -21,6 +21,7 @@ import {
 } from "abap-adt-api";
 import * as https from "node:https";
 import type { AppConfig } from "../config.js";
+import { AuthCircuitOpenError, hasHttpStatus, isAuthFailure } from "./errors.js";
 
 /** MCP 工具層所依賴的 ADT 操作介面(僅暴露 MVP 需要的方法) */
 export interface AdtService {
@@ -66,9 +67,14 @@ export function adtClientOptions(cfg: AppConfig): ClientOptions {
     : {};
 }
 
+/** 連續認證失敗達此次數後斷路:不再連 SAP,避免重試把帳號鎖住(SAP 預設失敗 5 次即鎖定) */
+export const MAX_AUTH_FAILURES = 2;
+
 /** 真實實作:包裝 abap-adt-api 的 ADTClient */
 export class RealAdtService implements AdtService {
   private client: ADTClient;
+  /** 連續認證失敗次數;成功一次(或收到非認證類的 SAP 回應)即歸零 */
+  private authFailures = 0;
 
   /** @param client 選填:注入既有的 ADTClient(單元測試用) */
   constructor(private cfg: AppConfig, client?: ADTClient) {
@@ -85,12 +91,39 @@ export class RealAdtService implements AdtService {
   }
 
   /**
+   * 所有連 SAP 的呼叫都經過這裡(401 斷路器)。
+   * 連續 MAX_AUTH_FAILURES 次認證失敗後,之後的呼叫直接拋出 AuthCircuitOpenError、不再連線;
+   * 要恢復必須修正密碼後重開 MCP(密碼只在啟動時讀取,重試也不會變對)。
+   */
+  private async guard<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.authFailures >= MAX_AUTH_FAILURES) {
+      throw new AuthCircuitOpenError(this.authFailures);
+    }
+    try {
+      const result = await fn();
+      this.authFailures = 0;
+      return result;
+    } catch (e) {
+      if (isAuthFailure(e)) {
+        this.authFailures++;
+      } else if (hasHttpStatus(e)) {
+        // SAP 有回應且不是認證問題(例如 404):代表帳密是對的
+        this.authFailures = 0;
+      }
+      // 網路層錯誤(SAP 未啟動等)無法判斷帳密,不改變計數
+      throw e;
+    }
+  }
+
+  /**
    * 確保已登入(冪等)。登入狀態以 abap-adt-api 的 ADTClient.loggedin 為準,
    * 不另外快取:其 request() 在未登入時會自動登入,stateless 下遇 401 也會自動重登一次,
    * 因此一般方法不需要先呼叫 login()。
    */
   async login(): Promise<void> {
-    if (!this.client.loggedin) await this.client.login();
+    await this.guard(async () => {
+      if (!this.client.loggedin) await this.client.login();
+    });
   }
 
   /**
@@ -99,7 +132,7 @@ export class RealAdtService implements AdtService {
    */
   async ping() {
     const start = Date.now();
-    await this.client.httpClient.request("/sap/bc/adt/compatibility/graph");
+    await this.guard(() => this.client.httpClient.request("/sap/bc/adt/compatibility/graph"));
     return { elapsedMs: Date.now() - start };
   }
 
@@ -112,11 +145,11 @@ export class RealAdtService implements AdtService {
   }
 
   async searchObject(query: string, objType?: string, max?: number) {
-    return this.client.searchObject(query, objType, max);
+    return this.guard(() => this.client.searchObject(query, objType, max));
   }
 
   async objectStructure(objectUrl: string) {
-    return this.client.objectStructure(objectUrl);
+    return this.guard(() => this.client.objectStructure(objectUrl));
   }
 
   mainInclude(structure: AbapObjectStructure): string {
@@ -124,7 +157,7 @@ export class RealAdtService implements AdtService {
   }
 
   async getObjectSource(sourceUrl: string) {
-    return this.client.getObjectSource(sourceUrl);
+    return this.guard(() => this.client.getObjectSource(sourceUrl));
   }
 
   async setObjectSource(
@@ -133,7 +166,7 @@ export class RealAdtService implements AdtService {
     lockHandle: string,
     transport?: string
   ) {
-    return this.client.setObjectSource(sourceUrl, source, lockHandle, transport);
+    return this.guard(() => this.client.setObjectSource(sourceUrl, source, lockHandle, transport));
   }
 
   /**
@@ -142,43 +175,45 @@ export class RealAdtService implements AdtService {
    * abap-adt-api 透過 client.stateful 切換,這裡集中處理。
    */
   async lock(objectUrl: string) {
-    this.client.stateful = session_types.stateful;
-    try {
-      return await this.client.lock(objectUrl);
-    } catch (e) {
-      // 鎖定失敗必須恢復 stateless:abap-adt-api 在 stateful 模式下不會自動重登,
-      // 若停在 stateful,之後 session 失效時所有呼叫都無法恢復
-      this.client.stateful = session_types.stateless;
-      throw e;
-    }
+    return this.guard(async () => {
+      this.client.stateful = session_types.stateful;
+      try {
+        return await this.client.lock(objectUrl);
+      } catch (e) {
+        // 鎖定失敗必須恢復 stateless:abap-adt-api 在 stateful 模式下不會自動重登,
+        // 若停在 stateful,之後 session 失效時所有呼叫都無法恢復
+        this.client.stateful = session_types.stateless;
+        throw e;
+      }
+    });
   }
 
   async unLock(objectUrl: string, lockHandle: string) {
     try {
-      await this.client.unLock(objectUrl, lockHandle);
+      await this.guard(() => this.client.unLock(objectUrl, lockHandle));
     } finally {
-      // 無論解鎖成敗都恢復 stateless,釋放後端資源並保留自動重登能力
+      // 無論解鎖成敗(含斷路)都恢復 stateless,釋放後端資源並保留自動重登能力
       this.client.stateful = session_types.stateless;
     }
   }
 
   async activate(objectName: string, objectUrl: string) {
-    return this.client.activate(objectName, objectUrl);
+    return this.guard(() => this.client.activate(objectName, objectUrl));
   }
 
   async syntaxCheck(url: string, mainUrl: string, content: string) {
-    return this.client.syntaxCheck(url, mainUrl, content);
+    return this.guard(() => this.client.syntaxCheck(url, mainUrl, content));
   }
 
   async nodeContents(parentType: "DEVC/K", packageName: string) {
-    return this.client.nodeContents(parentType, packageName);
+    return this.guard(() => this.client.nodeContents(parentType, packageName));
   }
 
   async transportInfo(objSourceUrl: string, devClass?: string) {
-    return this.client.transportInfo(objSourceUrl, devClass);
+    return this.guard(() => this.client.transportInfo(objSourceUrl, devClass));
   }
 
   async userTransports(user: string) {
-    return this.client.userTransports(user);
+    return this.guard(() => this.client.userTransports(user));
   }
 }
