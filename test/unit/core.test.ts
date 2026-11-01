@@ -78,6 +78,7 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     runAtc: vi.fn(async () => ({ checkVariant: "V", infos: [], findings: [] })),
     whereUsed: vi.fn(async () => ({ objects: [], snippets: [] })),
     findDefinition: vi.fn(async () => ({ identifier: "x", url: "", line: 0, column: 0, sourceLine: "" })),
+    runClass: vi.fn(async () => ""),
     classComponents: vi.fn(async () => ({ "adtcore:name": "ZCL_X", "adtcore:type": "CLAS/OC", visibility: "public", links: [], components: [] }) as never),
     username: () => "DEVELOPER",
     baseUrl: () => "https://sap.example.com:44300",
@@ -651,6 +652,59 @@ describe("class_components", () => {
   });
 });
 
+// ───────────────────────── run_class(G6)─────────────────────────
+
+describe("run_class", () => {
+  it("說明開頭明寫會在 SAP 系統上執行程式;唯讀模式不註冊", async () => {
+    const list = async (cfg: ReturnType<typeof makeConfig>) => {
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerTools(server, mockAdt(), cfg, new AuditLogger(""));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(clientT);
+      return (await client.listTools()).tools;
+    };
+    const tool = (await list(makeConfig())).find((t) => t.name === "run_class");
+    expect(tool?.description?.startsWith("⚠️ 會在 SAP 系統上執行程式")).toBe(true);
+    expect((await list(makeConfig({ ABAP_MCP_READONLY: "true" }))).map((t) => t.name)).not.toContain("run_class");
+  });
+
+  it("執行並回傳輸出;寫 audit log", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "abap-mcp-run-"));
+    const auditPath = path.join(dir, "audit.jsonl");
+    try {
+      const adt = mockAdt({ runClass: vi.fn(async () => "MCP-RUN-3\n") });
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerTools(server, adt, makeConfig(), new AuditLogger(auditPath));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(clientT);
+      const r = (await client.callTool({ name: "run_class", arguments: { class_name: "zcl_run" } })) as { content: { text: string }[] };
+      expect(r.content[0].text).toContain("已執行 ZCL_RUN");
+      expect(r.content[0].text).toContain("MCP-RUN-3");
+      expect(adt.objectPackage).toHaveBeenCalledWith("/sap/bc/adt/oo/classes/zcl_run");
+      const entry = JSON.parse(fs.readFileSync(auditPath, "utf8").trim());
+      expect(entry).toMatchObject({ action: "run_class", objectName: "ZCL_RUN", success: true });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("白名單外的 class 或 package 不執行;輸出超過 20,000 字元截斷", async () => {
+    const adt = mockAdt({ runClass: vi.fn(async () => "x".repeat(25_000)) });
+    const call = await connectTools(adt);
+    expect((await call("run_class", { class_name: "CL_STANDARD" })).text).toContain("前綴白名單");
+    (adt.objectPackage as ReturnType<typeof vi.fn>).mockResolvedValueOnce("SAP_PKG");
+    expect((await call("run_class", { class_name: "ZCL_X" })).text).toContain("package 白名單");
+    expect(adt.runClass).not.toHaveBeenCalled();
+    const big = await call("run_class", { class_name: "ZCL_BIG" });
+    expect(big.text).toContain("已截斷");
+    expect(big.text.length).toBeLessThan(21_000);
+  });
+});
+
 // ───────────────────────── 寫入互斥(F1)─────────────────────────
 
 describe("寫入類操作依序執行", () => {
@@ -934,6 +988,11 @@ describe("translateAdtError", () => {
     expect(info.message).toContain("ECONNREFUSED");
     expect(info.suggestion).toContain("a4h-start.bat");
     expect(JSON.stringify(info)).not.toContain("TopSecret");
+  });
+
+  it("SAP 的 does not exist 訊息 → 物件不存在的建議", () => {
+    const info = translateAdtError(new Error("Resource CLASS zcl_x does not exist."));
+    expect(info.suggestion).toContain("search_objects");
   });
 
   it("5xx → 提示可能是 SAP 端逾時與縮小範圍", () => {

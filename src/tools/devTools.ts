@@ -15,7 +15,7 @@ import type { AppConfig } from "../config.js";
 import type { AuditLogger } from "../safety/audit.js";
 import { assertPackageAllowed, assertWriteAllowed, GuardViolationError } from "../safety/guards.js";
 import type { SerialQueue } from "../safety/serialQueue.js";
-import { fail, ok } from "./result.js";
+import { fail, ok, truncate } from "./result.js";
 
 /** 分析類工具(唯讀模式也註冊) */
 export function registerAnalysisTools(server: McpServer, adt: AdtService): void {
@@ -160,6 +160,9 @@ export function registerAnalysisTools(server: McpServer, adt: AdtService): void 
   );
 }
 
+/** run_class 輸出上限(字元) */
+export const RUN_CLASS_MAX_OUTPUT = 20_000;
+
 /** run_atc 回傳 finding 上限 */
 const ATC_MAX_FINDINGS = 100;
 /** where_used 回傳筆數上限 */
@@ -247,5 +250,50 @@ export function registerWriteDevTools(
           return fail(e);
         }
       })
+  );
+
+  // ───────────────────────────── G6 run_class ─────────────────────────────
+  server.registerTool(
+    "run_class",
+    {
+      title: "執行 class(IF_OO_ADT_CLASSRUN)",
+      description:
+        "⚠️ 會在 SAP 系統上執行程式:呼叫 class 的 IF_OO_ADT_CLASSRUN~MAIN,程式內容(包括寫資料庫)都會真的執行。" +
+        "回傳 out->write 的輸出(超過 20,000 字元截斷)。只能執行符合可寫入前綴與 package 白名單的 class;" +
+        "class 必須已啟用並實作 IF_OO_ADT_CLASSRUN。執行前請先確認程式內容。",
+      inputSchema: {
+        class_name: z.string().min(1).describe("class 名稱,例如 ZCL_DEMO_RUN"),
+      },
+    },
+    async ({ class_name }) => {
+      const name = class_name.toUpperCase();
+      const objectUrl = newObjectUrl("CLAS/OC", name);
+      try {
+        // 執行程式與寫入同等風險:兩道白名單
+        assertWriteAllowed(cfg, objectUrl);
+        assertPackageAllowed(cfg, await adt.objectPackage(objectUrl));
+        const output = await adt.runClass(name);
+        audit.log({
+          timestamp: new Date().toISOString(),
+          action: "run_class",
+          objectUrl,
+          objectName: name,
+          summary: `輸出 ${output.length} 字元`,
+          success: true,
+        });
+        const text = output.trim() ? truncate(output.trimEnd(), RUN_CLASS_MAX_OUTPUT) : "(沒有輸出)";
+        return ok(`▶️ 已執行 ${name}:\n${text}`);
+      } catch (e) {
+        audit.log({
+          timestamp: new Date().toISOString(),
+          action: "run_class",
+          objectUrl,
+          objectName: name,
+          success: false,
+          error: e instanceof Error ? e.message : String(e),
+        });
+        return fail(e);
+      }
+    }
   );
 }

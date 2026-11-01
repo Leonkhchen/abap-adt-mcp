@@ -106,7 +106,7 @@ export function translateAdtError(err: unknown): AdtErrorInfo {
       suggestion: "請確認使用者具備 S_DEVELOP 權限,且 SICF 節點 /sap/bc/adt 已啟用。",
     };
   }
-  if (lower.includes("404") || lower.includes("not found")) {
+  if (lower.includes("404") || lower.includes("not found") || lower.includes("does not exist")) {
     return {
       message: `物件或服務不存在(404):${raw}`,
       suggestion: "請先用 search_objects 確認物件名稱與 URI 正確;也可能是該 ADT 服務未在此系統啟用。",

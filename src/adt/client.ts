@@ -142,6 +142,8 @@ export interface AdtService {
   findDefinition(sourceUrl: string, line: number, column0: number, implementation: boolean): Promise<DefinitionResult>;
   /** class / interface 的元件結構(方法、屬性、型別、實作的介面…) */
   classComponents(objectUrl: string): Promise<ClassComponent>;
+  /** 執行 class 的 IF_OO_ADT_CLASSRUN~MAIN,回傳 out->write 的輸出 */
+  runClass(className: string): Promise<string>;
   /** 取得目前登入的使用者帳號 */
   username(): string;
   /** 取得系統 base URL(供診斷訊息使用) */
@@ -443,6 +445,10 @@ export class RealAdtService implements AdtService {
 
   async classComponents(objectUrl: string) {
     return this.guard(() => this.client.classComponents(objectUrl));
+  }
+
+  async runClass(className: string) {
+    return this.guard(() => this.client.runClass(className.toUpperCase()));
   }
 
   async createObject(o: NewObjectSpec & { transport?: string }) {
