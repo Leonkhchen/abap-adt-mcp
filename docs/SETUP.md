@@ -21,6 +21,19 @@ npm run build
 npm test          # 應顯示 19 passed(不需要 SAP 連線)
 ```
 
+### 使用 `.env` 檔(選用)
+
+開發時可把連線設定放在專案根目錄的 `.env`(已列入 `.gitignore`),啟動時自動載入:
+
+```bash
+cp .env.example .env    # Windows PowerShell:Copy-Item .env.example .env
+```
+
+> ⚠️ **密碼請用雙引號包起來**:`SAP_PASSWORD="你的密碼"`。
+> dotenv 會把未加引號的值中 `#` 之後的內容當成註解截斷,密碼含 `#` 時會變成錯誤的密碼而 401;
+> 連續失敗數次(SAP 預設 5 次)會鎖住帳號。密碼本身含 `"` 時改用單引號。
+> 偵測到 `SAP_PASSWORD` 未加引號且含 `#` 時,server 啟動時會在 stderr 警告(不會印出密碼)。
+
 ## 3. 接入 Claude Code
 
 ### 方式 A:CLI 指令(推薦)
@@ -114,7 +127,7 @@ chmod 600 ~/.codex/config.toml
 
 | 症狀 | 處理 |
 |---|---|
-| `認證失敗(401)` | 檢查帳密與 client;確認帳號未被鎖(SU01) |
+| `認證失敗(401)` | 檢查帳密與 client;`.env` 中密碼含 `#` 時必須加雙引號;確認帳號未被鎖(SU01) |
 | `403 / CSRF` | SICF 啟用 `/sap/bc/adt`;確認 S_DEVELOP 權限 |
 | `TLS 憑證驗證失敗` | 內網自簽憑證 → 設 `ABAP_MCP_ALLOW_SELF_SIGNED=true`(風險見 SECURITY.md) |
 | `無法連線` | 檢查 VPN、`SAP_URL` port(SMICM 查 HTTPS port) |
