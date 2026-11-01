@@ -2,6 +2,7 @@
  * tools/formatters.ts — 把 ADT 回傳的結構整理成 AI 好讀的文字
  */
 import type { UnitTestAlert, UnitTestClass } from "abap-adt-api";
+import type { AtcResult } from "../adt/client.js";
 import { objectNameFromUrl } from "../safety/guards.js";
 
 /** 測試類別名稱前加上所屬物件,例如 ZCL_DEMO / LTC_TEST(package 模式下才分得出來) */
@@ -53,6 +54,37 @@ export function formatUnitTestResults(classes: UnitTestClass[]): string {
   }
   for (const { c, m } of methods.filter(({ m }) => m.alerts.length === 0)) {
     out.push(`✅ ${testClassLabel(c)}->${m["adtcore:name"]}(${m.executionTime} ${m.unit})`);
+  }
+  return out.join("\n");
+}
+
+/** ATC 優先級說明(1 最嚴重) */
+const PRIORITY_LABEL: Record<number, string> = { 1: "優先級 1(錯誤)", 2: "優先級 2(警告)", 3: "優先級 3(資訊)" };
+
+/** ATC 結果:依優先級分組,最多顯示 max 筆;附上執行資訊(例如部分檢查無法執行) */
+export function formatAtcResult(r: AtcResult, max = 100): string {
+  const out: string[] = [];
+  const shown = [...r.findings].sort((a, b) => a.priority - b.priority).slice(0, max);
+  const errors = r.findings.filter((f) => f.priority === 1).length;
+  out.push(
+    r.findings.length === 0
+      ? `✅ ATC(check variant ${r.checkVariant}):沒有任何 finding。`
+      : `${errors > 0 ? "❌" : "⚠️"} ATC(check variant ${r.checkVariant}):共 ${r.findings.length} 筆 finding` +
+          `(優先級 1:${errors} 筆)` +
+          (r.findings.length > max ? `,僅顯示前 ${max} 筆` : "")
+  );
+  for (const p of [...new Set(shown.map((f) => f.priority))]) {
+    out.push(`\n## ${PRIORITY_LABEL[p] ?? `優先級 ${p}`}`);
+    for (const f of shown.filter((x) => x.priority === p)) {
+      // ATC 的位置 URI 不一定帶 #start,行號另在 range 裡
+      const loc = f.location.includes("#start=") || !f.line ? describeLocation(f.location) : `${f.location} 第 ${f.line} 行`;
+      out.push(`- ${f.objectName}:${f.messageTitle}(檢查:${f.checkTitle})\n  位置:${loc}`);
+    }
+  }
+  const notes = r.infos.filter((i) => i.type !== "FINDING_STATS");
+  if (notes.length > 0) {
+    out.push(`\nℹ️ ATC 執行資訊:`);
+    for (const i of notes) out.push(`- ${i.type}:${i.description}`);
   }
   return out.join("\n");
 }

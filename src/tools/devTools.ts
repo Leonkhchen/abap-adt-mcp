@@ -10,7 +10,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { AdtService } from "../adt/client.js";
 import { CREATABLE_TYPES, isLocalPackage, newObjectUrl, packageUrl } from "../adt/objectTypes.js";
-import { formatUnitTestResults } from "./formatters.js";
+import { formatAtcResult, formatUnitTestResults } from "./formatters.js";
 import type { AppConfig } from "../config.js";
 import type { AuditLogger } from "../safety/audit.js";
 import { assertPackageAllowed, assertWriteAllowed, GuardViolationError } from "../safety/guards.js";
@@ -47,7 +47,39 @@ export function registerAnalysisTools(server: McpServer, adt: AdtService): void 
       }
     }
   );
+
+  // ───────────────────────────── G3 run_atc ─────────────────────────────
+  server.registerTool(
+    "run_atc",
+    {
+      title: "執行 ATC 檢查",
+      description:
+        "對物件或 package 執行 ATC(ABAP Test Cockpit)靜態檢查,finding 依優先級分組(1 最嚴重),最多 100 筆。" +
+        "check_variant 省略時用系統預設。系統啟動後第一次執行可能需要數分鐘。object_url 與 package_name 擇一提供。",
+      inputSchema: {
+        object_url: z.string().optional().describe("物件 URI,例如 /sap/bc/adt/oo/classes/zcl_demo"),
+        package_name: z.string().optional().describe("package 名稱,例如 $TMP"),
+        check_variant: z.string().optional().describe("選填:ATC check variant;省略時用系統預設"),
+      },
+    },
+    async ({ object_url, package_name, check_variant }) => {
+      try {
+        if (!!object_url === !!package_name) {
+          return fail(new GuardViolationError("object_url 與 package_name 必須擇一提供。"));
+        }
+        const url = object_url
+          ? object_url.replace(/\/source\/[^/]+$/, "")
+          : packageUrl(package_name!);
+        return ok(formatAtcResult(await adt.runAtc(url, check_variant, ATC_MAX_FINDINGS), ATC_MAX_FINDINGS));
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
 }
+
+/** run_atc 回傳 finding 上限 */
+const ATC_MAX_FINDINGS = 100;
 
 /** 寫入/執行類工具(呼叫端只在非唯讀模式時呼叫) */
 export function registerWriteDevTools(

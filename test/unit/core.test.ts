@@ -32,7 +32,7 @@ import { AuditLogger } from "../../src/safety/audit.js";
 import { VERSION } from "../../src/version.js";
 import { SerialQueue } from "../../src/safety/serialQueue.js";
 import { bdefCreateBody, newObjectUrl, parseValidation } from "../../src/adt/objectTypes.js";
-import { formatUnitTestResults } from "../../src/tools/formatters.js";
+import { formatAtcResult, formatUnitTestResults } from "../../src/tools/formatters.js";
 import type { UnitTestClass } from "abap-adt-api";
 
 // ───────────────────────── 測試用假物件 ─────────────────────────
@@ -68,6 +68,7 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     validateNewObject: vi.fn(async () => ({ ok: true, message: "" })),
     createObject: vi.fn(async () => {}),
     runUnitTests: vi.fn(async () => []),
+    runAtc: vi.fn(async () => ({ checkVariant: "V", infos: [], findings: [] })),
     username: () => "DEVELOPER",
     baseUrl: () => "https://sap.example.com:44300",
     ...overrides,
@@ -477,6 +478,63 @@ describe("run_unit_tests", () => {
     expect(adt.runUnitTests).toHaveBeenLastCalledWith("/sap/bc/adt/oo/classes/zcl_x");
     const r = await call("run_unit_tests", {});
     expect(r.isError).toBe(true);
+  });
+});
+
+// ───────────────────────── run_atc(G3)─────────────────────────
+
+describe("run_atc", () => {
+  const finding = (priority: number, msg: string) => ({
+    objectName: "ZCL_X", priority, checkTitle: "Check", messageTitle: msg,
+    location: "/sap/bc/adt/oo/classes/zcl_x/source/main#start=7,4", line: 7,
+  });
+
+  it("依優先級分組並附上執行資訊", () => {
+    const text = formatAtcResult({
+      checkVariant: "ZABAP_CLOUD_DEVELOPMENT",
+      infos: [{ type: "TOOL_FAILURE", description: "Check not executable" }, { type: "FINDING_STATS", description: "1,0,0" }],
+      findings: [finding(2, "warn"), finding(1, "err")],
+    });
+    expect(text).toContain("❌ ATC(check variant ZABAP_CLOUD_DEVELOPMENT):共 2 筆 finding(優先級 1:1 筆)");
+    expect(text.indexOf("優先級 1(錯誤)")).toBeLessThan(text.indexOf("優先級 2(警告)"));
+    expect(text).toContain("source/main 第 7 行");
+    expect(text).toContain("TOOL_FAILURE");
+    expect(text).not.toContain("FINDING_STATS");
+  });
+
+  it("位置 URI 沒有 #start 時改用 range 的行號(A4H 實測的形狀)", () => {
+    const text = formatAtcResult({
+      checkVariant: "V", infos: [],
+      findings: [{ ...finding(1, "red"), location: "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses", line: 13 }],
+    });
+    expect(text).toContain("includes/testclasses 第 13 行");
+  });
+
+  it("沒有 finding;超過上限時截斷", () => {
+    expect(formatAtcResult({ checkVariant: "V", infos: [], findings: [] })).toContain("✅ ATC");
+    const many = Array.from({ length: 120 }, (_, i) => finding(3, `m${i}`));
+    const text = formatAtcResult({ checkVariant: "V", infos: [], findings: many }, 100);
+    expect(text).toContain("共 120 筆");
+    expect(text).toContain("僅顯示前 100 筆");
+    expect(text).toContain("m99");
+    expect(text).not.toContain("m100");
+  });
+
+  it("未指定 variant 時用系統預設;第一次建立 worklist 回 5xx 時重試一次", async () => {
+    const http500 = Object.assign(new Error("Request failed with status code 500"), { status: 500 });
+    const fake = fakeAdtClient({
+      atcCustomizing: vi.fn(async () => ({ properties: [{ name: "systemCheckVariant", value: "SYSVAR" }], excemptions: [] })),
+      atcCheckVariant: vi.fn().mockRejectedValueOnce(http500).mockResolvedValueOnce("WL1"),
+      createAtcRun: vi.fn(async () => ({ id: "RUN1", timestamp: 0, infos: [] })),
+      atcWorklists: vi.fn(async () => ({
+        objects: [{ name: "ZCL_X", findings: [{ priority: 1, checkTitle: "ABAP Unit", messageTitle: "red", location: { uri: "u#start=13,0", range: { start: { line: 13, column: 0 } } } }] }],
+      })),
+    });
+    const r = await realAdt(fake).runAtc("/sap/bc/adt/oo/classes/zcl_x");
+    expect(fake.atcCheckVariant).toHaveBeenCalledTimes(2);
+    expect(fake.atcCheckVariant).toHaveBeenCalledWith("SYSVAR");
+    expect(fake.createAtcRun).toHaveBeenCalledWith("WL1", "/sap/bc/adt/oo/classes/zcl_x", 100);
+    expect(r).toEqual({ checkVariant: "SYSVAR", infos: [], findings: [{ objectName: "ZCL_X", priority: 1, checkTitle: "ABAP Unit", messageTitle: "red", location: "u#start=13,0", line: 13 }] });
   });
 });
 

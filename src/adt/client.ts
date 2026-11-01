@@ -31,6 +31,24 @@ import {
   type CreatableType,
 } from "./objectTypes.js";
 
+/** ATC 單筆 finding(已攤平) */
+export interface AtcFinding {
+  objectName: string;
+  priority: number;
+  checkTitle: string;
+  messageTitle: string;
+  /** 位置 URI(含 #start=行,欄) */
+  location: string;
+  line: number;
+}
+
+export interface AtcResult {
+  checkVariant: string;
+  /** ATC 執行資訊,例如 TOOL_FAILURE(部分檢查無法執行)、FINDING_STATS */
+  infos: { type: string; description: string }[];
+  findings: AtcFinding[];
+}
+
 /** 建立物件的參數 */
 export interface NewObjectSpec {
   type: CreatableType;
@@ -74,6 +92,8 @@ export interface AdtService {
   createObject(o: NewObjectSpec & { transport?: string }): Promise<void>;
   /** 執行 ABAP Unit(物件或 package URI);只跑 RISK LEVEL HARMLESS 的測試 */
   runUnitTests(url: string): Promise<UnitTestClass[]>;
+  /** 執行 ATC;checkVariant 省略時用系統預設(atcCustomizing 的 systemCheckVariant) */
+  runAtc(url: string, checkVariant?: string, maxFindings?: number): Promise<AtcResult>;
   /** 取得目前登入的使用者帳號 */
   username(): string;
   /** 取得系統 base URL(供診斷訊息使用) */
@@ -288,6 +308,41 @@ export class RealAdtService implements AdtService {
     // 單元測試會執行程式:只跑 harmless(不改資料庫/系統設定);duration 不含 long
     const flags = { harmless: true, dangerous: false, critical: false, short: true, medium: true, long: false };
     return this.guard(() => this.client.unitTestRun(url, flags));
+  }
+
+  async runAtc(url: string, checkVariant?: string, maxFindings = 100) {
+    const variant =
+      checkVariant ||
+      String(
+        (await this.guard(() => this.client.atcCustomizing())).properties.find(
+          (p) => p.name === "systemCheckVariant"
+        )?.value ?? ""
+      );
+    if (!variant) throw new Error("系統沒有設定預設 ATC check variant,請以 check_variant 參數指定。");
+    // A4H 實測:系統啟動後第一次建立 worklist 可能超過 5 分鐘並回 500,但伺服器端已完成,重試一次即成功
+    const worklistId = await this.guard(async () => {
+      try {
+        return await this.client.atcCheckVariant(variant);
+      } catch (e) {
+        const status = (e as { status?: unknown }).status;
+        if (typeof status === "number" && status >= 500) return this.client.atcCheckVariant(variant);
+        throw e;
+      }
+    });
+    const run = await this.guard(() => this.client.createAtcRun(worklistId, url, maxFindings));
+    const worklist = await this.guard(() => this.client.atcWorklists(run.id));
+    const findings: AtcFinding[] = worklist.objects.flatMap((o) =>
+      o.findings.map((f) => ({
+        objectName: o.name,
+        priority: f.priority,
+        // SAP 的標題常帶尾端換行
+        checkTitle: f.checkTitle.trim(),
+        messageTitle: f.messageTitle.trim(),
+        location: f.location.uri,
+        line: f.location.range.start.line,
+      }))
+    );
+    return { checkVariant: variant, infos: run.infos, findings };
   }
 
   async createObject(o: NewObjectSpec & { transport?: string }) {
