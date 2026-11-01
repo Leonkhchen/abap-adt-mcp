@@ -6,9 +6,45 @@
  */
 import { z } from "zod";
 import * as dotenv from "dotenv";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 // 支援 .env 檔(開發時方便),正式使用建議直接設定環境變數
 dotenv.config({ quiet: true } as Parameters<typeof dotenv.config>[0]);
+warnIfPasswordUnquoted();
+
+/**
+ * 檢查 .env 內容:SAP_PASSWORD 的值未加引號又含 # 時回傳 true。
+ * dotenv 會把未加引號值中 # 之後的內容當成註解,密碼因而被截斷。
+ */
+export function hasUnquotedHashPassword(envFileContent: string): boolean {
+  for (const line of envFileContent.split(/\r?\n/)) {
+    const m = line.match(/^\s*(?:export\s+)?SAP_PASSWORD\s*=\s*(.*)$/);
+    if (!m) continue;
+    const value = m[1];
+    if (/^["'`]/.test(value)) return false;
+    return value.includes("#");
+  }
+  return false;
+}
+
+/** 工作目錄的 .env 有上述問題時在 stderr 警告(絕不印出密碼本身);回傳是否有警告 */
+export function warnIfPasswordUnquoted(envFilePath = path.resolve(".env")): boolean {
+  let content: string;
+  try {
+    content = fs.readFileSync(envFilePath, "utf8");
+  } catch {
+    return false; // 沒有 .env 檔
+  }
+  if (!hasUnquotedHashPassword(content)) return false;
+  // stdout 是 MCP stdio channel,警告一律走 stderr
+  console.error(
+    `[abap-adt-mcp] 警告:${envFilePath} 的 SAP_PASSWORD 未加引號且含 #,` +
+      `# 之後會被當成註解截斷,登入可能 401 並導致帳號被鎖。` +
+      `請改為 SAP_PASSWORD="..."(若 # 之後確實是註解可忽略此警告)。`
+  );
+  return true;
+}
 
 /** 布林環境變數解析:接受 true/1/yes(不分大小寫) */
 const boolEnv = (def: boolean) =>
@@ -62,6 +98,9 @@ export type AppConfig = {
   };
 };
 
+/** 允許使用 http:// 的本機主機名稱(URL.hostname 的 IPv6 會帶中括號) */
+const LOCAL_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
+
 /** 載入並驗證設定;驗證失敗時丟出含中文說明的錯誤 */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const parsed = ConfigSchema.safeParse(env);
@@ -72,6 +111,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error(`環境變數設定錯誤:\n${msgs}\n請參考 .env.example`);
   }
   const c = parsed.data;
+
+  // 安全規則:http(明文,帳密以 Basic auth 傳送)只允許連本機,其餘一律要求 https
+  const url = new URL(c.SAP_URL);
+  if (url.protocol === "http:" && !LOCAL_HOSTS.includes(url.hostname)) {
+    throw new Error(
+      `環境變數設定錯誤:\n  - SAP_URL: ${c.SAP_URL} 使用 http:// 明文連線,帳號密碼可能被竊聽。` +
+        `http:// 只允許 localhost / 127.0.0.1 / ::1(本機系統),其他主機請改用 https://(例如 https://host:44300)。`
+    );
+  }
 
   // 安全規則:prod 系統一律強制唯讀,無法以環境變數覆寫
   const effectiveReadonly = c.ABAP_MCP_SYSTEM_ROLE === "prod" ? true : c.ABAP_MCP_READONLY;

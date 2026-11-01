@@ -18,8 +18,43 @@ git clone https://github.com/<your-account>/abap-adt-mcp.git
 cd abap-adt-mcp
 npm install
 npm run build
-npm test          # 應顯示 19 passed(不需要 SAP 連線)
+npm test          # 單元測試應全部通過(不需要 SAP 連線)
 ```
+
+### 本機 Trial(ABAP Cloud Developer Trial / A4H)範例 `.env`
+
+```dotenv
+SAP_URL=http://localhost:50000
+SAP_USER=DEVELOPER
+SAP_PASSWORD="你的密碼"
+SAP_CLIENT=001
+SAP_LANGUAGE=EN
+ABAP_MCP_SYSTEM_ROLE=dev
+```
+
+- `http://` 只允許 `localhost` / `127.0.0.1` / `::1`;連其他主機必須用 `https://`,否則啟動時會報錯
+- 確認系統已啟動:`curl http://localhost:50000/sap/public/ping` 回 403 代表 ICM 已在服務
+- 系統未啟動時,工具會回報「無法連線」並提示執行 `a4h-start.bat` 或 `docker start a4h`
+
+有了 `.env` 之後可以直接跑整合測試(PowerShell / bash 通用):
+
+```bash
+npm run test:it          # 唯讀組
+npm run test:it:write    # 唯讀 + 寫入組($TMP 暫存 class,測完自動刪除)
+```
+
+### 使用 `.env` 檔(選用)
+
+開發時可把連線設定放在專案根目錄的 `.env`(已列入 `.gitignore`),啟動時自動載入:
+
+```bash
+cp .env.example .env    # Windows PowerShell:Copy-Item .env.example .env
+```
+
+> ⚠️ **密碼請用雙引號包起來**:`SAP_PASSWORD="你的密碼"`。
+> dotenv 會把未加引號的值中 `#` 之後的內容當成註解截斷,密碼含 `#` 時會變成錯誤的密碼而 401;
+> 連續失敗數次(SAP 預設 5 次)會鎖住帳號。密碼本身含 `"` 時改用單引號。
+> 偵測到 `SAP_PASSWORD` 未加引號且含 `#` 時,server 啟動時會在 stderr 警告(不會印出密碼)。
 
 ## 3. 接入 Claude Code
 
@@ -39,6 +74,29 @@ claude mcp add abap \
   --env ABAP_MCP_AUDIT_LOG="$HOME/.abap-adt-mcp/audit.jsonl" \
   -- node /絕對路徑/abap-adt-mcp/dist/index.js
 ```
+
+### 方式 A'(Windows PowerShell)
+
+PowerShell 的換行是反引號 `` ` ``,環境變數寫成 `$env:NAME`:
+
+```powershell
+# 密碼以隱藏輸入放進目前 session,不進 history
+$p = Read-Host "SAP 密碼" -AsSecureString
+$env:SAP_PASSWORD = [System.Net.NetworkCredential]::new("", $p).Password
+
+# 本機 Trial(A4H)範例
+claude mcp add abap-a4h `
+  --env SAP_URL=http://localhost:50000 `
+  --env SAP_CLIENT=001 `
+  --env SAP_USER=DEVELOPER `
+  --env "SAP_PASSWORD=$env:SAP_PASSWORD" `
+  --env SAP_LANGUAGE=EN `
+  --env ABAP_MCP_SYSTEM_ROLE=dev `
+  --env "ABAP_MCP_AUDIT_LOG=$env:USERPROFILE\.abap-adt-mcp\audit.jsonl" `
+  -- node C:\path\to\abap-adt-mcp\dist\index.js
+```
+
+> `claude mcp add --env` 會把值存進 Claude Code 的使用者設定檔(明文)。若不希望密碼留在設定檔,改用方式 B 的變數展開。
 
 ### 方式 B:專案層級 `.mcp.json`(團隊共用,密碼用變數展開)
 
@@ -114,7 +172,7 @@ chmod 600 ~/.codex/config.toml
 
 | 症狀 | 處理 |
 |---|---|
-| `認證失敗(401)` | 檢查帳密與 client;確認帳號未被鎖(SU01) |
+| `認證失敗(401)` | 檢查帳密與 client;`.env` 中密碼含 `#` 時必須加雙引號;確認帳號未被鎖(SU01) |
 | `403 / CSRF` | SICF 啟用 `/sap/bc/adt`;確認 S_DEVELOP 權限 |
 | `TLS 憑證驗證失敗` | 內網自簽憑證 → 設 `ABAP_MCP_ALLOW_SELF_SIGNED=true`(風險見 SECURITY.md) |
 | `無法連線` | 檢查 VPN、`SAP_URL` port(SMICM 查 HTTPS port) |

@@ -13,16 +13,56 @@ export interface AdtErrorInfo {
   suggestion?: string;
 }
 
+/**
+ * 取出錯誤的可讀描述。
+ * abap-adt-api 在網路層失敗(例如 SAP 未啟動)時丟出的 AdtHttpException message 是空字串,
+ * 真正的代碼(ECONNREFUSED 等)在 parent.code,因此一併收集 code / parent / cause。
+ * 只取字串欄位,絕不序列化整個錯誤物件(parent.request 內含帳密)。
+ */
+function describeError(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const e = err as Error & {
+    code?: unknown;
+    parent?: { code?: unknown; message?: unknown };
+    cause?: { code?: unknown; message?: unknown };
+  };
+  const parts = [e.message, e.code, e.parent?.code, e.parent?.message, e.cause?.code, e.cause?.message]
+    .filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+    .map((p) => p.trim());
+  const unique = [...new Set(parts)];
+  return unique.length > 0 ? unique.join(" / ") : e.name || "未知錯誤";
+}
+
 /** 將任意錯誤翻譯為 AI 友善的說明 */
 export function translateAdtError(err: unknown): AdtErrorInfo {
-  const raw = err instanceof Error ? err.message : String(err);
+  const raw = describeError(err);
   const lower = raw.toLowerCase();
 
   // 常見情境的對應表(依出現頻率排序)
+  // 連線失敗放最前面:訊息含 port 號(例如 :44010)時不可被誤判為 401
+  if (
+    lower.includes("econnrefused") ||
+    lower.includes("econnreset") ||
+    lower.includes("socket hang up") ||
+    lower.includes("enotfound") ||
+    lower.includes("etimedout") ||
+    lower.includes("fetch failed")
+  ) {
+    return {
+      message: `無法連線 SAP 系統:${raw}`,
+      suggestion:
+        "SAP 系統可能未啟動;本機 Trial 可執行 a4h-start.bat 或 docker start a4h。" +
+        "若系統已啟動,請檢查 SAP_URL 是否正確、VPN/網路是否暢通、ICM 的 HTTP(S) port 是否開啟(SMICM)。",
+    };
+  }
   if (lower.includes("401") || lower.includes("unauthorized")) {
     return {
       message: `SAP 認證失敗(401):${raw}`,
-      suggestion: "請檢查 SAP_USER / SAP_PASSWORD / SAP_CLIENT 環境變數是否正確,以及帳號是否被鎖定。",
+      suggestion:
+        "請檢查 SAP_USER / SAP_PASSWORD / SAP_CLIENT 環境變數是否正確,以及帳號是否被鎖定。" +
+        "密碼含 # 時,.env 中要加引號(SAP_PASSWORD=\"...\"),否則 # 之後會被當成註解截斷。" +
+        "注意:連續登入失敗會鎖住帳號,請先確認設定再重試;被鎖時請用同一 client 的管理者帳號" +
+        "以 SU01 解鎖(SU01 只能管理目前登入 client 的使用者)。",
     };
   }
   if (lower.includes("403") || lower.includes("forbidden") || lower.includes("csrf")) {
@@ -41,12 +81,6 @@ export function translateAdtError(err: unknown): AdtErrorInfo {
     return {
       message: `物件鎖定失敗:${raw}`,
       suggestion: "物件可能正被其他使用者(或 SE80/Eclipse session)編輯中。請稍後重試,或請對方釋放鎖定(SM12)。",
-    };
-  }
-  if (lower.includes("econnrefused") || lower.includes("enotfound") || lower.includes("etimedout") || lower.includes("fetch failed")) {
-    return {
-      message: `無法連線 SAP 系統:${raw}`,
-      suggestion: "請檢查 SAP_URL 是否正確、VPN/網路是否暢通、ICM 的 HTTPS port 是否開啟(SMICM)。",
     };
   }
   if (lower.includes("self-signed") || lower.includes("certificate")) {

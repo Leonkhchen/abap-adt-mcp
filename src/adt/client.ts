@@ -12,17 +12,21 @@ import {
   type AbapObjectStructure,
   type ActivationResult,
   type AdtLock,
+  type ClientOptions,
   type NodeStructure,
   type SearchResult,
   type SyntaxCheckResult,
   type TransportInfo,
   type TransportsOfUser,
 } from "abap-adt-api";
+import * as https from "node:https";
 import type { AppConfig } from "../config.js";
 
 /** MCP 工具層所依賴的 ADT 操作介面(僅暴露 MVP 需要的方法) */
 export interface AdtService {
   login(): Promise<void>;
+  /** 每次都實際對 SAP 發一次請求(不依賴快取的登入狀態),回傳耗時 */
+  ping(): Promise<{ elapsedMs: number }>;
   searchObject(query: string, objType?: string, max?: number): Promise<SearchResult[]>;
   objectStructure(objectUrl: string): Promise<AbapObjectStructure>;
   /** 由物件結構推導主要 include 的 source URL */
@@ -51,32 +55,52 @@ export interface AdtService {
   baseUrl(): string;
 }
 
+/**
+ * ADTClient 的連線選項。
+ * 自簽憑證支援:內網開發系統常見自簽憑證,需明確開啟才放行(見 SECURITY.md)。
+ * 只對 ADTClient 自己的 https.Agent 停用驗證,不影響同一 process 的其他連線。
+ */
+export function adtClientOptions(cfg: AppConfig): ClientOptions {
+  return cfg.sap.allowSelfSigned
+    ? { httpsAgent: new https.Agent({ rejectUnauthorized: false }) }
+    : {};
+}
+
 /** 真實實作:包裝 abap-adt-api 的 ADTClient */
 export class RealAdtService implements AdtService {
   private client: ADTClient;
-  private loggedIn = false;
 
-  constructor(private cfg: AppConfig) {
-    // 自簽憑證支援:abap-adt-api 底層使用 Node fetch/https,
-    // 在內網開發系統常見自簽憑證,需明確開啟才放行(見 SECURITY.md)
-    if (cfg.sap.allowSelfSigned) {
-      process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-    }
-    this.client = new ADTClient(
-      cfg.sap.url,
-      cfg.sap.user,
-      cfg.sap.password,
-      cfg.sap.client,
-      cfg.sap.language
-    );
+  /** @param client 選填:注入既有的 ADTClient(單元測試用) */
+  constructor(private cfg: AppConfig, client?: ADTClient) {
+    this.client =
+      client ??
+      new ADTClient(
+        cfg.sap.url,
+        cfg.sap.user,
+        cfg.sap.password,
+        cfg.sap.client,
+        cfg.sap.language,
+        adtClientOptions(cfg)
+      );
   }
 
-  /** 確保已登入(冪等;斷線後可重複呼叫) */
+  /**
+   * 確保已登入(冪等)。登入狀態以 abap-adt-api 的 ADTClient.loggedin 為準,
+   * 不另外快取:其 request() 在未登入時會自動登入,stateless 下遇 401 也會自動重登一次,
+   * 因此一般方法不需要先呼叫 login()。
+   */
   async login(): Promise<void> {
-    if (!this.loggedIn) {
-      await this.client.login();
-      this.loggedIn = true;
-    }
+    if (!this.client.loggedin) await this.client.login();
+  }
+
+  /**
+   * 連線測試:走 abap-adt-api 的 request()(未登入會自動登入,
+   * stateless 下遇 401 會自動重登一次),確保每次 ping 都真的連到 SAP。
+   */
+  async ping() {
+    const start = Date.now();
+    await this.client.httpClient.request("/sap/bc/adt/compatibility/graph");
+    return { elapsedMs: Date.now() - start };
   }
 
   username(): string {
@@ -88,12 +112,10 @@ export class RealAdtService implements AdtService {
   }
 
   async searchObject(query: string, objType?: string, max?: number) {
-    await this.login();
     return this.client.searchObject(query, objType, max);
   }
 
   async objectStructure(objectUrl: string) {
-    await this.login();
     return this.client.objectStructure(objectUrl);
   }
 
@@ -102,7 +124,6 @@ export class RealAdtService implements AdtService {
   }
 
   async getObjectSource(sourceUrl: string) {
-    await this.login();
     return this.client.getObjectSource(sourceUrl);
   }
 
@@ -112,7 +133,6 @@ export class RealAdtService implements AdtService {
     lockHandle: string,
     transport?: string
   ) {
-    await this.login();
     return this.client.setObjectSource(sourceUrl, source, lockHandle, transport);
   }
 
@@ -122,39 +142,43 @@ export class RealAdtService implements AdtService {
    * abap-adt-api 透過 client.stateful 切換,這裡集中處理。
    */
   async lock(objectUrl: string) {
-    await this.login();
     this.client.stateful = session_types.stateful;
-    return this.client.lock(objectUrl);
+    try {
+      return await this.client.lock(objectUrl);
+    } catch (e) {
+      // 鎖定失敗必須恢復 stateless:abap-adt-api 在 stateful 模式下不會自動重登,
+      // 若停在 stateful,之後 session 失效時所有呼叫都無法恢復
+      this.client.stateful = session_types.stateless;
+      throw e;
+    }
   }
 
   async unLock(objectUrl: string, lockHandle: string) {
-    await this.client.unLock(objectUrl, lockHandle);
-    // 解鎖後恢復 stateless,釋放後端資源
-    this.client.stateful = session_types.stateless;
+    try {
+      await this.client.unLock(objectUrl, lockHandle);
+    } finally {
+      // 無論解鎖成敗都恢復 stateless,釋放後端資源並保留自動重登能力
+      this.client.stateful = session_types.stateless;
+    }
   }
 
   async activate(objectName: string, objectUrl: string) {
-    await this.login();
     return this.client.activate(objectName, objectUrl);
   }
 
   async syntaxCheck(url: string, mainUrl: string, content: string) {
-    await this.login();
     return this.client.syntaxCheck(url, mainUrl, content);
   }
 
   async nodeContents(parentType: "DEVC/K", packageName: string) {
-    await this.login();
     return this.client.nodeContents(parentType, packageName);
   }
 
   async transportInfo(objSourceUrl: string, devClass?: string) {
-    await this.login();
     return this.client.transportInfo(objSourceUrl, devClass);
   }
 
   async userTransports(user: string) {
-    await this.login();
     return this.client.userTransports(user);
   }
 }

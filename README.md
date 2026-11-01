@@ -59,13 +59,34 @@ claude mcp add abap \
 # > 請用 ping_system 確認 SAP 連線
 ```
 
+### 本機 ABAP Cloud Developer Trial(A4H,Windows PowerShell)
+
+Trial 容器的 ADT 走本機 HTTP port 50000(`http://` 只允許 localhost / 127.0.0.1 / ::1,遠端主機必須用 https):
+
+```powershell
+# 密碼以隱藏輸入放進目前 PowerShell session,不進 history
+$p = Read-Host "SAP 密碼" -AsSecureString
+$env:SAP_PASSWORD = [System.Net.NetworkCredential]::new("", $p).Password
+
+claude mcp add abap-a4h `
+  --env SAP_URL=http://localhost:50000 `
+  --env SAP_CLIENT=001 `
+  --env SAP_USER=DEVELOPER `
+  --env "SAP_PASSWORD=$env:SAP_PASSWORD" `
+  --env SAP_LANGUAGE=EN `
+  --env ABAP_MCP_SYSTEM_ROLE=dev `
+  -- node C:\path\to\abap-adt-mcp\dist\index.js
+```
+
+PowerShell 的換行符號是反引號 `` ` ``(行尾不可有空白)。密碼含 `#`、`$`、`"` 等特殊字元時,用上面的 `"SAP_PASSWORD=$env:SAP_PASSWORD"` 寫法即可,不需另外跳脫。
+
 詳細設定(含 Codex、自簽憑證、唯讀模式)請見 [docs/SETUP.md](docs/SETUP.md)。
 
 ## 環境變數
 
 | 變數 | 必填 | 預設 | 說明 |
 |---|---|---|---|
-| `SAP_URL` | ✅ | — | 例如 `https://host:44300` |
+| `SAP_URL` | ✅ | — | 例如 `https://host:44300`;`http://` 僅限本機(如 Trial 的 `http://localhost:50000`) |
 | `SAP_USER` / `SAP_PASSWORD` | ✅ | — | SAP 帳密(僅從環境變數讀取) |
 | `SAP_CLIENT` | | `''` | 例如 `100` |
 | `SAP_LANGUAGE` | | `EN` | 登入語言 |
@@ -91,9 +112,13 @@ AI 直接寫入 SAP 系統風險很高,本專案內建多層防護,詳見 [docs/
 ## 開發
 
 ```bash
-npm run build   # tsc 編譯
-npm test        # vitest 單元測試(不需 SAP 系統)
+npm run build          # tsc 編譯
+npm test               # vitest 單元測試(不需 SAP 系統)
+npm run test:it        # 整合測試唯讀組(連 .env 設定的 SAP 系統)
+npm run test:it:write  # 整合測試唯讀 + 寫入組(只在 $TMP 建暫存 class,測完刪除)
 ```
+
+整合測試會讀取專案根目錄的 `.env`(見 `.env.example`),PowerShell 與 bash 指令相同。
 
 ## Roadmap
 

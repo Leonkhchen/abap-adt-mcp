@@ -60,7 +60,11 @@ ABAP_MCP_ALLOWED_PREFIXES=ZFI_,ZMM_
 
 ### 6. TLS
 
-預設驗證伺服器憑證。`ABAP_MCP_ALLOW_SELF_SIGNED=true` 會停用整個 Node process 的 TLS 驗證(`NODE_TLS_REJECT_UNAUTHORIZED=0`),**僅限與內網開發系統搭配使用**;較佳的長期做法是把企業 Root CA 加入 Node 的信任清單:
+預設驗證伺服器憑證。`ABAP_MCP_ALLOW_SELF_SIGNED=true` 會讓連 SAP 的 ADT client 改用專屬的 `https.Agent({ rejectUnauthorized: false })`,**不再驗證 SAP 伺服器憑證**(可能遭中間人攻擊),**僅限與內網開發系統搭配使用**。
+
+自 v0.2 起,這個設定只作用在 ADT client 本身,不再設定 `NODE_TLS_REJECT_UNAUTHORIZED=0`,所以同一個 Node process 的其他 HTTPS 連線仍會驗證憑證。
+
+較佳的長期做法是把企業 Root CA 加入 Node 的信任清單:
 
 ```bash
 export NODE_EXTRA_CA_CERTS=/path/to/corp-root-ca.pem
