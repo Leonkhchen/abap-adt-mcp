@@ -32,6 +32,8 @@ import { AuditLogger } from "../../src/safety/audit.js";
 import { VERSION } from "../../src/version.js";
 import { SerialQueue } from "../../src/safety/serialQueue.js";
 import { bdefCreateBody, newObjectUrl, parseValidation } from "../../src/adt/objectTypes.js";
+import { formatUnitTestResults } from "../../src/tools/formatters.js";
+import type { UnitTestClass } from "abap-adt-api";
 
 // ───────────────────────── 測試用假物件 ─────────────────────────
 
@@ -65,6 +67,7 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     userTransports: vi.fn(async () => ({ workbench: [] } as never)),
     validateNewObject: vi.fn(async () => ({ ok: true, message: "" })),
     createObject: vi.fn(async () => {}),
+    runUnitTests: vi.fn(async () => []),
     username: () => "DEVELOPER",
     baseUrl: () => "https://sap.example.com:44300",
     ...overrides,
@@ -416,6 +419,64 @@ describe("create_object", () => {
     expect(xml).toContain("a &quot;b&quot; &lt;c&gt;");
     expect(parseValidation("<DATA><SEVERITY>ERROR</SEVERITY><SHORT_TEXT>exists</SHORT_TEXT></DATA>")).toEqual({ severity: "ERROR", text: "exists" });
     expect(newObjectUrl("BDEF/BDO", "ZI_DEMO")).toBe("/sap/bc/adt/bo/behaviordefinitions/zi_demo");
+  });
+});
+
+// ───────────────────────── run_unit_tests(G2)─────────────────────────
+
+/** 依 A4H 實測回傳的形狀:LTC_TEST 一綠一紅 */
+function unitResult(): UnitTestClass[] {
+  const m = (name: string, alerts: unknown[] = []) =>
+    ({ "adtcore:name": name, "adtcore:uri": "", "adtcore:type": "CLAS/OLI", executionTime: 0.5, unit: "s", uriType: "semantic", alerts }) as never;
+  return [
+    {
+      "adtcore:name": "LTC_TEST", "adtcore:uri": "/sap/bc/adt/oo/classes/zcl_x#testclass=LTC_TEST", "adtcore:type": "CLAS/OP", uriType: "semantic",
+      durationCategory: "short", riskLevel: "harmless", alerts: [],
+      testmethods: [
+        m("GREEN"),
+        m("RED", [{
+          kind: "failedAssertion", severity: "critical", title: "Critical Assertion Error: 'MCP-RED'",
+          details: ["Different values\n\tExpected [4] Actual [3]"],
+          stack: [{ "adtcore:uri": "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses#start=13,0;end=13,0", "adtcore:type": "", "adtcore:name": "", "adtcore:description": "" }],
+        }]),
+      ],
+    } as never,
+  ];
+}
+
+describe("run_unit_tests", () => {
+  it("摘要、失敗訊息與位置;失敗的排前面", () => {
+    const text = formatUnitTestResults(unitResult());
+    expect(text).toContain("❌ ABAP Unit:2 個測試方法,1 通過,1 失敗");
+    expect(text).toContain("ZCL_X / LTC_TEST->RED");
+    expect(text).toContain("Expected [4] Actual [3]");
+    expect(text).toContain("/sap/bc/adt/oo/classes/zcl_x/includes/testclasses 第 13 行");
+    expect(text.indexOf("->RED")).toBeLessThan(text.indexOf("->GREEN"));
+  });
+
+  it("全綠與沒有測試", () => {
+    const green = unitResult();
+    (green[0].testmethods[1] as { alerts: unknown[] }).alerts = [];
+    expect(formatUnitTestResults(green)).toContain("✅ ABAP Unit:2 個測試方法,2 通過,0 失敗");
+    expect(formatUnitTestResults([])).toContain("找不到可執行的 ABAP Unit 測試");
+  });
+
+  it("只跑 harmless 測試;package 轉成 package URI", async () => {
+    const fake = fakeAdtClient({ unitTestRun: vi.fn(async () => []) });
+    await realAdt(fake).runUnitTests("/sap/bc/adt/oo/classes/zcl_x");
+    expect(fake.unitTestRun).toHaveBeenCalledWith(
+      "/sap/bc/adt/oo/classes/zcl_x",
+      expect.objectContaining({ harmless: true, dangerous: false, critical: false })
+    );
+
+    const adt = mockAdt();
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" })); // 唯讀模式也可用
+    await call("run_unit_tests", { package_name: "$TMP" });
+    expect(adt.runUnitTests).toHaveBeenCalledWith("/sap/bc/adt/packages/%24tmp");
+    await call("run_unit_tests", { object_url: "/sap/bc/adt/oo/classes/zcl_x/source/main" });
+    expect(adt.runUnitTests).toHaveBeenLastCalledWith("/sap/bc/adt/oo/classes/zcl_x");
+    const r = await call("run_unit_tests", {});
+    expect(r.isError).toBe(true);
   });
 });
 

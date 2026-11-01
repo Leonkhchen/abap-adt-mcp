@@ -18,6 +18,7 @@ import {
   type SyntaxCheckResult,
   type TransportInfo,
   type TransportsOfUser,
+  type UnitTestClass,
 } from "abap-adt-api";
 import * as https from "node:https";
 import type { AppConfig } from "../config.js";
@@ -71,6 +72,8 @@ export interface AdtService {
   validateNewObject(o: NewObjectSpec): Promise<{ ok: boolean; message: string }>;
   /** 建立新物件(只建立空殼;原始碼另以 write_source 寫入) */
   createObject(o: NewObjectSpec & { transport?: string }): Promise<void>;
+  /** 執行 ABAP Unit(物件或 package URI);只跑 RISK LEVEL HARMLESS 的測試 */
+  runUnitTests(url: string): Promise<UnitTestClass[]>;
   /** 取得目前登入的使用者帳號 */
   username(): string;
   /** 取得系統 base URL(供診斷訊息使用) */
@@ -279,6 +282,12 @@ export class RealAdtService implements AdtService {
       }
       throw e;
     }
+  }
+
+  async runUnitTests(url: string) {
+    // 單元測試會執行程式:只跑 harmless(不改資料庫/系統設定);duration 不含 long
+    const flags = { harmless: true, dangerous: false, critical: false, short: true, medium: true, long: false };
+    return this.guard(() => this.client.unitTestRun(url, flags));
   }
 
   async createObject(o: NewObjectSpec & { transport?: string }) {

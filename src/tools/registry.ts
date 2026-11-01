@@ -14,7 +14,7 @@ import { AuditLogger, diffSummary } from "../safety/audit.js";
 import { assertPackageAllowed, assertWriteAllowed, objectNameFromUrl } from "../safety/guards.js";
 import { lockedWrite } from "../workflows/lockedWrite.js";
 import { SerialQueue } from "../safety/serialQueue.js";
-import { registerWriteDevTools } from "./devTools.js";
+import { registerAnalysisTools, registerWriteDevTools } from "./devTools.js";
 import { VERSION } from "../version.js";
 
 
@@ -267,6 +267,9 @@ export function registerTools(
       }
     }
   );
+
+  // v0.3 分析類工具(唯讀模式也可用,見 tools/devTools.ts)
+  registerAnalysisTools(server, adt);
 
   // ───────────────────────────── 寫入(唯讀模式下不註冊)─────────────────────────────
   if (cfg.safety.readonly) {

@@ -9,12 +9,45 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { AdtService } from "../adt/client.js";
-import { CREATABLE_TYPES, isLocalPackage, newObjectUrl } from "../adt/objectTypes.js";
+import { CREATABLE_TYPES, isLocalPackage, newObjectUrl, packageUrl } from "../adt/objectTypes.js";
+import { formatUnitTestResults } from "./formatters.js";
 import type { AppConfig } from "../config.js";
 import type { AuditLogger } from "../safety/audit.js";
 import { assertPackageAllowed, assertWriteAllowed, GuardViolationError } from "../safety/guards.js";
 import type { SerialQueue } from "../safety/serialQueue.js";
 import { fail, ok } from "./result.js";
+
+/** 分析類工具(唯讀模式也註冊) */
+export function registerAnalysisTools(server: McpServer, adt: AdtService): void {
+  // ───────────────────────────── G2 run_unit_tests ─────────────────────────────
+  server.registerTool(
+    "run_unit_tests",
+    {
+      title: "執行 ABAP Unit 測試",
+      description:
+        "執行物件(class / program)或整個 package 的 ABAP Unit 測試,回傳每個測試方法的結果、" +
+        "失敗訊息與位置。只執行 RISK LEVEL HARMLESS、DURATION SHORT/MEDIUM 的測試(不會跑會改資料的測試)。" +
+        "object_url 與 package_name 擇一提供。",
+      inputSchema: {
+        object_url: z.string().optional().describe("物件 URI,例如 /sap/bc/adt/oo/classes/zcl_demo"),
+        package_name: z.string().optional().describe("package 名稱,例如 $TMP(執行其中所有物件的測試)"),
+      },
+    },
+    async ({ object_url, package_name }) => {
+      try {
+        if (!!object_url === !!package_name) {
+          return fail(new GuardViolationError("object_url 與 package_name 必須擇一提供。"));
+        }
+        const url = object_url
+          ? object_url.replace(/\/source\/[^/]+$/, "")
+          : packageUrl(package_name!);
+        return ok(formatUnitTestResults(await adt.runUnitTests(url)));
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
+}
 
 /** 寫入/執行類工具(呼叫端只在非唯讀模式時呼叫) */
 export function registerWriteDevTools(
