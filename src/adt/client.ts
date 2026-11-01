@@ -23,6 +23,8 @@ import type { AppConfig } from "../config.js";
 /** MCP 工具層所依賴的 ADT 操作介面(僅暴露 MVP 需要的方法) */
 export interface AdtService {
   login(): Promise<void>;
+  /** 每次都實際對 SAP 發一次請求(不依賴快取的登入狀態),回傳耗時 */
+  ping(): Promise<{ elapsedMs: number }>;
   searchObject(query: string, objType?: string, max?: number): Promise<SearchResult[]>;
   objectStructure(objectUrl: string): Promise<AbapObjectStructure>;
   /** 由物件結構推導主要 include 的 source URL */
@@ -56,19 +58,22 @@ export class RealAdtService implements AdtService {
   private client: ADTClient;
   private loggedIn = false;
 
-  constructor(private cfg: AppConfig) {
+  /** @param client 選填:注入既有的 ADTClient(單元測試用) */
+  constructor(private cfg: AppConfig, client?: ADTClient) {
     // 自簽憑證支援:abap-adt-api 底層使用 Node fetch/https,
     // 在內網開發系統常見自簽憑證,需明確開啟才放行(見 SECURITY.md)
     if (cfg.sap.allowSelfSigned) {
       process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
     }
-    this.client = new ADTClient(
-      cfg.sap.url,
-      cfg.sap.user,
-      cfg.sap.password,
-      cfg.sap.client,
-      cfg.sap.language
-    );
+    this.client =
+      client ??
+      new ADTClient(
+        cfg.sap.url,
+        cfg.sap.user,
+        cfg.sap.password,
+        cfg.sap.client,
+        cfg.sap.language
+      );
   }
 
   /** 確保已登入(冪等;斷線後可重複呼叫) */
@@ -77,6 +82,16 @@ export class RealAdtService implements AdtService {
       await this.client.login();
       this.loggedIn = true;
     }
+  }
+
+  /**
+   * 連線測試:走 abap-adt-api 的 request()(未登入會自動登入,
+   * stateless 下遇 401 會自動重登一次),確保每次 ping 都真的連到 SAP。
+   */
+  async ping() {
+    const start = Date.now();
+    await this.client.httpClient.request("/sap/bc/adt/compatibility/graph");
+    return { elapsedMs: Date.now() - start };
   }
 
   username(): string {

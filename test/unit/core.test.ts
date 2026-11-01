@@ -12,7 +12,13 @@ import { assertWriteAllowed, objectNameFromUrl, GuardViolationError } from "../.
 import { lockedWrite, ConcurrentModificationError } from "../../src/workflows/lockedWrite.js";
 import { translateAdtError } from "../../src/adt/errors.js";
 import { diffSummary } from "../../src/safety/audit.js";
-import type { AdtService } from "../../src/adt/client.js";
+import { RealAdtService, type AdtService } from "../../src/adt/client.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { session_types, type ADTClient } from "abap-adt-api";
+import { registerTools } from "../../src/tools/registry.js";
+import { AuditLogger } from "../../src/safety/audit.js";
 
 // ───────────────────────── 測試用假物件 ─────────────────────────
 
@@ -30,6 +36,7 @@ function makeConfig(extra: Record<string, string> = {}) {
 function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
   return {
     login: vi.fn(async () => {}),
+    ping: vi.fn(async () => ({ elapsedMs: 12 })),
     searchObject: vi.fn(async () => []),
     objectStructure: vi.fn(async () => ({} as never)),
     mainInclude: vi.fn(() => "/sap/bc/adt/oo/classes/zcl_demo/source/main"),
@@ -47,6 +54,78 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     ...overrides,
   };
 }
+
+/** 建立假的 ADTClient(只實作 RealAdtService 會用到的部分) */
+function fakeAdtClient(overrides: Record<string, unknown> = {}) {
+  const fake = {
+    stateful: session_types.stateless as string,
+    loggedin: true,
+    httpClient: { request: vi.fn(async () => ({ status: 200 })) },
+    login: vi.fn(async () => {}),
+    searchObject: vi.fn(async () => []),
+    lock: vi.fn(async () => ({ LOCK_HANDLE: "LH-1" })),
+    unLock: vi.fn(async () => {}),
+    ...overrides,
+  };
+  return fake;
+}
+
+function realAdt(fake: ReturnType<typeof fakeAdtClient>, cfg = makeConfig()) {
+  return new RealAdtService(cfg, fake as unknown as ADTClient);
+}
+
+/** 以 InMemoryTransport 連上 registerTools,回傳呼叫工具的函式 */
+async function connectTools(adt: AdtService, cfg = makeConfig()) {
+  const server = new McpServer({ name: "unit", version: "0.0.0" });
+  registerTools(server, adt, cfg, new AuditLogger(""));
+  const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverT);
+  const client = new Client({ name: "unit-client", version: "0.0.0" });
+  await client.connect(clientT);
+  return async (name: string, args: Record<string, unknown> = {}) => {
+    const r = (await client.callTool({ name, arguments: args })) as {
+      content: { text?: string }[];
+      isError?: boolean;
+    };
+    return { text: r.content.map((c) => c.text ?? "").join("\n"), isError: !!r.isError };
+  };
+}
+
+// ───────────────────────── ping(A1)─────────────────────────
+
+describe("ping", () => {
+  it("每次 ping 都實際發出請求,不因先前成功而略過", async () => {
+    const fake = fakeAdtClient();
+    const adt = realAdt(fake);
+    await adt.ping();
+    await adt.ping();
+    expect(fake.httpClient.request).toHaveBeenCalledTimes(2);
+  });
+
+  it("SAP 連不上時 ping 丟出錯誤(即使先前成功過)", async () => {
+    const fake = fakeAdtClient();
+    const adt = realAdt(fake);
+    await adt.ping();
+    fake.httpClient.request.mockRejectedValueOnce(new Error("connect ECONNREFUSED 127.0.0.1:50000"));
+    await expect(adt.ping()).rejects.toThrow("ECONNREFUSED");
+  });
+
+  it("ping_system 回報回應時間", async () => {
+    const call = await connectTools(mockAdt());
+    const r = await call("ping_system");
+    expect(r.isError).toBe(false);
+    expect(r.text).toContain("SAP 連線正常");
+    expect(r.text).toContain("12 ms");
+  });
+
+  it("ping_system 連線失敗時回傳錯誤", async () => {
+    const adt = mockAdt({ ping: vi.fn(async () => { throw new Error("fetch failed"); }) });
+    const call = await connectTools(adt);
+    const r = await call("ping_system");
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("無法連線");
+  });
+});
 
 // ───────────────────────── config ─────────────────────────
 

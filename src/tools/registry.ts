@@ -47,10 +47,10 @@ export function registerTools(
     },
     async () => {
       try {
-        await adt.login();
+        const { elapsedMs } = await adt.ping();
         return ok(
           [
-            `✅ SAP 連線正常`,
+            `✅ SAP 連線正常(回應時間 ${elapsedMs} ms)`,
             `系統:${adt.baseUrl()}`,
             `使用者:${adt.username()}`,
             `系統角色:${cfg.safety.systemRole}`,
