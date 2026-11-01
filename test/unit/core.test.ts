@@ -433,6 +433,24 @@ describe("translateAdtError", () => {
     }
   });
 
+  it("abap-adt-api 的 AdtHttpException(message 為空,代碼在 parent.code)也能辨識為連線失敗", () => {
+    // 實際形狀:SAP 未啟動時 message === "",parent 為 axios 錯誤,parent.request 內含帳密
+    const err = Object.assign(new Error(""), {
+      name: "AdtHttpException",
+      parent: { code: "ECONNREFUSED", message: "", request: { auth: { username: "u", password: "TopSecret#1" } } },
+    });
+    const info = translateAdtError(err);
+    expect(info.message).toContain("無法連線");
+    expect(info.message).toContain("ECONNREFUSED");
+    expect(info.suggestion).toContain("a4h-start.bat");
+    expect(JSON.stringify(info)).not.toContain("TopSecret");
+  });
+
+  it("沒有任何訊息的錯誤也不會回傳空白描述", () => {
+    const info = translateAdtError(Object.assign(new Error(""), { name: "AdtHttpException" }));
+    expect(info.message).toBe("ADT 操作失敗:AdtHttpException");
+  });
+
   it("port 號含 401 的連線錯誤不會被誤判為認證失敗", () => {
     const info = translateAdtError(new Error("connect ECONNREFUSED 10.0.0.1:44010"));
     expect(info.message).toContain("無法連線");

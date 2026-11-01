@@ -13,9 +13,29 @@ export interface AdtErrorInfo {
   suggestion?: string;
 }
 
+/**
+ * 取出錯誤的可讀描述。
+ * abap-adt-api 在網路層失敗(例如 SAP 未啟動)時丟出的 AdtHttpException message 是空字串,
+ * 真正的代碼(ECONNREFUSED 等)在 parent.code,因此一併收集 code / parent / cause。
+ * 只取字串欄位,絕不序列化整個錯誤物件(parent.request 內含帳密)。
+ */
+function describeError(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const e = err as Error & {
+    code?: unknown;
+    parent?: { code?: unknown; message?: unknown };
+    cause?: { code?: unknown; message?: unknown };
+  };
+  const parts = [e.message, e.code, e.parent?.code, e.parent?.message, e.cause?.code, e.cause?.message]
+    .filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+    .map((p) => p.trim());
+  const unique = [...new Set(parts)];
+  return unique.length > 0 ? unique.join(" / ") : e.name || "未知錯誤";
+}
+
 /** 將任意錯誤翻譯為 AI 友善的說明 */
 export function translateAdtError(err: unknown): AdtErrorInfo {
-  const raw = err instanceof Error ? err.message : String(err);
+  const raw = describeError(err);
   const lower = raw.toLowerCase();
 
   // 常見情境的對應表(依出現頻率排序)
