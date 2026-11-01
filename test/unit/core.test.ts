@@ -7,7 +7,10 @@
  *  4. 錯誤翻譯
  */
 import { describe, it, expect, vi } from "vitest";
-import { loadConfig } from "../../src/config.js";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { loadConfig, hasUnquotedHashPassword, warnIfPasswordUnquoted } from "../../src/config.js";
 import { assertWriteAllowed, objectNameFromUrl, GuardViolationError } from "../../src/safety/guards.js";
 import { lockedWrite, ConcurrentModificationError } from "../../src/workflows/lockedWrite.js";
 import { translateAdtError } from "../../src/adt/errors.js";
@@ -210,6 +213,38 @@ describe("loadConfig", () => {
   it("可自訂前綴白名單", () => {
     const cfg = makeConfig({ ABAP_MCP_ALLOWED_PREFIXES: "ZFI, ztest" });
     expect(cfg.safety.allowedPrefixes).toEqual(["ZFI", "ZTEST"]);
+  });
+});
+
+describe(".env 密碼 # 檢查(B3)", () => {
+  it("未加引號且含 # → 偵測到", () => {
+    expect(hasUnquotedHashPassword("SAP_USER=DEV\nSAP_PASSWORD=ab#cd\n")).toBe(true);
+    expect(hasUnquotedHashPassword("SAP_PASSWORD = #abc\r\n")).toBe(true);
+  });
+
+  it("加了引號或不含 # → 不警告", () => {
+    expect(hasUnquotedHashPassword('SAP_PASSWORD="ab#cd"')).toBe(false);
+    expect(hasUnquotedHashPassword("SAP_PASSWORD='ab#cd'")).toBe(false);
+    expect(hasUnquotedHashPassword("SAP_PASSWORD=abcd")).toBe(false);
+    expect(hasUnquotedHashPassword("# SAP_PASSWORD=ab#cd\nSAP_USER=X")).toBe(false);
+  });
+
+  it("警告寫到 stderr 且不含密碼本身;沒有 .env 時不警告", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "abap-mcp-env-"));
+    const file = path.join(dir, ".env");
+    fs.writeFileSync(file, "SAP_PASSWORD=Secr3t#Tail\n");
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(warnIfPasswordUnquoted(file)).toBe(true);
+      const msg = spy.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(msg).toContain("SAP_PASSWORD");
+      expect(msg).not.toContain("Secr3t");
+      expect(msg).not.toContain("Tail");
+      expect(warnIfPasswordUnquoted(path.join(dir, "missing.env"))).toBe(false);
+    } finally {
+      spy.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
