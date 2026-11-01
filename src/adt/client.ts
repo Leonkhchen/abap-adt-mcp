@@ -19,6 +19,7 @@ import {
   type TransportInfo,
   type TransportsOfUser,
   type UnitTestClass,
+  type ClassComponent,
 } from "abap-adt-api";
 import * as https from "node:https";
 import type { AppConfig } from "../config.js";
@@ -55,6 +56,33 @@ export interface AtcResult {
   /** ATC 執行資訊,例如 TOOL_FAILURE(部分檢查無法執行)、FINDING_STATS */
   infos: { type: string; description: string }[];
   findings: AtcFinding[];
+}
+
+/** find_definition 結果 */
+export interface DefinitionResult {
+  /** 查詢的識別字 */
+  identifier: string;
+  /** 定義所在的 source URI;找不到定義時為空字串 */
+  url: string;
+  /** 1 起算的行與欄 */
+  line: number;
+  column: number;
+  /** 定義那一行的原始碼(讀取失敗時為空字串) */
+  sourceLine: string;
+}
+
+/**
+ * 找出某行第 column0 欄(0 起算)所在的 ABAP 識別字範圍。
+ * ABAP 名稱可含 /(namespace)與 ~(介面元件,例如 if_x~method)。
+ */
+export function identifierAt(lineText: string, column0: number): { start: number; end: number; text: string } | undefined {
+  const isId = (ch: string | undefined) => !!ch && /[A-Za-z0-9_\/~]/.test(ch);
+  if (!isId(lineText[column0])) return undefined;
+  let start = column0;
+  let end = column0;
+  while (isId(lineText[start - 1])) start--;
+  while (isId(lineText[end])) end++;
+  return { start, end, text: lineText.slice(start, end) };
 }
 
 /** 建立物件的參數 */
@@ -107,6 +135,13 @@ export interface AdtService {
    * column0 是 ADT 的 0 起算欄位
    */
   whereUsed(url: string, line?: number, column0?: number): Promise<{ objects: UsageObject[]; snippets: UsageSnippet[] }>;
+  /**
+   * 跳到定義:sourceUrl 第 line 行(1 起算)、column0(0 起算)所在的識別字。
+   * implementation=true 時跳到實作(例如方法的 METHOD 區塊)
+   */
+  findDefinition(sourceUrl: string, line: number, column0: number, implementation: boolean): Promise<DefinitionResult>;
+  /** class / interface 的元件結構(方法、屬性、型別、實作的介面…) */
+  classComponents(objectUrl: string): Promise<ClassComponent>;
   /** 取得目前登入的使用者帳號 */
   username(): string;
   /** 取得系統 base URL(供診斷訊息使用) */
@@ -379,6 +414,35 @@ export class RealAdtService implements AdtService {
       })
     );
     return { objects, snippets: parseUsageSnippets(String(snips.body ?? "")) };
+  }
+
+  async findDefinition(sourceUrl: string, line: number, column0: number, implementation: boolean) {
+    const source = await this.guard(() => this.client.getObjectSource(sourceUrl));
+    const lines = source.split(/\r?\n/);
+    const lineText = lines[line - 1];
+    if (lineText === undefined) throw new Error(`第 ${line} 行不存在(原始碼共 ${lines.length} 行)。`);
+    const id = identifierAt(lineText, column0);
+    if (!id) {
+      throw new Error(`第 ${line} 行第 ${column0 + 1} 欄不是識別字:「${lineText.trim()}」。請把 column 指到名稱上。`);
+    }
+    // mainProgram:include(例如 testclasses)需告知所屬主程式,一律用物件的 main source
+    const mainProgram = sourceUrl.replace(/\/(source\/[^/]+|includes\/[^/]+)$/, "") + "/source/main";
+    const loc = await this.guard(() =>
+      this.client.findDefinition(sourceUrl, source, line, id.start, id.end, implementation, mainProgram)
+    );
+    if (!loc.url) return { identifier: id.text, url: "", line: 0, column: 0, sourceLine: "" };
+    let sourceLine = "";
+    try {
+      const target = loc.url === sourceUrl ? source : await this.guard(() => this.client.getObjectSource(loc.url));
+      sourceLine = target.split(/\r?\n/)[loc.line - 1] ?? "";
+    } catch {
+      // 讀不到目標原始碼(例如權限)時只回位置
+    }
+    return { identifier: id.text, url: loc.url, line: loc.line, column: loc.column + 1, sourceLine };
+  }
+
+  async classComponents(objectUrl: string) {
+    return this.guard(() => this.client.classComponents(objectUrl));
   }
 
   async createObject(o: NewObjectSpec & { transport?: string }) {

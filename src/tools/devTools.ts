@@ -10,7 +10,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { AdtService } from "../adt/client.js";
 import { CREATABLE_TYPES, isLocalPackage, newObjectUrl, packageUrl } from "../adt/objectTypes.js";
-import { formatAtcResult, formatUnitTestResults, formatWhereUsed } from "./formatters.js";
+import { formatAtcResult, formatClassComponents, formatUnitTestResults, formatWhereUsed } from "./formatters.js";
 import type { AppConfig } from "../config.js";
 import type { AuditLogger } from "../safety/audit.js";
 import { assertPackageAllowed, assertWriteAllowed, GuardViolationError } from "../safety/guards.js";
@@ -100,6 +100,59 @@ export function registerAnalysisTools(server: McpServer, adt: AdtService): void 
         const r = await adt.whereUsed(url, line, line ? (column ?? 1) - 1 : undefined);
         const target = line ? `${object_url} 第 ${line} 行${column ? `第 ${column} 欄` : ""}的元件` : object_url;
         return ok(formatWhereUsed(target, r, WHERE_USED_MAX));
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
+
+  // ───────────────────────────── G5 find_definition ─────────────────────────────
+  server.registerTool(
+    "find_definition",
+    {
+      title: "跳到定義",
+      description:
+        "找出原始碼某個位置上的名稱(方法、變數、型別、class…)的定義位置,回傳 URI、行欄與該行原始碼。" +
+        "line / column 以 1 起算(可先用 read_source 看行號),column 指到名稱上的任一字元即可。" +
+        "implementation=true 時改跳到實作(例如方法的 METHOD 區塊)。",
+      inputSchema: {
+        object_url: z.string().describe("物件 URI 或 source URI,例如 /sap/bc/adt/oo/classes/zcl_demo 或 …/includes/testclasses"),
+        line: z.number().int().positive().describe("名稱所在行(1 起算)"),
+        column: z.number().int().positive().describe("名稱上的任一欄(1 起算)"),
+        implementation: z.boolean().optional().describe("跳到實作而非定義(預設 false)"),
+      },
+    },
+    async ({ object_url, line, column, implementation }) => {
+      try {
+        const sourceUrl = /\/source\/[^/]+$|\/includes\/[^/]+$/.test(object_url)
+          ? object_url
+          : `${object_url.replace(/\/$/, "")}/source/main`;
+        const d = await adt.findDefinition(sourceUrl, line, column - 1, implementation ?? false);
+        if (!d.url) return ok(`找不到「${d.identifier}」的定義(可能是 ABAP 關鍵字或內建型別)。`);
+        return ok(
+          `📍 「${d.identifier}」的${implementation ? "實作" : "定義"}:${d.url} 第 ${d.line} 行第 ${d.column} 欄` +
+            (d.sourceLine ? `\n${String(d.line).padStart(5)}| ${d.sourceLine}` : "")
+        );
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
+
+  // ───────────────────────────── G5 class_components ─────────────────────────────
+  server.registerTool(
+    "class_components",
+    {
+      title: "列出 class 元件",
+      description:
+        "列出 class 或 interface 的元件:方法、屬性、常數、型別、事件、實作的介面,含可見性、static/instance 與定義行號。",
+      inputSchema: {
+        object_url: z.string().describe("class / interface URI,例如 /sap/bc/adt/oo/classes/zcl_demo"),
+      },
+    },
+    async ({ object_url }) => {
+      try {
+        return ok(formatClassComponents(await adt.classComponents(object_url.replace(/\/source\/[^/]+$/, ""))));
       } catch (e) {
         return fail(e);
       }

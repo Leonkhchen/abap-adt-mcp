@@ -1,0 +1,195 @@
+{
+ "xml:base": "/sap/bc/adt/oo/classes/zcl_mcp_expg/objectstructure?version=active&withShortDescriptions=true",
+ "adtcore:name": "ZCL_MCP_EXPG",
+ "visibility": "public",
+ "final": true,
+ "adtcore:type": "CLAS/OC",
+ "links": [
+  {
+   "rel": "http://www.sap.com/adt/relations/source/definitionIdentifier",
+   "href": "./source/main#start=1,6;end=1,18"
+  },
+  {
+   "rel": "http://www.sap.com/adt/relations/source/implementationIdentifier",
+   "href": "./source/main#start=7,6;end=7,18"
+  },
+  {
+   "rel": "http://www.sap.com/adt/relations/source/definitionBlock",
+   "href": "./source/main#start=1,0;end=5,8"
+  },
+  {
+   "rel": "http://www.sap.com/adt/relations/source/implementationBlock",
+   "href": "./source/main#start=7,0;end=16,8"
+  }
+ ],
+ "components": [
+  {
+   "adtcore:type": "CLAS/OR",
+   "adtcore:name": "IF_OO_ADT_CLASSRUN",
+   "links": [
+    {
+     "rel": "http://www.sap.com/adt/relations/source/definitionIdentifier",
+     "href": "./source/main#start=3,15;end=3,33"
+    },
+    {
+     "rel": "http://www.sap.com/adt/relations/source/implementationIdentifier",
+     "href": "./source/main#start=8,9;end=8,32",
+     "type": "CLAS/OM"
+    },
+    {
+     "rel": "http://www.sap.com/adt/relations/source/definitionBlock",
+     "href": "./source/main#start=3,4;end=3,33"
+    }
+   ],
+   "components": []
+  },
+  {
+   "adtcore:type": "CLAS/OM",
+   "adtcore:name": "ADD",
+   "level": "instance",
+   "clif_name": "ZCL_MCP_EXPG",
+   "visibility": "public",
+   "links": [
+    {
+     "rel": "http://www.sap.com/adt/relations/source/definitionIdentifier",
+     "href": "./source/main#start=4,12;end=4,15",
+     "type": "CLAS/OM"
+    },
+    {
+     "rel": "http://www.sap.com/adt/relations/source/implementationIdentifier",
+     "href": "./source/main#start=13,9;end=13,12"
+    },
+    {
+     "rel": "http://www.sap.com/adt/relations/source/definitionBlock",
+     "href": "./source/main#start=4,4;end=4,69"
+    },
+    {
+     "rel": "http://www.sap.com/adt/relations/source/implementationBlock",
+     "href": "./source/main#start=13,2;end=15,11"
+    }
+   ],
+   "components": []
+  },
+  {
+   "clif_name": "ZCL_MCP_EXPG",
+   "adtcore:type": "CLAS/OM",
+   "adtcore:name": "IF_OO_ADT_CLASSRUN~MAIN",
+   "level": "instance",
+   "visibility": "public",
+   "links": [
+    {
+     "rel": "http://www.sap.com/adt/relations/source/definitionIdentifier",
+     "href": "./source/main#start=3,15;end=3,33",
+     "type": "CLAS/OR"
+    },
+    {
+     "rel": "http://www.sap.com/adt/relations/source/implementationIdentifier",
+     "href": "./source/main#start=8,9;end=8,32",
+     "type": "CLAS/OM"
+    },
+    {
+     "rel": "http://www.sap.com/adt/relations/source/implementationBlock",
+     "href": "./source/main#start=8,2;end=11,11"
+    }
+   ],
+   "components": []
+  },
+  {
+   "adtcore:name": "LTC_TEST",
+   "final": true,
+   "testclass": true,
+   "adtcore:type": "CLAS/OCL",
+   "links": [
+    {
+     "rel": "http://www.sap.com/adt/relations/source/definitionIdentifier",
+     "href": "./includes/testclasses#start=1,6;end=1,14"
+    },
+    {
+     "rel": "http://www.sap.com/adt/relations/source/implementationIdentifier",
+     "href": "./includes/testclasses#start=7,6;end=7,14"
+    },
+    {
+     "rel": "http://www.sap.com/adt/relations/source/definitionBlock",
+     "href": "./includes/testclasses#start=1,0;end=5,8"
+    },
+    {
+     "rel": "http://www.sap.com/adt/relations/source/implementationBlock",
+     "href": "./includes/testclasses#start=7,0;end=15,8"
+    }
+   ],
+   "components": [
+    {
+     "adtcore:type": "CLAS/OLD",
+     "adtcore:name": "GREEN",
+     "testmethod": true,
+     "level": "instance",
+     "clif_name": "LTC_TEST",
+     "visibility": "private",
+     "links": [
+      {
+       "rel": "http://www.sap.com/adt/relations/source/definitionIdentifier",
+       "href": "./includes/testclasses#start=3,12;end=3,17",
+       "type": "CLAS/OLD"
+      },
+      {
+       "rel": "http://www.sap.com/adt/relations/source/implementationIdentifier",
+       "href": "./includes/testclasses#start=8,9;end=8,14",
+       "type": "CLAS/OLD"
+      },
+      {
+       "rel": "http://www.sap.com/adt/relations/source/definitionBlock",
+       "href": "./includes/testclasses#start=3,4;end=3,29"
+      },
+      {
+       "rel": "http://www.sap.com/adt/relations/source/implementationBlock",
+       "href": "./includes/testclasses#start=8,2;end=10,11"
+      }
+     ],
+     "components": []
+    },
+    {
+     "adtcore:type": "CLAS/OLD",
+     "adtcore:name": "RED",
+     "testmethod": true,
+     "level": "instance",
+     "clif_name": "LTC_TEST",
+     "visibility": "private",
+     "links": [
+      {
+       "rel": "http://www.sap.com/adt/relations/source/definitionIdentifier",
+       "href": "./includes/testclasses#start=4,12;end=4,15",
+       "type": "CLAS/OLD"
+      },
+      {
+       "rel": "http://www.sap.com/adt/relations/source/implementationIdentifier",
+       "href": "./includes/testclasses#start=12,9;end=12,12",
+       "type": "CLAS/OLD"
+      },
+      {
+       "rel": "http://www.sap.com/adt/relations/source/definitionBlock",
+       "href": "./includes/testclasses#start=4,4;end=4,27"
+      },
+      {
+       "rel": "http://www.sap.com/adt/relations/source/implementationBlock",
+       "href": "./includes/testclasses#start=12,2;end=14,11"
+      }
+     ],
+     "components": []
+    }
+   ]
+  },
+  {
+   "adtcore:type": "CLAS/OCX",
+   "adtcore:name": "ZCL_MCP_EXPG",
+   "isExternalRef": true,
+   "description": "Text Elements",
+   "links": [
+    {
+     "rel": "http://www.sap.com/adt/relations/source/definitionIdentifier",
+     "href": "/sap/bc/adt/textelements/classes/zcl_mcp_expg"
+    }
+   ],
+   "components": []
+  }
+ ]
+}

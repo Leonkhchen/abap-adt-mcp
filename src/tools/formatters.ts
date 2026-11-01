@@ -1,7 +1,7 @@
 /**
  * tools/formatters.ts — 把 ADT 回傳的結構整理成 AI 好讀的文字
  */
-import type { UnitTestAlert, UnitTestClass } from "abap-adt-api";
+import type { ClassComponent, UnitTestAlert, UnitTestClass } from "abap-adt-api";
 import type { AtcResult } from "../adt/client.js";
 import type { UsageObject, UsageSnippet } from "../adt/whereUsed.js";
 import { objectNameFromUrl } from "../safety/guards.js";
@@ -80,6 +80,58 @@ export function formatWhereUsed(
       shown++;
     }
   }
+  return out.join("\n");
+}
+
+/** class 元件類型 → 中文說明 */
+const COMPONENT_LABEL: Record<string, string> = {
+  "CLAS/OM": "方法",
+  "CLAS/OA": "屬性",
+  "CLAS/OT": "型別",
+  "CLAS/OE": "事件",
+  "CLAS/OR": "實作的介面",
+  "CLAS/OK": "常數",
+  "CLAS/OCL": "本地類別",
+  "CLAS/OLD": "本地類別方法",
+  "CLAS/OCX": "文字元素",
+  "INTF/IO": "方法",
+  "INTF/IA": "屬性",
+  "INTF/IT": "型別",
+  "INTF/IE": "事件",
+};
+
+/**
+ * 由元件的 definitionIdentifier 連結取出定義位置:
+ * ./source/main#start=4,12 →「第 4 行」;./includes/testclasses#start=3,12 →「testclasses include 第 3 行」
+ */
+function definitionLocation(c: ClassComponent): string {
+  const href = c.links?.find((l) => l.rel.endsWith("/definitionIdentifier"))?.href ?? "";
+  const m = href.match(/^\.\/(source\/main|includes\/([^#]+))#start=(\d+)/);
+  if (!m) return "";
+  return m[2] ? `${m[2]} include 第 ${m[3]} 行` : `第 ${m[3]} 行`;
+}
+
+/** class_components 結果:類別資訊 + 元件樹(含可見性、static/instance、定義行號) */
+export function formatClassComponents(root: ClassComponent): string {
+  const head = [root["adtcore:type"], root.visibility, (root as { final?: boolean }).final ? "final" : ""].filter(Boolean).join(",");
+  const out = [`${root["adtcore:name"]}(${head})`];
+  const walk = (list: ClassComponent[], indent: string) => {
+    for (const c of list) {
+      const type = c["adtcore:type"];
+      const attrs = [
+        COMPONENT_LABEL[type] ?? type,
+        c.visibility,
+        c.level === "static" ? "static" : c.level === "instance" ? "instance" : "",
+        c.constant ? "constant" : "",
+        c.readOnly ? "read-only" : "",
+      ].filter(Boolean);
+      const loc = definitionLocation(c);
+      out.push(`${indent}- ${c["adtcore:name"]}(${attrs.join(",")})${loc ? ` 定義於${loc}` : ""}`);
+      if (c.components?.length) walk(c.components, indent + "  ");
+    }
+  };
+  walk(root.components ?? [], "");
+  if ((root.components ?? []).length === 0) out.push("(沒有任何元件)");
   return out.join("\n");
 }
 

@@ -22,7 +22,13 @@ import { lockedWrite, ConcurrentModificationError } from "../../src/workflows/lo
 import { translateAdtError, AuthCircuitOpenError } from "../../src/adt/errors.js";
 import { diffSummary } from "../../src/safety/audit.js";
 import * as https from "node:https";
-import { RealAdtService, adtClientOptions, packageFromObjectXml, type AdtService } from "../../src/adt/client.js";
+import {
+  RealAdtService,
+  adtClientOptions,
+  identifierAt,
+  packageFromObjectXml,
+  type AdtService,
+} from "../../src/adt/client.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -32,7 +38,7 @@ import { AuditLogger } from "../../src/safety/audit.js";
 import { VERSION } from "../../src/version.js";
 import { SerialQueue } from "../../src/safety/serialQueue.js";
 import { bdefCreateBody, newObjectUrl, parseValidation } from "../../src/adt/objectTypes.js";
-import { formatAtcResult, formatUnitTestResults, formatWhereUsed } from "../../src/tools/formatters.js";
+import { formatAtcResult, formatClassComponents, formatUnitTestResults, formatWhereUsed } from "../../src/tools/formatters.js";
 import { parseUsageReferences, parseUsageSnippets, usageSnippetsBody } from "../../src/adt/whereUsed.js";
 import type { UnitTestClass } from "abap-adt-api";
 
@@ -71,6 +77,8 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     runUnitTests: vi.fn(async () => []),
     runAtc: vi.fn(async () => ({ checkVariant: "V", infos: [], findings: [] })),
     whereUsed: vi.fn(async () => ({ objects: [], snippets: [] })),
+    findDefinition: vi.fn(async () => ({ identifier: "x", url: "", line: 0, column: 0, sourceLine: "" })),
+    classComponents: vi.fn(async () => ({ "adtcore:name": "ZCL_X", "adtcore:type": "CLAS/OC", visibility: "public", links: [], components: [] }) as never),
     username: () => "DEVELOPER",
     baseUrl: () => "https://sap.example.com:44300",
     ...overrides,
@@ -589,6 +597,57 @@ describe("where_used", () => {
     expect(adt.whereUsed).toHaveBeenCalledWith("/sap/bc/adt/oo/classes/zcl_x/source/main", 4, 12);
     await call("where_used", { object_url: "/sap/bc/adt/oo/classes/zcl_x" });
     expect(adt.whereUsed).toHaveBeenLastCalledWith("/sap/bc/adt/oo/classes/zcl_x", undefined, undefined);
+  });
+});
+
+// ───────────────────────── find_definition / class_components(G5)─────────────────────────
+
+describe("find_definition", () => {
+  it("identifierAt:找出識別字範圍(含 / 與 ~)", () => {
+    const line = "    out->write( |MCP-RUN-{ add( a = 1 b = 2 ) }| ).";
+    expect(identifierAt(line, 28)).toEqual({ start: 27, end: 30, text: "add" });
+    expect(identifierAt("  CALL METHOD if_x~run.", 15)?.text).toBe("if_x~run");
+    expect(identifierAt("  DATA x TYPE /dmo/travel_id.", 20)?.text).toBe("/dmo/travel_id");
+    expect(identifierAt(line, 3)).toBeUndefined();
+  });
+
+  it("把 1 起算的欄位轉成識別字範圍,include 帶上主程式;回傳 1 起算欄位與定義行", async () => {
+    const src = "line1\nline2\n    x = add( 1 ).\n";
+    const fake = fakeAdtClient({
+      getObjectSource: vi.fn(async () => src),
+      findDefinition: vi.fn(async () => ({ url: "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses", line: 2, column: 4 })),
+    });
+    const r = await realAdt(fake).findDefinition("/sap/bc/adt/oo/classes/zcl_x/includes/testclasses", 3, 9, false);
+    expect(fake.findDefinition).toHaveBeenCalledWith(
+      "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses", src, 3, 8, 11, false, "/sap/bc/adt/oo/classes/zcl_x/source/main"
+    );
+    expect(r).toEqual({ identifier: "add", url: "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses", line: 2, column: 5, sourceLine: "line2" });
+  });
+
+  it("位置不在識別字上 → 清楚的錯誤;工具會補上 /source/main", async () => {
+    const fake = fakeAdtClient({ getObjectSource: vi.fn(async () => "  x = 1.") });
+    await expect(realAdt(fake).findDefinition("/u/source/main", 1, 1, false)).rejects.toThrow("不是識別字");
+    await expect(realAdt(fake).findDefinition("/u/source/main", 5, 1, false)).rejects.toThrow("第 5 行不存在");
+
+    const adt = mockAdt({ findDefinition: vi.fn(async () => ({ identifier: "add", url: "/u/source/main", line: 13, column: 10, sourceLine: "  METHOD add." })) });
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" }));
+    const r = await call("find_definition", { object_url: "/sap/bc/adt/oo/classes/zcl_x", line: 10, column: 29 });
+    expect(adt.findDefinition).toHaveBeenCalledWith("/sap/bc/adt/oo/classes/zcl_x/source/main", 10, 28, false);
+    expect(r.text).toContain("「add」的定義:/u/source/main 第 13 行第 10 欄");
+    expect(r.text).toContain("13|   METHOD add.");
+  });
+});
+
+describe("class_components", () => {
+  it("格式化 A4H 實際回傳:方法、介面、本地測試類別(標示 include)", () => {
+    const root = JSON.parse(fs.readFileSync(path.resolve("test/unit/fixtures/class-components.a4h.json"), "utf8"));
+    const text = formatClassComponents(root);
+    expect(text).toContain("ZCL_MCP_EXPG(CLAS/OC,public,final)");
+    expect(text).toContain("- ADD(方法,public,instance) 定義於第 4 行");
+    expect(text).toContain("- IF_OO_ADT_CLASSRUN(實作的介面) 定義於第 3 行");
+    expect(text).toContain("- LTC_TEST(本地類別) 定義於testclasses include 第 1 行");
+    expect(text).toContain("  - RED(本地類別方法,private,instance) 定義於testclasses include 第 4 行");
+    expect(text).toContain("- ZCL_MCP_EXPG(文字元素)");
   });
 });
 
