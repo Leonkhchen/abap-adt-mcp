@@ -134,13 +134,23 @@ export class RealAdtService implements AdtService {
    */
   async lock(objectUrl: string) {
     this.client.stateful = session_types.stateful;
-    return this.client.lock(objectUrl);
+    try {
+      return await this.client.lock(objectUrl);
+    } catch (e) {
+      // 鎖定失敗必須恢復 stateless:abap-adt-api 在 stateful 模式下不會自動重登,
+      // 若停在 stateful,之後 session 失效時所有呼叫都無法恢復
+      this.client.stateful = session_types.stateless;
+      throw e;
+    }
   }
 
   async unLock(objectUrl: string, lockHandle: string) {
-    await this.client.unLock(objectUrl, lockHandle);
-    // 解鎖後恢復 stateless,釋放後端資源
-    this.client.stateful = session_types.stateless;
+    try {
+      await this.client.unLock(objectUrl, lockHandle);
+    } finally {
+      // 無論解鎖成敗都恢復 stateless,釋放後端資源並保留自動重登能力
+      this.client.stateful = session_types.stateless;
+    }
   }
 
   async activate(objectName: string, objectUrl: string) {

@@ -153,6 +153,42 @@ describe("登入狀態交給 abap-adt-api", () => {
   });
 });
 
+// ───────────────────────── stateful 恢復(A3)─────────────────────────
+
+describe("lock / unLock 的 session 模式", () => {
+  it("lock 成功時切換為 stateful,unLock 後恢復 stateless", async () => {
+    const fake = fakeAdtClient();
+    const adt = realAdt(fake);
+    await adt.lock("/sap/bc/adt/oo/classes/zcl_demo");
+    expect(fake.stateful).toBe(session_types.stateful);
+    await adt.unLock("/sap/bc/adt/oo/classes/zcl_demo", "LH-1");
+    expect(fake.stateful).toBe(session_types.stateless);
+  });
+
+  it("lock 失敗時恢復 stateless 並拋出原始錯誤", async () => {
+    const fake = fakeAdtClient({
+      lock: vi.fn(async () => {
+        throw new Error("Object is locked by user OTHER");
+      }),
+    });
+    const adt = realAdt(fake);
+    await expect(adt.lock("/sap/bc/adt/oo/classes/zcl_demo")).rejects.toThrow("locked by user OTHER");
+    expect(fake.stateful).toBe(session_types.stateless);
+  });
+
+  it("unLock 失敗時也恢復 stateless", async () => {
+    const fake = fakeAdtClient({
+      unLock: vi.fn(async () => {
+        throw new Error("500 unlock failed");
+      }),
+    });
+    const adt = realAdt(fake);
+    await adt.lock("/sap/bc/adt/oo/classes/zcl_demo");
+    await expect(adt.unLock("/sap/bc/adt/oo/classes/zcl_demo", "LH-1")).rejects.toThrow("unlock failed");
+    expect(fake.stateful).toBe(session_types.stateless);
+  });
+});
+
 // ───────────────────────── config ─────────────────────────
 
 describe("loadConfig", () => {
