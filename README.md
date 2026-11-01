@@ -16,21 +16,31 @@ Claude Code ◄── stdio (MCP) ──► abap-adt-mcp ◄── HTTPS (ADT RE
 - 錯誤訊息經過翻譯,附帶可行動的建議(例如「請檢查 SICF 節點 /sap/bc/adt」),AI 能自行修正
 - 安全優先:唯讀模式、prod 系統強制唯讀、Z*/Y* 前綴白名單、audit log
 
-## 功能(MVP)
+## 功能
+
+AI 可以在 `$TMP` 從零完成「建立 → 寫 → 啟用 → ABAP Unit → ATC」,全程不需要 SAP GUI 或 Eclipse。
 
 | 工具 | 說明 |
 |---|---|
-| `ping_system` | 連線測試與診斷 |
+| `ping_system` | 連線測試與診斷(每次實際連線,顯示回應時間與版本) |
 | `search_objects` | 萬用字元搜尋 ABAP 物件 |
 | `browse_package` | 瀏覽 package 內容 |
 | `get_object_structure` | 物件結構(methods / includes) |
-| `read_source` | 讀取原始碼(含行號、分段讀取、截斷保護) |
+| `read_source` | 讀取原始碼(含行號、分段讀取、截斷保護;含 class 的測試 include) |
 | `syntax_check` | 語法檢查(免鎖定) |
 | `list_transports` | 查詢可用 transport requests |
-| `write_source` | ✏️ 寫入原始碼(自動鎖定編排 + 並行保護 + 可選啟用) |
+| `run_unit_tests` | 執行 ABAP Unit(物件或 package;只跑 RISK LEVEL HARMLESS) |
+| `run_atc` | 執行 ATC 靜態檢查(依優先級分組,上限 100 筆) |
+| `where_used` | 查詢物件或元件的使用處(含程式碼行,上限 50 筆) |
+| `find_definition` | 跳到定義 / 實作 |
+| `class_components` | 列出 class / interface 的方法、屬性、介面、本地類別 |
+| `write_source` | ✏️ 寫入原始碼(自動鎖定編排 + 並行保護 + 語法檢查 + 可選啟用;可寫測試 include) |
 | `activate_object` | ✏️ 啟用物件 |
+| `create_object` | ✏️ 建立 CLAS/OC、INTF/OI、PROG/P、DDLS/DF、BDEF/BDO |
+| `run_class` | ⚠️ **會在 SAP 系統上執行程式**:執行 IF_OO_ADT_CLASSRUN(輸出上限 20,000 字元) |
+| `create_transport` | ✏️ 建立 workbench transport request(只在 `SYSTEM_ROLE=dev`) |
 
-✏️ = 寫入工具,唯讀模式下不會註冊(AI 完全看不到)。
+✏️ / ⚠️ = 寫入或執行類工具,唯讀模式下不會註冊(AI 完全看不到),且必須通過名稱前綴與 package 兩道白名單。
 
 ## 系統需求
 
@@ -93,6 +103,7 @@ PowerShell 的換行符號是反引號 `` ` ``(行尾不可有空白)。密碼�
 | `ABAP_MCP_READONLY` | | `false` | `true` 時不註冊寫入工具 |
 | `ABAP_MCP_SYSTEM_ROLE` | | `dev` | `dev`/`qa`/`prod`;**prod 強制唯讀** |
 | `ABAP_MCP_ALLOWED_PREFIXES` | | `Z,Y,$` | 可寫入的物件名稱前綴白名單 |
+| `ABAP_MCP_ALLOWED_PACKAGES` | | `$TMP,Z*,Y*` | 可寫入/建立/執行物件所在的 package 白名單(`*` 結尾為前綴比對) |
 | `ABAP_MCP_ALLOW_SELF_SIGNED` | | `false` | 允許自簽憑證(限內網開發系統) |
 | `ABAP_MCP_AUDIT_LOG` | | (停用) | 寫入操作稽核紀錄檔路徑 |
 | `ABAP_MCP_MAX_SOURCE_LINES` | | `5000` | `read_source` 回傳行數上限 |
@@ -104,10 +115,12 @@ AI 直接寫入 SAP 系統風險很高,本專案內建多層防護,詳見 [docs/
 1. **唯讀模式** — 寫入工具不註冊,而非「註冊後拒絕」
 2. **prod 強制唯讀** — 設定 `ABAP_MCP_SYSTEM_ROLE=prod` 後無法以任何方式覆寫
 3. **前綴白名單** — 預設僅允許 `Z*` / `Y*` / `$`(本機物件),保護 SAP 標準物件
-4. **並行保護** — 寫入前比對先前讀取的版本,避免蓋掉他人變更
-5. **寫入前語法檢查** — 預設不讓語法錯誤的程式碼進系統
-6. **Audit log** — JSON Lines 紀錄所有寫入操作(不含憑證與原始碼內容)
-7. **鎖定保證釋放** — try/finally,不留殘留鎖定
+4. **package 白名單** — 預設僅允許 `$TMP`、`Z*`、`Y*` package;寫入、建立、執行都要同時通過名稱與 package 兩道白名單
+5. **並行保護** — 寫入前比對先前讀取的版本,避免蓋掉他人變更;寫入類操作在 process 內依序執行
+6. **寫入前語法檢查** — 預設不讓語法錯誤的程式碼進系統
+7. **Audit log** — JSON Lines 紀錄所有寫入、建立、執行操作(不含憑證與原始碼內容)
+8. **鎖定保證釋放** — try/finally,不留殘留鎖定,也不讓連線卡在 stateful
+9. **401 斷路** — 連續 2 次認證失敗後停止連線 SAP,避免重試把帳號鎖住
 
 ## 開發
 
@@ -122,7 +135,7 @@ npm run test:it:write  # 整合測試唯讀 + 寫入組(只在 $TMP 建暫存 cl
 
 ## Roadmap
 
-- **Phase 2**:`create_object`、ABAP Unit 測試、ATC、where-used
+- ~~**Phase 2**:`create_object`、ABAP Unit 測試、ATC、where-used~~(v0.3 完成)
 - **Phase 3**:SQL 資料查詢(Data Preview)、ST22 dump 分析、DDIC 資訊
 - **Phase 4**:BTP ABAP Environment(JWT / Service Key)
 

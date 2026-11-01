@@ -6,7 +6,12 @@
 
 | 風險 | 防護 |
 |---|---|
-| AI 誤改 SAP 標準物件 | 前綴白名單(預設僅 `Z`/`Y`/`$`) |
+| AI 誤改 SAP 標準物件 | 前綴白名單(預設僅 `Z`/`Y`/`$`)+ package 白名單(預設僅 `$TMP`、`Z*`、`Y*`) |
+| AI 在 SAP 上執行任意程式(`run_class`) | 唯讀模式不註冊;只能執行通過兩道白名單的 class;工具說明開頭明寫「會在 SAP 系統上執行程式」;audit log |
+| AI 大量建立物件或放進錯誤的 package(`create_object`) | 兩道白名單;非本機 package 必須明確給 transport;建立前先做名稱檢查;audit log |
+| ABAP Unit 測試改到資料 | `run_unit_tests` 只執行 RISK LEVEL HARMLESS 的測試 |
+| 密碼錯誤時自動重試把帳號鎖住 | 401 斷路:連續 2 次認證失敗後停止連線 SAP,需修正密碼後重開 MCP |
+| 並行寫入互相干擾(共用 stateful session) | 寫入類操作在 process 內依序執行;解鎖後回到 stateless 並清除 stateful context |
 | AI 在 prod 系統執行寫入 | `SYSTEM_ROLE=prod` 強制唯讀,程式內無覆寫路徑 |
 | AI 蓋掉其他開發者的變更 | 樂觀並行檢查(`expected_current_source`) |
 | AI 寫入語法錯誤的程式碼 | 寫入前強制語法檢查(可明確跳過,但預設開啟) |
@@ -41,9 +46,37 @@ SYSTEM_ROLE=prod → readonly=true(無條件)
 ABAP_MCP_ALLOWED_PREFIXES=ZFI_,ZMM_
 ```
 
+### 3-1. package 白名單
+
+`ABAP_MCP_ALLOWED_PACKAGES`(預設 `$TMP,Z*,Y*`;`*` 結尾為前綴比對,否則完全比對)。即使物件名稱是 `Z` 開頭,只要放在白名單外的 package,`write_source`、`activate_object`、`create_object`、`run_class` 都會拒絕。物件的 package 在鎖定前從 SAP 讀取;讀不到 package 時一律拒絕。
+
+```
+ABAP_MCP_ALLOWED_PACKAGES=$TMP,ZFI_*
+```
+
+### 3-2. 執行程式(`run_class`)
+
+`run_class` 會在 SAP 系統上**真的執行** class 的 `IF_OO_ADT_CLASSRUN~MAIN`,程式裡寫資料庫、呼叫 RFC 等都會發生。防護:
+
+- 唯讀模式或 `SYSTEM_ROLE=prod` 時不註冊
+- 只能執行同時通過名稱前綴與 package 白名單的 class(預設即只有 `$TMP` / `Z*` / `Y*` 的自建 class)
+- 工具說明開頭寫明「會在 SAP 系統上執行程式」,讓 AI 與使用者在呼叫前都看得到
+- 每次執行都寫 audit log(`action: "run_class"`)
+
+刻意**沒有**另外的開關:能寫入就能把任意程式寫進白名單內的 class,再加一個執行開關提供不了實質保護,只會增加設定負擔。不希望 AI 執行程式時,請改用唯讀模式。
+
+### 3-3. ABAP Unit 與建立物件
+
+- `run_unit_tests` 只執行 `RISK LEVEL HARMLESS`、`DURATION SHORT/MEDIUM` 的測試類別(不跑 DANGEROUS / CRITICAL),因此唯讀模式也提供
+- `create_object` 在建立前呼叫 SAP 的名稱檢查;非 `$` 開頭的 package 必須給 transport;`create_transport` 只在 `SYSTEM_ROLE=dev` 且非唯讀時註冊
+
+### 3-4. 401 斷路
+
+SAP 預設連續登入失敗 5 次即鎖住帳號。密碼錯誤時,AI 或使用者很容易在幾次重試內就把帳號鎖住。因此連續 2 次 401 後,所有工具直接回錯誤、不再連 SAP,提示「修正 SAP_PASSWORD 後重開 MCP」;中間只要成功一次就歸零。網路層錯誤(SAP 未啟動)不計入。
+
 ### 4. Audit log
 
-設定 `ABAP_MCP_AUDIT_LOG=/path/audit.jsonl` 後,每筆寫入/啟用操作記錄一行 JSON:
+設定 `ABAP_MCP_AUDIT_LOG=/path/audit.jsonl` 後,每筆寫入、啟用、建立物件(`create_object`)、執行(`run_class`)、建立 transport(`create_transport`)操作記錄一行 JSON:
 
 ```json
 {"timestamp":"2026-06-12T08:00:00.000Z","action":"write_source","objectUrl":"/sap/bc/adt/oo/classes/zcl_demo","objectName":"ZCL_DEMO","transport":"DEVK900123","summary":"行數 120 → 135(約 +18 / -3)","success":true}
@@ -78,7 +111,8 @@ export NODE_EXTRA_CA_CERTS=/path/to/corp-root-ca.pem
 - [ ] 連 qa 系統:考慮 `ABAP_MCP_READONLY=true`(AI 只做分析)
 - [ ] 連 prod 系統:`SYSTEM_ROLE=prod`(自動唯讀),或乾脆不要連
 - [ ] 使用專屬的技術帳號(非個人帳號),權限最小化,只授權需要的 package
-- [ ] 白名單收斂到實際需要的命名空間
+- [ ] 白名單收斂到實際需要的命名空間與 package(`ABAP_MCP_ALLOWED_PREFIXES`、`ABAP_MCP_ALLOWED_PACKAGES`)
+- [ ] 不希望 AI 在 SAP 上執行程式(`run_class`)時,使用唯讀模式
 - [ ] 密碼不出現在任何進版控的檔案中
 
 ## 回報安全問題

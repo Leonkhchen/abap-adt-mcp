@@ -158,10 +158,10 @@ describe("ping", () => {
     expect(r.text).toContain("12 ms");
   });
 
-  it("ping_system 顯示版本,且版本取自 package.json(E2)", async () => {
+  it("ping_system 顯示版本,且版本取自 package.json(E2;v0.3 起為 0.3.0)", async () => {
     const pkg = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8"));
     expect(VERSION).toBe(pkg.version);
-    expect(VERSION).toBe("0.2.0");
+    expect(VERSION).toBe("0.3.0");
     const call = await connectTools(mockAdt());
     const r = await call("ping_system");
     expect(r.text).toContain(`版本:${VERSION}`);
