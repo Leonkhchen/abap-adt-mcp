@@ -25,6 +25,24 @@ export const TYPE_INFO: Record<CreatableType, TypeInfo> = {
   "BDEF/BDO": { collection: "/sap/bc/adt/bo/behaviordefinitions", label: "Behavior Definition", maxLength: 30 },
 };
 
+/** source URI 的尾端:/source/main 或 class 的 include(例如 /includes/testclasses) */
+const SOURCE_SUFFIX = /\/(source\/[^/]+|includes\/[^/]+)$/;
+
+/** 是否已是 source URI(/source/main 或 /includes/xxx) */
+export function isSourceUrl(url: string): boolean {
+  return SOURCE_SUFFIX.test(url);
+}
+
+/** source URI → 物件 URI,例如 …/zcl_demo/includes/testclasses → …/zcl_demo */
+export function baseObjectUrl(url: string): string {
+  return url.replace(SOURCE_SUFFIX, "");
+}
+
+/** class 的測試 include(ABAP Unit 測試類別所在) */
+export function isTestClassesInclude(url: string): boolean {
+  return /\/oo\/classes\/[^/]+\/includes\/testclasses$/.test(url);
+}
+
 /** 新物件的 ADT URI,例如 /sap/bc/adt/oo/classes/zcl_demo */
 export function newObjectUrl(type: CreatableType, name: string): string {
   return `${TYPE_INFO[type].collection}/${encodeURIComponent(name.toLowerCase())}`;

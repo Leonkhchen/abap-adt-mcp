@@ -9,7 +9,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { AdtService } from "../adt/client.js";
-import { CREATABLE_TYPES, isLocalPackage, newObjectUrl, packageUrl } from "../adt/objectTypes.js";
+import {
+  baseObjectUrl,
+  CREATABLE_TYPES,
+  isLocalPackage,
+  isSourceUrl,
+  newObjectUrl,
+  packageUrl,
+} from "../adt/objectTypes.js";
 import { formatAtcResult, formatClassComponents, formatUnitTestResults, formatWhereUsed } from "./formatters.js";
 import type { AppConfig } from "../config.js";
 import type { AuditLogger } from "../safety/audit.js";
@@ -39,7 +46,7 @@ export function registerAnalysisTools(server: McpServer, adt: AdtService): void 
           return fail(new GuardViolationError("object_url 與 package_name 必須擇一提供。"));
         }
         const url = object_url
-          ? object_url.replace(/\/source\/[^/]+$/, "")
+          ? baseObjectUrl(object_url)
           : packageUrl(package_name!);
         return ok(formatUnitTestResults(await adt.runUnitTests(url)));
       } catch (e) {
@@ -68,7 +75,7 @@ export function registerAnalysisTools(server: McpServer, adt: AdtService): void 
           return fail(new GuardViolationError("object_url 與 package_name 必須擇一提供。"));
         }
         const url = object_url
-          ? object_url.replace(/\/source\/[^/]+$/, "")
+          ? baseObjectUrl(object_url)
           : packageUrl(package_name!);
         return ok(formatAtcResult(await adt.runAtc(url, check_variant, ATC_MAX_FINDINGS), ATC_MAX_FINDINGS));
       } catch (e) {
@@ -96,7 +103,7 @@ export function registerAnalysisTools(server: McpServer, adt: AdtService): void 
         if (column && !line) return fail(new GuardViolationError("給 column 時必須同時給 line。"));
         let url = object_url;
         // 指定位置時要用 source URI(位置是相對於原始碼)
-        if (line && !/\/source\/[^/]+$|\/includes\/[^/]+$/.test(url)) url = `${url.replace(/\/$/, "")}/source/main`;
+        if (line && !isSourceUrl(url)) url = `${url.replace(/\/$/, "")}/source/main`;
         const r = await adt.whereUsed(url, line, line ? (column ?? 1) - 1 : undefined);
         const target = line ? `${object_url} 第 ${line} 行${column ? `第 ${column} 欄` : ""}的元件` : object_url;
         return ok(formatWhereUsed(target, r, WHERE_USED_MAX));
@@ -124,7 +131,7 @@ export function registerAnalysisTools(server: McpServer, adt: AdtService): void 
     },
     async ({ object_url, line, column, implementation }) => {
       try {
-        const sourceUrl = /\/source\/[^/]+$|\/includes\/[^/]+$/.test(object_url)
+        const sourceUrl = isSourceUrl(object_url)
           ? object_url
           : `${object_url.replace(/\/$/, "")}/source/main`;
         const d = await adt.findDefinition(sourceUrl, line, column - 1, implementation ?? false);
@@ -152,7 +159,7 @@ export function registerAnalysisTools(server: McpServer, adt: AdtService): void 
     },
     async ({ object_url }) => {
       try {
-        return ok(formatClassComponents(await adt.classComponents(object_url.replace(/\/source\/[^/]+$/, ""))));
+        return ok(formatClassComponents(await adt.classComponents(baseObjectUrl(object_url))));
       } catch (e) {
         return fail(e);
       }

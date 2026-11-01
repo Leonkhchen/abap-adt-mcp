@@ -110,6 +110,14 @@ export function translateAdtError(err: unknown): AdtErrorInfo {
       suggestion: "請確認使用者具備 S_DEVELOP 權限,且 SICF 節點 /sap/bc/adt 已啟用。",
     };
   }
+  if (lower.includes("does not have any inactive version")) {
+    return {
+      message: `原始碼尚未建立:${raw}`,
+      suggestion:
+        "若是 class 的測試 include(…/includes/testclasses),代表還沒有 ABAP Unit 測試類別;" +
+        "直接用 write_source 寫入該 URI 即會自動建立。",
+    };
+  }
   if (lower.includes("404") || lower.includes("not found") || lower.includes("does not exist")) {
     return {
       message: `物件或服務不存在(404):${raw}`,

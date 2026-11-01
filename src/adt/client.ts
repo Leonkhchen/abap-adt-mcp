@@ -112,6 +112,8 @@ export interface AdtService {
     transport?: string
   ): Promise<void>;
   lock(objectUrl: string): Promise<AdtLock>;
+  /** 為 class 建立測試 include(/includes/testclasses);需在鎖定中呼叫 */
+  createTestInclude(className: string, lockHandle: string, transport?: string): Promise<void>;
   unLock(objectUrl: string, lockHandle: string): Promise<void>;
   activate(objectName: string, objectUrl: string): Promise<ActivationResult>;
   syntaxCheck(
@@ -290,10 +292,26 @@ export class RealAdtService implements AdtService {
       } catch (e) {
         // 鎖定失敗必須恢復 stateless:abap-adt-api 在 stateful 模式下不會自動重登,
         // 若停在 stateful,之後 session 失效時所有呼叫都無法恢復
-        this.client.stateful = session_types.stateless;
+        this.endStatefulSession();
         throw e;
       }
     });
+  }
+
+  /**
+   * 回到 stateless,並丟掉 stateful 期間 SAP 發的 sap-contextid cookie。
+   * A4H 實測:解鎖後若保留 sap-contextid,之後任何一次 SAP 端例外(例如讀取尚未建立的 include)
+   * 會結束那個 context,此後所有請求都帶著失效的 context id 而回 400,且無法自行恢復。
+   */
+  private endStatefulSession(): void {
+    this.client.stateful = session_types.stateless;
+    // AdtHTTP.cookie 在型別上是 private,執行期為 Map<cookie 名稱, 值>
+    const jar = (this.client.httpClient as unknown as { cookie?: Map<string, string> }).cookie;
+    jar?.delete("sap-contextid");
+  }
+
+  async createTestInclude(className: string, lockHandle: string, transport?: string) {
+    return this.guard(() => this.client.createTestInclude(className.toUpperCase(), lockHandle, transport));
   }
 
   async unLock(objectUrl: string, lockHandle: string) {
@@ -301,7 +319,7 @@ export class RealAdtService implements AdtService {
       await this.guard(() => this.client.unLock(objectUrl, lockHandle));
     } finally {
       // 無論解鎖成敗(含斷路)都恢復 stateless,釋放後端資源並保留自動重登能力
-      this.client.stateful = session_types.stateless;
+      this.endStatefulSession();
     }
   }
 

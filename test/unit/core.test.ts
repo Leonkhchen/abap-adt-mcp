@@ -37,7 +37,14 @@ import { registerTools } from "../../src/tools/registry.js";
 import { AuditLogger } from "../../src/safety/audit.js";
 import { VERSION } from "../../src/version.js";
 import { SerialQueue } from "../../src/safety/serialQueue.js";
-import { bdefCreateBody, newObjectUrl, parseValidation } from "../../src/adt/objectTypes.js";
+import {
+  baseObjectUrl,
+  bdefCreateBody,
+  isSourceUrl,
+  isTestClassesInclude,
+  newObjectUrl,
+  parseValidation,
+} from "../../src/adt/objectTypes.js";
 import { formatAtcResult, formatClassComponents, formatUnitTestResults, formatWhereUsed } from "../../src/tools/formatters.js";
 import { parseUsageReferences, parseUsageSnippets, usageSnippetsBody } from "../../src/adt/whereUsed.js";
 import type { UnitTestClass } from "abap-adt-api";
@@ -67,6 +74,7 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     setObjectSource: vi.fn(async () => {}),
     lock: vi.fn(async () => ({ LOCK_HANDLE: "LH-123" } as never)),
     unLock: vi.fn(async () => {}),
+    createTestInclude: vi.fn(async () => {}),
     activate: vi.fn(async () => ({ success: true, messages: [] } as never)),
     syntaxCheck: vi.fn(async () => []),
     nodeContents: vi.fn(async () => ({ nodes: [] } as never)),
@@ -653,6 +661,76 @@ describe("class_components", () => {
   });
 });
 
+// ───────────────────────── 測試 include 與語法檢查參數 ─────────────────────────
+
+describe("source URI 與語法檢查", () => {
+  it("baseObjectUrl / isSourceUrl / isTestClassesInclude", () => {
+    expect(baseObjectUrl("/sap/bc/adt/oo/classes/zcl_x/includes/testclasses")).toBe("/sap/bc/adt/oo/classes/zcl_x");
+    expect(baseObjectUrl("/sap/bc/adt/oo/classes/zcl_x/source/main")).toBe("/sap/bc/adt/oo/classes/zcl_x");
+    expect(baseObjectUrl("/sap/bc/adt/oo/classes/zcl_x")).toBe("/sap/bc/adt/oo/classes/zcl_x");
+    expect(isSourceUrl("/sap/bc/adt/oo/classes/zcl_x/includes/testclasses")).toBe(true);
+    expect(isSourceUrl("/sap/bc/adt/oo/classes/zcl_x")).toBe(false);
+    expect(isTestClassesInclude("/sap/bc/adt/oo/classes/zcl_x/includes/testclasses")).toBe(true);
+    expect(isTestClassesInclude("/sap/bc/adt/oo/classes/zcl_x/source/main")).toBe(false);
+  });
+
+  it("write_source / syntax_check 以 (source URI, 物件 URI) 順序做語法檢查(A4H 實測 include 需此順序)", async () => {
+    const adt = mockAdt();
+    const call = await connectTools(adt);
+    const inc = "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses";
+    await call("write_source", { object_url: inc, new_source: "tests" });
+    expect(adt.syntaxCheck).toHaveBeenCalledWith(inc, "/sap/bc/adt/oo/classes/zcl_x", "tests");
+    expect(adt.lock).toHaveBeenCalledWith("/sap/bc/adt/oo/classes/zcl_x");
+    expect(adt.objectStructure).not.toHaveBeenCalled();
+    await call("syntax_check", { object_url: inc, source: "x" });
+    expect(adt.syntaxCheck).toHaveBeenLastCalledWith(inc, "/sap/bc/adt/oo/classes/zcl_x", "x");
+  });
+
+  it("測試 include 尚未建立 → 先建立空 include 再做語法檢查;語法錯誤時不寫入", async () => {
+    const order: string[] = [];
+    let exists = false;
+    const adt = mockAdt({
+      getObjectSource: vi.fn(async () => {
+        if (!exists) throw new Error("ZCL_X=====CCAU does not have any inactive version");
+        return "* empty";
+      }),
+      lock: vi.fn(async () => { order.push("lock"); return { LOCK_HANDLE: "LH" } as never; }),
+      createTestInclude: vi.fn(async () => { order.push("createTestInclude"); exists = true; }),
+      unLock: vi.fn(async () => { order.push("unlock"); }),
+      syntaxCheck: vi.fn(async () => { order.push("syntaxCheck"); return [{ severity: "E", line: 8, text: "\".\" expected", offset: 0, uri: "" }] as never; }),
+      setObjectSource: vi.fn(async () => { order.push("write"); }),
+    });
+    const call = await connectTools(adt);
+    const r = await call("write_source", { object_url: "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses", new_source: "bad" });
+    expect(r.text).toContain("寫入已中止");
+    expect(r.text).toContain("已先建立空的測試 include");
+    expect(order).toEqual(["lock", "createTestInclude", "unlock", "syntaxCheck"]);
+    expect(adt.setObjectSource).not.toHaveBeenCalled();
+  });
+
+  it("解鎖或鎖定失敗回到 stateless 時丟掉 sap-contextid cookie(A4H 實測會導致之後全部 400)", async () => {
+    const cookie = new Map([["SAP_SESSIONID_A4H_001", "s"], ["sap-contextid", "c"]]);
+    const fake = fakeAdtClient();
+    (fake.httpClient as unknown as { cookie: Map<string, string> }).cookie = cookie;
+    const adt = realAdt(fake);
+    await adt.lock("/u");
+    await adt.unLock("/u", "LH-1");
+    expect([...cookie.keys()]).toEqual(["SAP_SESSIONID_A4H_001"]);
+
+    cookie.set("sap-contextid", "c2");
+    fake.lock.mockRejectedValueOnce(new Error("locked by OTHER"));
+    await expect(adt.lock("/u")).rejects.toThrow("locked");
+    expect(cookie.has("sap-contextid")).toBe(false);
+    expect(fake.stateful).toBe(session_types.stateless);
+  });
+
+  it("讀不到尚未建立的測試 include → 提示用 write_source 建立", () => {
+    const info = translateAdtError(new Error("ZCL_X=====CCAU does not have any inactive version"));
+    expect(info.message).toContain("原始碼尚未建立");
+    expect(info.suggestion).toContain("write_source");
+  });
+});
+
 // ───────────────────────── run_class(G6)─────────────────────────
 
 describe("run_class", () => {
@@ -969,6 +1047,33 @@ describe("lockedWrite", () => {
       expectedCurrentSource: "line1\nline2\n",
     });
     expect(result.success).toBe(true);
+  });
+
+  it("class 測試 include 尚未建立 → 鎖定中先建立再寫入", async () => {
+    const order: string[] = [];
+    const adt = mockAdt({
+      getObjectSource: vi.fn(async () => {
+        throw new Error("ZCL_DEMO=====================CCAU does not have any inactive version");
+      }),
+      lock: vi.fn(async () => { order.push("lock"); return { LOCK_HANDLE: "LH-1" } as never; }),
+      createTestInclude: vi.fn(async () => { order.push("createTestInclude"); }),
+      setObjectSource: vi.fn(async () => { order.push("write"); }),
+      unLock: vi.fn(async () => { order.push("unlock"); }),
+    });
+    const inc = "/sap/bc/adt/oo/classes/zcl_demo/includes/testclasses";
+    const r = await lockedWrite(adt, { objectUrl: "/sap/bc/adt/oo/classes/zcl_demo", sourceUrl: inc, newSource: "tests" });
+    expect(r.previousSource).toBe("");
+    expect(adt.createTestInclude).toHaveBeenCalledWith("ZCL_DEMO", "LH-1", undefined);
+    expect(order).toEqual(["lock", "createTestInclude", "write", "unlock"]);
+  });
+
+  it("main source 讀取失敗不會被當成新 include(原錯誤照拋)", async () => {
+    const adt = mockAdt({
+      getObjectSource: vi.fn(async () => { throw new Error("Resource does not exist"); }),
+    });
+    await expect(lockedWrite(adt, params)).rejects.toThrow("does not exist");
+    expect(adt.lock).not.toHaveBeenCalled();
+    expect(adt.createTestInclude).not.toHaveBeenCalled();
   });
 
   it("transport 編號正確傳遞", async () => {
