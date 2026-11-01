@@ -332,6 +332,21 @@ describe("translateAdtError", () => {
     expect(info.suggestion).toContain("SAP_URL");
   });
 
+  it("ECONNREFUSED / fetch failed → 提示系統可能未啟動與啟動方式(A4)", () => {
+    for (const msg of ["connect ECONNREFUSED 127.0.0.1:50000", "fetch failed", "socket hang up"]) {
+      const info = translateAdtError(new Error(msg));
+      expect(info.message).toContain("無法連線");
+      expect(info.suggestion).toContain("SAP 系統可能未啟動");
+      expect(info.suggestion).toContain("a4h-start.bat");
+      expect(info.suggestion).toContain("docker start a4h");
+    }
+  });
+
+  it("port 號含 401 的連線錯誤不會被誤判為認證失敗", () => {
+    const info = translateAdtError(new Error("connect ECONNREFUSED 10.0.0.1:44010"));
+    expect(info.message).toContain("無法連線");
+  });
+
   it("鎖定衝突 → SM12 建議", () => {
     const info = translateAdtError(new Error("Object is locked by user OTHER"));
     expect(info.suggestion).toContain("SM12");
