@@ -38,7 +38,11 @@ export function translateAdtError(err: unknown): AdtErrorInfo {
   if (lower.includes("401") || lower.includes("unauthorized")) {
     return {
       message: `SAP 認證失敗(401):${raw}`,
-      suggestion: "請檢查 SAP_USER / SAP_PASSWORD / SAP_CLIENT 環境變數是否正確,以及帳號是否被鎖定。",
+      suggestion:
+        "請檢查 SAP_USER / SAP_PASSWORD / SAP_CLIENT 環境變數是否正確,以及帳號是否被鎖定。" +
+        "密碼含 # 時,.env 中要加引號(SAP_PASSWORD=\"...\"),否則 # 之後會被當成註解截斷。" +
+        "注意:連續登入失敗會鎖住帳號,請先確認設定再重試;被鎖時請用同一 client 的管理者帳號" +
+        "以 SU01 解鎖(SU01 只能管理目前登入 client 的使用者)。",
     };
   }
   if (lower.includes("403") || lower.includes("forbidden") || lower.includes("csrf")) {

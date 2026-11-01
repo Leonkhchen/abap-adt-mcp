@@ -327,6 +327,14 @@ describe("translateAdtError", () => {
     expect(info.suggestion).toContain("SAP_USER");
   });
 
+  it("401 建議提醒 # 要加引號、連續失敗會鎖帳號與 SU01 解鎖(B2)", () => {
+    const info = translateAdtError(new Error("Request failed with status code 401"));
+    expect(info.suggestion).toContain("#");
+    expect(info.suggestion).toContain("引號");
+    expect(info.suggestion).toContain("鎖住帳號");
+    expect(info.suggestion).toContain("SU01");
+  });
+
   it("連線失敗 → 網路建議", () => {
     const info = translateAdtError(new Error("connect ECONNREFUSED 10.0.0.1:44300"));
     expect(info.suggestion).toContain("SAP_URL");
