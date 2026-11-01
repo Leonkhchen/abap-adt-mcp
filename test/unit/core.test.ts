@@ -127,6 +127,32 @@ describe("ping", () => {
   });
 });
 
+// ───────────────────────── 登入狀態(A2)─────────────────────────
+
+describe("登入狀態交給 abap-adt-api", () => {
+  it("login() 依 ADTClient.loggedin 判斷:session 失效後會重新登入", async () => {
+    const fake = fakeAdtClient({ loggedin: false });
+    const adt = realAdt(fake);
+    await adt.login();
+    expect(fake.login).toHaveBeenCalledTimes(1);
+    fake.loggedin = true;
+    await adt.login();
+    expect(fake.login).toHaveBeenCalledTimes(1);
+    fake.loggedin = false; // 例如 SAP 重啟後 library 清掉了 CSRF token
+    await adt.login();
+    expect(fake.login).toHaveBeenCalledTimes(2);
+  });
+
+  it("一般方法直接交給 ADTClient(由其自動登入/重登),不自行快取登入狀態", async () => {
+    const fake = fakeAdtClient({ loggedin: false });
+    const adt = realAdt(fake);
+    await adt.searchObject("ZCL_*");
+    await adt.searchObject("ZCL_*");
+    expect(fake.searchObject).toHaveBeenCalledTimes(2);
+    expect(fake.login).not.toHaveBeenCalled();
+  });
+});
+
 // ───────────────────────── config ─────────────────────────
 
 describe("loadConfig", () => {

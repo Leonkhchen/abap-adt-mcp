@@ -56,7 +56,6 @@ export interface AdtService {
 /** 真實實作:包裝 abap-adt-api 的 ADTClient */
 export class RealAdtService implements AdtService {
   private client: ADTClient;
-  private loggedIn = false;
 
   /** @param client 選填:注入既有的 ADTClient(單元測試用) */
   constructor(private cfg: AppConfig, client?: ADTClient) {
@@ -76,12 +75,13 @@ export class RealAdtService implements AdtService {
       );
   }
 
-  /** 確保已登入(冪等;斷線後可重複呼叫) */
+  /**
+   * 確保已登入(冪等)。登入狀態以 abap-adt-api 的 ADTClient.loggedin 為準,
+   * 不另外快取:其 request() 在未登入時會自動登入,stateless 下遇 401 也會自動重登一次,
+   * 因此一般方法不需要先呼叫 login()。
+   */
   async login(): Promise<void> {
-    if (!this.loggedIn) {
-      await this.client.login();
-      this.loggedIn = true;
-    }
+    if (!this.client.loggedin) await this.client.login();
   }
 
   /**
@@ -103,12 +103,10 @@ export class RealAdtService implements AdtService {
   }
 
   async searchObject(query: string, objType?: string, max?: number) {
-    await this.login();
     return this.client.searchObject(query, objType, max);
   }
 
   async objectStructure(objectUrl: string) {
-    await this.login();
     return this.client.objectStructure(objectUrl);
   }
 
@@ -117,7 +115,6 @@ export class RealAdtService implements AdtService {
   }
 
   async getObjectSource(sourceUrl: string) {
-    await this.login();
     return this.client.getObjectSource(sourceUrl);
   }
 
@@ -127,7 +124,6 @@ export class RealAdtService implements AdtService {
     lockHandle: string,
     transport?: string
   ) {
-    await this.login();
     return this.client.setObjectSource(sourceUrl, source, lockHandle, transport);
   }
 
@@ -137,7 +133,6 @@ export class RealAdtService implements AdtService {
    * abap-adt-api 透過 client.stateful 切換,這裡集中處理。
    */
   async lock(objectUrl: string) {
-    await this.login();
     this.client.stateful = session_types.stateful;
     return this.client.lock(objectUrl);
   }
@@ -149,27 +144,22 @@ export class RealAdtService implements AdtService {
   }
 
   async activate(objectName: string, objectUrl: string) {
-    await this.login();
     return this.client.activate(objectName, objectUrl);
   }
 
   async syntaxCheck(url: string, mainUrl: string, content: string) {
-    await this.login();
     return this.client.syntaxCheck(url, mainUrl, content);
   }
 
   async nodeContents(parentType: "DEVC/K", packageName: string) {
-    await this.login();
     return this.client.nodeContents(parentType, packageName);
   }
 
   async transportInfo(objSourceUrl: string, devClass?: string) {
-    await this.login();
     return this.client.transportInfo(objSourceUrl, devClass);
   }
 
   async userTransports(user: string) {
-    await this.login();
     return this.client.userTransports(user);
   }
 }
