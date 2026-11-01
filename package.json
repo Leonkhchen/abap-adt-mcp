@@ -4,7 +4,9 @@
   "description": "Standalone MCP server connecting Claude Code / Codex directly to SAP ABAP ADT REST API",
   "main": "index.js",
   "scripts": {
-    "test": "vitest run",
+    "test": "vitest run test/unit",
+    "test:it": "vitest run test/integration --mode it",
+    "test:it:write": "vitest run test/integration --mode it-write",
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsc && node dist/index.js"
