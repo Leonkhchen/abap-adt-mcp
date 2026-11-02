@@ -321,8 +321,25 @@ export function registerTools(
         // 第二道白名單:物件所在 package(在鎖定前檢查)
         assertPackageAllowed(cfg, await adt.objectPackage(baseObjectUrl));
 
-        // 測試 include 尚未建立時先建立空的,語法檢查才有效
-        const includeCreated = await ensureTestInclude(adt, baseObjectUrl, sourceUrl, transport);
+        // 測試 include 尚未建立時先建立空的,語法檢查才有效(並行檢查在建立之前)
+        const includeCreated = await ensureTestInclude(
+          adt,
+          baseObjectUrl,
+          sourceUrl,
+          transport,
+          expected_current_source
+        );
+        if (includeCreated) {
+          audit.log({
+            timestamp: new Date().toISOString(),
+            action: "create_test_include",
+            objectUrl: sourceUrl,
+            objectName,
+            transport,
+            summary: "建立空的測試 include(寫入前語法檢查用)",
+            success: true,
+          });
+        }
 
         // 寫入前語法檢查(預設開啟):避免把壞掉的程式碼寫進系統
         if (!skip_syntax_check) {

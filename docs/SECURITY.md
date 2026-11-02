@@ -76,7 +76,7 @@ SAP 預設連續登入失敗 5 次即鎖住帳號。密碼錯誤時,AI 或使用
 
 ### 4. Audit log
 
-設定 `ABAP_MCP_AUDIT_LOG=/path/audit.jsonl` 後,每筆寫入、啟用、建立物件(`create_object`)、執行(`run_class`)、建立 transport(`create_transport`)操作記錄一行 JSON:
+設定 `ABAP_MCP_AUDIT_LOG=/path/audit.jsonl` 後,每筆寫入、啟用、建立物件(`create_object`)、為語法檢查先建立空的測試 include(`create_test_include`)、執行(`run_class`)、建立 transport(`create_transport`)操作記錄一行 JSON:
 
 ```json
 {"timestamp":"2026-06-12T08:00:00.000Z","action":"write_source","objectUrl":"/sap/bc/adt/oo/classes/zcl_demo","objectName":"ZCL_DEMO","transport":"DEVK900123","summary":"行數 120 → 135(約 +18 / -3)","success":true}

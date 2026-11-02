@@ -724,6 +724,42 @@ describe("source URI 與語法檢查", () => {
     expect(adt.setObjectSource).not.toHaveBeenCalled();
   });
 
+  it("建立空測試 include 時寫 audit;給了非空 expected_current_source 卻不存在 → 不建立、回並行衝突(v0.3 審查 #3)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "abap-mcp-inc-"));
+    const auditPath = path.join(dir, "audit.jsonl");
+    try {
+      let exists = false;
+      const missing = () => { if (!exists) throw new Error("ZCL_X=====CCAU does not have any inactive version"); return "* empty"; };
+      const adt = mockAdt({
+        getObjectSource: vi.fn(async () => missing()),
+        createTestInclude: vi.fn(async () => { exists = true; }),
+      });
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerTools(server, adt, makeConfig(), new AuditLogger(auditPath));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(clientT);
+      const inc = "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses";
+      const callTool = async (args: Record<string, unknown>) =>
+        ((await client.callTool({ name: "write_source", arguments: args })) as { content: { text: string }[] }).content[0].text;
+
+      // 1) 並行衝突:不建立 include
+      const conflict = await callTool({ object_url: inc, new_source: "tests", expected_current_source: "CLASS ltc …" });
+      expect(conflict).toContain("不一致");
+      expect(adt.createTestInclude).not.toHaveBeenCalled();
+
+      // 2) 正常建立:audit 有 create_test_include
+      await callTool({ object_url: inc, new_source: "tests" });
+      expect(adt.createTestInclude).toHaveBeenCalledTimes(1);
+      const entries = fs.readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(entries.some((e) => e.action === "create_test_include" && e.objectName === "ZCL_X" && e.success)).toBe(true);
+      expect(entries.some((e) => e.action === "write_source" && e.success)).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("解鎖或鎖定失敗回到 stateless 時丟掉 sap-contextid cookie(A4H 實測會導致之後全部 400)", async () => {
     const cookie = new Map([["SAP_SESSIONID_A4H_001", "s"], ["sap-contextid", "c"]]);
     const fake = fakeAdtClient();

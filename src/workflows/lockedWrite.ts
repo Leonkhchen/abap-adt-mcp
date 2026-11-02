@@ -122,7 +122,8 @@ export async function ensureTestInclude(
   adt: AdtService,
   objectUrl: string,
   sourceUrl: string,
-  transport?: string
+  transport?: string,
+  expectedCurrentSource?: string
 ): Promise<boolean> {
   if (!isTestClassesInclude(sourceUrl)) return false;
   try {
@@ -130,6 +131,10 @@ export async function ensureTestInclude(
     return false;
   } catch (e) {
     if (!isMissingSource(e)) throw e;
+  }
+  // 並行檢查先於建立:呼叫端以為已有內容、系統上卻不存在 → 已被他人改動,什麼都不建立
+  if (expectedCurrentSource !== undefined && normalize(expectedCurrentSource) !== "") {
+    throw new ConcurrentModificationError();
   }
   const lock = await adt.lock(objectUrl);
   try {
