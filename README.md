@@ -116,7 +116,7 @@ PowerShell 的換行符號是反引號 `` ` ``(行尾不可有空白)。密碼�
 | `ABAP_MCP_ALLOWED_PREFIXES` | | `Z,Y,$` | 可寫入的物件名稱前綴白名單 |
 | `ABAP_MCP_ALLOWED_PACKAGES` | | `$TMP,Z*,Y*` | 可寫入/建立/執行物件所在的 package 白名單(`*` 結尾為前綴比對) |
 | `ABAP_MCP_ALLOW_DATA_PREVIEW` | | `false` | `true` 時才註冊 `data_preview`(讀資料表內容) |
-| `ABAP_MCP_DATA_PREVIEW_TABLES` | | `/DMO/*,Z*,Y*` | `data_preview` 可讀的表/view 白名單(`*` 結尾為前綴比對) |
+| `ABAP_MCP_DATA_PREVIEW_TABLES` | | `/DMO/*` | `data_preview` 可讀的表/view 白名單(`*` 結尾為前綴比對);加入 `Z*`/`Y*` 的風險見 SECURITY.md |
 | `ABAP_MCP_ALLOW_SELF_SIGNED` | | `false` | 允許自簽憑證(限內網開發系統) |
 | `ABAP_MCP_AUDIT_LOG` | | (停用) | 寫入操作稽核紀錄檔路徑 |
 | `ABAP_MCP_MAX_SOURCE_LINES` | | `5000` | `read_source` 回傳行數上限 |

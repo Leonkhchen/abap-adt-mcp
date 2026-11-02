@@ -11,7 +11,7 @@
 | AI 大量建立物件或放進錯誤的 package(`create_object`) | 兩道白名單;非本機 package 必須明確給 transport;建立前先做名稱檢查;audit log |
 | ABAP Unit 測試改到資料 | `run_unit_tests` 唯讀模式(含 prod)不註冊;只執行宣告為 RISK LEVEL HARMLESS 的測試 |
 | 密碼錯誤時自動重試把帳號鎖住 | 401 斷路:連續 2 次認證失敗後停止連線 SAP,需修正密碼後重開 MCP |
-| AI 讀出敏感資料(`data_preview`,例如 USR02 密碼雜湊、薪資) | 預設不註冊;表白名單(預設 `/DMO/*`、`Z*`、`Y*`),FROM / JOIN / 子查詢裡的每張表都檢查;無法可靠解析即拒絕 |
+| AI 讀出敏感資料(`data_preview`,例如 USR02 密碼雜湊、薪資) | 預設不註冊;表白名單(預設只有 `/DMO/*`),FROM / JOIN / 子查詢裡的每張表都檢查;無法可靠解析即拒絕 |
 | AI 透過查詢改資料或執行多語句 | 只接受單一 SELECT:去掉字串常值與註解後不得含 `;` 或 INSERT/UPDATE/DELETE/MODIFY/COMMIT/ROLLBACK/CALL/EXEC/INTO 等;SAP 端也只接受 SELECT |
 | 查詢結果撐爆或外洩大量資料 | 預設 100 筆、上限 1,000 筆;每格 200 字元、整體 20,000 字元;audit 只記 SQL 與筆數,不記資料 |
 | 短傾印帶出業務資料(`dump_detail`) | 只取除錯需要的章節,不含 Selected Variables(變數內容)、系統環境、記憶體資訊;dump_id 只接受 runtime/dump 路徑 |
@@ -83,12 +83,14 @@ SAP 預設連續登入失敗 5 次即鎖住帳號。密碼錯誤時,AI 或使用
 讀資料表等於把資料交給 AI(以及它背後的模型服務),是這個專案外洩風險最高的工具,因此:
 
 - **預設不註冊**:只有 `ABAP_MCP_ALLOW_DATA_PREVIEW=true` 時 AI 才看得到。開啟後唯讀模式也可用,因為它只讀資料
-- **表白名單** `ABAP_MCP_DATA_PREVIEW_TABLES`(預設 `/DMO/*,Z*,Y*`;`*` 結尾為前綴比對):單表模式檢查表名;SQL 模式從 SQL 解析 FROM / JOIN 後的每張表(含 WHERE 裡子查詢的表),任一不在白名單就整個拒絕。FROM 後面接子查詢、表函式或帶參數的 view、逗號列出多張表、找不到 FROM 等**無法可靠判斷讀取哪些表**的寫法一律拒絕
+- **表白名單** `ABAP_MCP_DATA_PREVIEW_TABLES`(預設只有 `/DMO/*`;`*` 結尾為前綴比對):單表模式檢查表名;SQL 模式從 SQL 解析 FROM / JOIN 後的每張表(含 WHERE 裡子查詢的表),任一不在白名單就整個拒絕。FROM 後面接子查詢、表函式或帶參數的 view、逗號列出多張表、找不到 FROM 等**無法可靠判斷讀取哪些表**的寫法一律拒絕
 - **只接受單一 SELECT**:先去掉字串常值與註解,再檢查不得含 `;`(多語句)與 INSERT、UPDATE、DELETE、MODIFY、COMMIT、ROLLBACK、CALL、EXEC、INTO 等關鍵字,且必須以 SELECT 開頭。SAP 的 Data Preview 端點本身也只接受 SELECT(實測回「Only SELECT statement is allowed」),這裡是可以在本機先擋下的第二道防線
 - **筆數與大小**:預設 100 筆、上限 1,000 筆;每格截斷 200 字元,整體輸出上限 20,000 字元
 - **audit**:記錄 SQL 文字(或表名)與回傳筆數,**不記錄任何資料內容**。注意 SQL 裡的 WHERE 條件值會進 audit
 
 白名單外的表(例如 USR02、HR 相關表、客戶主檔)不建議開放;確實需要時,只加入最小範圍的表名,不要用 `*`。
+
+**不要把 `Z*` / `Y*` 加進表白名單**(v0.4 起預設不含):白名單只看得到查詢裡寫的名稱,看不到 view 背後讀的是哪張表。AI 在非唯讀模式下可以用 `create_object` + `write_source` 建一個 `Z` 開頭的 CDS view,例如 `define view entity ZI_X as select from usr02 { … }`,再用 `data_preview` 讀 `ZI_X`,白名單就形同虛設。若確實要讓 AI 查自建的表,請只列出那幾張表的完整名稱(例如 `/DMO/*,ZMY_ORDERS`),或在開啟 `data_preview` 時同時使用唯讀模式(唯讀模式下 AI 無法建立物件)。
 
 ### 3-6. 短傾印(`list_dumps` / `dump_detail`)
 

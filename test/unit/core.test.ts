@@ -986,11 +986,14 @@ describe("data_preview 的 SQL 護欄", () => {
 
   it("每張表都要在白名單內:WHERE 子查詢裡的 USR02 也擋", () => {
     const cfg = makeConfig(dp);
-    expect(cfg.safety.dataPreviewTables).toEqual(["/DMO/*", "Z*", "Y*"]);
+    // 預設只有 /DMO/*:Z* / Y* 會讓 AI 能以自建 CDS view 包住任意表
+    expect(cfg.safety.dataPreviewTables).toEqual(["/DMO/*"]);
+    expect(() => assertTablesAllowed(cfg, ["ZI_WRAPS_USR02"])).toThrow(/ZI_WRAPS_USR02/);
     const sub = validateSelectSql("SELECT * FROM /dmo/travel WHERE agency_id IN ( SELECT bname FROM usr02 )");
     expect(sub.tables).toEqual(["/DMO/TRAVEL", "USR02"]);
     expect(() => assertTablesAllowed(cfg, sub.tables)).toThrow(/USR02/);
-    expect(() => assertTablesAllowed(cfg, ["/DMO/TRAVEL", "ZTAB"])).not.toThrow();
+    const custom = makeConfig({ ...dp, ABAP_MCP_DATA_PREVIEW_TABLES: "/DMO/*,ZTAB" });
+    expect(() => assertTablesAllowed(custom, ["/DMO/TRAVEL", "ZTAB"])).not.toThrow();
   });
 
   it("預設不註冊;開啟後唯讀模式也可用", async () => {
@@ -1030,7 +1033,12 @@ describe("data_preview 的 SQL 護欄", () => {
     try {
       const qr = { columns: [{ name: "SECRET" }], values: [{ SECRET: "TOP-SECRET-VALUE" }] } as never;
       const server = new McpServer({ name: "unit", version: "0" });
-      registerTools(server, mockAdt({ runQuery: vi.fn(async () => qr) }), makeConfig(dp), new AuditLogger(auditPath));
+      registerTools(
+        server,
+        mockAdt({ runQuery: vi.fn(async () => qr) }),
+        makeConfig({ ...dp, ABAP_MCP_DATA_PREVIEW_TABLES: "/DMO/*,ZTAB" }),
+        new AuditLogger(auditPath)
+      );
       const [clientT, serverT] = InMemoryTransport.createLinkedPair();
       await server.connect(serverT);
       const client = new Client({ name: "c", version: "0" });
