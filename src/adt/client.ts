@@ -174,16 +174,28 @@ export function packageFromObjectXml(xml: string): string {
 /** 連續認證失敗達此次數後斷路:不再連 SAP,避免重試把帳號鎖住(SAP 預設失敗 5 次即鎖定) */
 export const MAX_AUTH_FAILURES = 2;
 
-/** 真實實作:包裝 abap-adt-api 的 ADTClient */
+/**
+ * 真實實作:包裝 abap-adt-api 的 ADTClient。
+ *
+ * 用兩個 ADTClient(兩個獨立的 SAP session):
+ *  - client:一般呼叫(讀取、分析、啟用、建立、執行),一律 stateless
+ *  - lockClient:只做 lock → setObjectSource / createTestInclude → unLock,鎖定期間為 stateful
+ * 鎖定與寫入必須在同一個 stateful session;而 SAP 端只要一次例外就會結束該 session 的 context。
+ * 分開後,其他工具在寫入鎖定期間並行執行、甚至出錯,也碰不到持有鎖定的 session。
+ * 寫入類工具之間仍由 SerialQueue 依序執行。
+ */
 export class RealAdtService implements AdtService {
   private client: ADTClient;
-  /** 連續認證失敗次數;成功一次(或收到非認證類的 SAP 回應)即歸零 */
+  private lockClient: ADTClient;
+  /** 連續認證失敗次數(兩個 client 共用);成功一次(或收到非認證類的 SAP 回應)即歸零 */
   private authFailures = 0;
 
-  /** @param client 選填:注入既有的 ADTClient(單元測試用) */
-  constructor(private cfg: AppConfig, client?: ADTClient) {
-    this.client =
-      client ??
+  /**
+   * @param client 選填:注入一般呼叫用的 ADTClient(單元測試用)
+   * @param lockClient 選填:注入鎖定/寫入用的 ADTClient;只注入 client 時兩者共用
+   */
+  constructor(private cfg: AppConfig, client?: ADTClient, lockClient?: ADTClient) {
+    const create = () =>
       new ADTClient(
         cfg.sap.url,
         cfg.sap.user,
@@ -192,6 +204,8 @@ export class RealAdtService implements AdtService {
         cfg.sap.language,
         adtClientOptions(cfg)
       );
+    this.client = client ?? create();
+    this.lockClient = lockClient ?? (client ? client : create());
   }
 
   /**
@@ -276,7 +290,7 @@ export class RealAdtService implements AdtService {
     lockHandle: string,
     transport?: string
   ) {
-    return this.guard(() => this.client.setObjectSource(sourceUrl, source, lockHandle, transport));
+    return this.guard(() => this.lockClient.setObjectSource(sourceUrl, source, lockHandle, transport));
   }
 
   /**
@@ -286,9 +300,9 @@ export class RealAdtService implements AdtService {
    */
   async lock(objectUrl: string) {
     return this.guard(async () => {
-      this.client.stateful = session_types.stateful;
+      this.lockClient.stateful = session_types.stateful;
       try {
-        return await this.client.lock(objectUrl);
+        return await this.lockClient.lock(objectUrl);
       } catch (e) {
         // 鎖定失敗必須恢復 stateless:abap-adt-api 在 stateful 模式下不會自動重登,
         // 若停在 stateful,之後 session 失效時所有呼叫都無法恢復
@@ -304,19 +318,19 @@ export class RealAdtService implements AdtService {
    * 會結束那個 context,此後所有請求都帶著失效的 context id 而回 400,且無法自行恢復。
    */
   private endStatefulSession(): void {
-    this.client.stateful = session_types.stateless;
+    this.lockClient.stateful = session_types.stateless;
     // AdtHTTP.cookie 在型別上是 private,執行期為 Map<cookie 名稱, 值>
-    const jar = (this.client.httpClient as unknown as { cookie?: Map<string, string> }).cookie;
+    const jar = (this.lockClient.httpClient as unknown as { cookie?: Map<string, string> }).cookie;
     jar?.delete("sap-contextid");
   }
 
   async createTestInclude(className: string, lockHandle: string, transport?: string) {
-    return this.guard(() => this.client.createTestInclude(className.toUpperCase(), lockHandle, transport));
+    return this.guard(() => this.lockClient.createTestInclude(className.toUpperCase(), lockHandle, transport));
   }
 
   async unLock(objectUrl: string, lockHandle: string) {
     try {
-      await this.guard(() => this.client.unLock(objectUrl, lockHandle));
+      await this.guard(() => this.lockClient.unLock(objectUrl, lockHandle));
     } finally {
       // 無論解鎖成敗(含斷路)都恢復 stateless,釋放後端資源並保留自動重登能力
       this.endStatefulSession();

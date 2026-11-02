@@ -821,6 +821,53 @@ describe("create_transport", () => {
   });
 });
 
+// ───────────────────────── 鎖定用獨立 session(v0.3.1 #1)─────────────────────────
+
+describe("鎖定/寫入使用獨立的 ADTClient", () => {
+  it("lock、setObjectSource、createTestInclude、unLock 走鎖定 client;其他呼叫走一般 client", async () => {
+    const read = fakeAdtClient({ getObjectSource: vi.fn(async () => "src"), activate: vi.fn(async () => ({ success: true })) });
+    const lock = fakeAdtClient({ setObjectSource: vi.fn(async () => {}), createTestInclude: vi.fn(async () => {}) });
+    const adt = new RealAdtService(makeConfig(), read as unknown as ADTClient, lock as unknown as ADTClient);
+    await adt.getObjectSource("/u/source/main");
+    const l = await adt.lock("/u");
+    await adt.createTestInclude("ZCL_U", l.LOCK_HANDLE);
+    await adt.setObjectSource("/u/source/main", "new", l.LOCK_HANDLE);
+    await adt.unLock("/u", l.LOCK_HANDLE);
+    await adt.activate("ZCL_U", "/u");
+    expect(read.getObjectSource).toHaveBeenCalled();
+    expect(read.activate).toHaveBeenCalled();
+    expect(read.lock).not.toHaveBeenCalled();
+    expect(lock.lock).toHaveBeenCalledWith("/u");
+    expect(lock.createTestInclude).toHaveBeenCalled();
+    expect(lock.setObjectSource).toHaveBeenCalled();
+    expect(lock.unLock).toHaveBeenCalled();
+  });
+
+  it("鎖定期間一般 client 出錯,不影響持有鎖定的 session(stateful 與 context cookie 都保留)", async () => {
+    const read = fakeAdtClient({
+      getObjectSource: vi.fn(async () => { throw new Error("CCAU does not have any inactive version"); }),
+    });
+    const lock = fakeAdtClient();
+    const jar = new Map([["sap-contextid", "ctx"]]);
+    (lock.httpClient as unknown as { cookie: Map<string, string> }).cookie = jar;
+    const adt = new RealAdtService(makeConfig(), read as unknown as ADTClient, lock as unknown as ADTClient);
+    await adt.lock("/u");
+    await expect(adt.getObjectSource("/u/includes/testclasses")).rejects.toThrow("inactive version");
+    expect(lock.stateful).toBe(session_types.stateful);
+    expect(jar.get("sap-contextid")).toBe("ctx");
+    expect(read.stateful).toBe(session_types.stateless);
+    await adt.unLock("/u", "LH-1");
+    expect(jar.has("sap-contextid")).toBe(false);
+  });
+
+  it("只注入一個 client 時兩者共用(相容既有測試)", async () => {
+    const one = fakeAdtClient();
+    const adt = realAdt(one);
+    await adt.lock("/u");
+    expect(one.lock).toHaveBeenCalled();
+  });
+});
+
 // ───────────────────────── 寫入互斥(F1)─────────────────────────
 
 describe("寫入類操作依序執行", () => {
