@@ -104,6 +104,7 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     dataElementProperties: vi.fn(async () => ({ metaData: { name: "" }, properties: {} })),
     domainProperties: vi.fn(async () => ({ metaData: { name: "" }, properties: {} })),
     listDumps: vi.fn(async () => []),
+    prettyPrint: vi.fn(async (s: string) => ({ source: s, style: "", indentation: false })),
     dumpDetail: vi.fn(async () => ({ meta: { title: "", error: "", exception: "", program: "", datetime: "", author: "", contentsUri: "", chapters: [] }, text: "" })),
     runQuery: vi.fn(async () => ({ columns: [], values: [] }) as never),
     classComponents: vi.fn(async () => ({ "adtcore:name": "ZCL_X", "adtcore:type": "CLAS/OC", visibility: "public", links: [], components: [] }) as never),
@@ -1195,6 +1196,33 @@ describe("短傾印", () => {
     expect(r.text).toContain("/sap/bc/adt/runtime/dump/mine");
     expect(r.text).not.toContain("逾時");
     expect(adt.listDumps).toHaveBeenCalledWith("DEVELOPER");
+  });
+});
+
+// ───────────────────────── pretty_print(v0.4 D4)─────────────────────────
+
+describe("pretty_print", () => {
+  it("回傳格式化結果、不寫回;object_url 讀系統內容;唯讀模式可用", async () => {
+    const adt = mockAdt({
+      prettyPrint: vi.fn(async (s: string) => ({ source: s.toUpperCase(), style: "keywordUpper", indentation: true })),
+      getObjectSource: vi.fn(async () => "method m.\nendmethod."),
+    });
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" }));
+    const r = await call("pretty_print", { source: "data x type i." });
+    expect(r.text).toContain("keywordUpper、縮排");
+    expect(r.text).toContain("DATA X TYPE I.");
+    expect(r.text).toContain("尚未寫回系統");
+    await call("pretty_print", { object_url: "/sap/bc/adt/oo/classes/zcl_x" });
+    expect(adt.getObjectSource).toHaveBeenCalledWith("/sap/bc/adt/oo/classes/zcl_x/source/main");
+    expect(adt.lock).not.toHaveBeenCalled();
+    expect(adt.setObjectSource).not.toHaveBeenCalled();
+    expect((await call("pretty_print", {})).isError).toBe(true);
+  });
+
+  it("內容沒有變化時說明", async () => {
+    const adt = mockAdt({ prettyPrint: vi.fn(async (s: string) => ({ source: s, style: "keywordUpper", indentation: true })) });
+    const call = await connectTools(adt);
+    expect((await call("pretty_print", { source: "DATA x TYPE i." })).text).toContain("內容沒有變化");
   });
 });
 

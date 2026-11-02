@@ -162,6 +162,8 @@ export interface AdtService {
   classComponents(objectUrl: string): Promise<ClassComponent>;
   /** 執行 class 的 IF_OO_ADT_CLASSRUN~MAIN,回傳 out->write 的輸出 */
   runClass(className: string): Promise<string>;
+  /** 以系統的 Pretty Printer 設定格式化原始碼(只回傳結果,不寫入系統) */
+  prettyPrint(source: string): Promise<{ source: string; style: string; indentation: boolean }>;
   /** ST22 短傾印列表(新的在前);user 指定時只列該使用者 */
   listDumps(user?: string): Promise<DumpSummary[]>;
   /** 單筆短傾印:metadata + 擷取後的章節文字(不含 Selected Variables 等可能含資料的章節) */
@@ -513,6 +515,16 @@ export class RealAdtService implements AdtService {
 
   async runClass(className: string) {
     return this.guard(() => this.client.runClass(className.toUpperCase()));
+  }
+
+  async prettyPrint(source: string) {
+    const settings = await this.guard(() => this.client.prettyPrinterSetting());
+    const formatted = await this.guard(() => this.client.prettyPrinter(source));
+    return {
+      source: formatted,
+      style: String(settings["abapformatter:style"] ?? ""),
+      indentation: !!settings["abapformatter:indentation"],
+    };
   }
 
   async listDumps(user?: string) {

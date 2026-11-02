@@ -7,6 +7,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { AdtService } from "../adt/client.js";
+import { isSourceUrl } from "../adt/objectTypes.js";
 import type { AppConfig } from "../config.js";
 import type { AuditLogger } from "../safety/audit.js";
 import { GuardViolationError } from "../safety/guards.js";
@@ -151,6 +152,38 @@ export function registerDiagnosticTools(
           }
         }
         return ok(truncate(sections.join("\n\n"), DIAG_MAX_OUTPUT));
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
+
+  // ───────────────────────────── D4 pretty_print ─────────────────────────────
+  server.registerTool(
+    "pretty_print",
+    {
+      title: "格式化原始碼(Pretty Printer)",
+      description:
+        "以 SAP 系統的 Pretty Printer 設定(關鍵字大小寫、縮排)格式化 ABAP 原始碼並回傳結果。" +
+        "source 與 object_url 擇一:object_url 會讀取系統上目前的內容來格式化。" +
+        "不會寫回系統;要套用請把結果交給 write_source。",
+      inputSchema: {
+        source: z.string().optional().describe("要格式化的原始碼"),
+        object_url: z.string().optional().describe("物件或 source URI;讀取系統上目前的內容來格式化"),
+      },
+    },
+    async ({ source, object_url }) => {
+      try {
+        if (!!source === !!object_url) return fail(new GuardViolationError("source 與 object_url 必須擇一提供。"));
+        const input = source ?? (await adt.getObjectSource(isSourceUrl(object_url!) ? object_url! : `${object_url!.replace(/\/$/, "")}/source/main`));
+        const r = await adt.prettyPrint(input);
+        const same = r.source.replace(/\r\n/g, "\n").trimEnd() === input.replace(/\r\n/g, "\n").trimEnd();
+        return ok(
+          `🧹 已依系統 Pretty Printer 設定(${r.style || "預設"}${r.indentation ? "、縮排" : ""})格式化` +
+            (same ? ",內容沒有變化" : "") +
+            "。尚未寫回系統,要套用請用 write_source。\n\n" +
+            truncate(r.source, DIAG_MAX_OUTPUT)
+        );
       } catch (e) {
         return fail(e);
       }
