@@ -78,6 +78,13 @@ const ConfigSchema = z.object({
   ABAP_MCP_AUDIT_LOG: z.string().optional().default(""),
   /** read_source 回傳的最大行數(超過會截斷以保護 AI context) */
   ABAP_MCP_MAX_SOURCE_LINES: z.coerce.number().int().positive().optional().default(5000),
+  /** 允許 data_preview 讀取資料表內容;false(預設)時工具完全不註冊 */
+  ABAP_MCP_ALLOW_DATA_PREVIEW: boolEnv(false),
+  /**
+   * data_preview 可讀的表/view 白名單(逗號分隔,* 結尾表示前綴),預設只有 /DMO/*。
+   * 不預設開放 Z* / Y*:能寫入的 AI 可以自建 Z CDS view 包住任意表(見 docs/SECURITY.md)
+   */
+  ABAP_MCP_DATA_PREVIEW_TABLES: z.string().optional().default("/DMO/*"),
 });
 
 export type AppConfig = {
@@ -98,6 +105,10 @@ export type AppConfig = {
     allowedPackages: string[];
     auditLogPath: string;
     maxSourceLines: number;
+    /** data_preview 是否開啟(唯讀模式也可開,因為只讀資料) */
+    allowDataPreview: boolean;
+    /** data_preview 可讀的表/view 白名單;* 結尾為前綴比對(皆為大寫) */
+    dataPreviewTables: string[];
   };
 };
 
@@ -150,6 +161,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       allowedPackages: splitList(c.ABAP_MCP_ALLOWED_PACKAGES),
       auditLogPath: c.ABAP_MCP_AUDIT_LOG,
       maxSourceLines: c.ABAP_MCP_MAX_SOURCE_LINES,
+      allowDataPreview: c.ABAP_MCP_ALLOW_DATA_PREVIEW,
+      dataPreviewTables: splitList(c.ABAP_MCP_DATA_PREVIEW_TABLES),
     },
   };
 }

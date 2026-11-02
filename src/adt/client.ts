@@ -20,10 +20,22 @@ import {
   type TransportsOfUser,
   type UnitTestClass,
   type ClassComponent,
+  type QueryResult,
+  type DdicElement,
+  type Revision,
 } from "abap-adt-api";
 import * as https from "node:https";
 import type { AppConfig } from "../config.js";
 import { AuthCircuitOpenError, hasHttpStatus, isAuthFailure } from "./errors.js";
+import { activationBody, parseActivationResponse } from "./activation.js";
+import {
+  extractDumpChapters,
+  normalizeDumpId,
+  parseDumpMeta,
+  summarizeDump,
+  type DumpMeta,
+  type DumpSummary,
+} from "./dumps.js";
 import {
   parseUsageReferences,
   parseUsageSnippets,
@@ -33,6 +45,7 @@ import {
   type UsageSnippet,
 } from "./whereUsed.js";
 import {
+  baseObjectUrl,
   bdefCreateBody,
   packageUrl,
   parseValidation,
@@ -56,6 +69,23 @@ export interface AtcResult {
   /** ATC 執行資訊,例如 TOOL_FAILURE(部分檢查無法執行)、FINDING_STATS */
   infos: { type: string; description: string }[];
   findings: AtcFinding[];
+}
+
+/** 資料元素 / domain 的屬性(abap-adt-api 回傳的 metaData + properties,保留原形狀) */
+export interface DdicTypeProperties {
+  metaData: { name: string; description?: string; packageName?: string };
+  properties: object;
+}
+
+/** inactive 物件(或其子項目) */
+export interface InactiveEntry {
+  uri: string;
+  type: string;
+  name: string;
+  /** 子項目(例如 class include)所屬物件的 URI;主物件為空字串 */
+  parentUri: string;
+  user: string;
+  deleted: boolean;
 }
 
 /** find_definition 結果 */
@@ -146,6 +176,30 @@ export interface AdtService {
   classComponents(objectUrl: string): Promise<ClassComponent>;
   /** 執行 class 的 IF_OO_ADT_CLASSRUN~MAIN,回傳 out->write 的輸出 */
   runClass(className: string): Promise<string>;
+  /** 版本歷史(新的在前);url 可為物件、source/main 或 class include */
+  revisions(url: string): Promise<Revision[]>;
+  /** 取得某個版本的內容;sourceUrl 是該物件(或 include)的 source URI */
+  revisionContent(revisionUri: string, sourceUrl: string): Promise<string>;
+  /** 目前 inactive 的物件(含子項目,例如 class 的 include);已過濾掉空紀錄 */
+  inactiveObjects(): Promise<InactiveEntry[]>;
+  /** 批次啟用(一次送出;呼叫端負責白名單檢查) */
+  activateObjects(objects: InactiveEntry[]): Promise<ActivationResult>;
+  /** 以系統的 Pretty Printer 設定格式化原始碼(只回傳結果,不寫入系統) */
+  prettyPrint(source: string): Promise<{ source: string; style: string; indentation: boolean }>;
+  /** ST22 短傾印列表(新的在前);user 指定時只列該使用者 */
+  listDumps(user?: string): Promise<DumpSummary[]>;
+  /** 單筆短傾印:metadata + 擷取後的章節文字(不含 Selected Variables 等可能含資料的章節) */
+  dumpDetail(dumpId: string): Promise<{ meta: DumpMeta; text: string }>;
+  /** DDIC 元素(表、CDS view 的欄位);結構與資料元素在 A4H 會回空 */
+  ddicElement(name: string): Promise<DdicElement>;
+  /** 資料元素屬性(型別、長度、欄位標籤) */
+  dataElementProperties(url: string): Promise<DdicTypeProperties>;
+  /** domain 屬性(型別、長度、固定值) */
+  domainProperties(url: string): Promise<DdicTypeProperties>;
+  /** 讀取單一表/view 的前 rows 筆(Data Preview);呼叫端負責白名單檢查 */
+  tableContents(table: string, rows: number): Promise<QueryResult>;
+  /** 執行自由 SELECT(Data Preview);呼叫端負責 SQL 與白名單檢查 */
+  runQuery(sql: string, rows: number): Promise<QueryResult>;
   /** 建立 workbench transport request,回傳 TR 編號;refUrl 為相關物件(或 package)的 URI */
   createTransport(refUrl: string, description: string, packageName: string): Promise<string>;
   /** 取得目前登入的使用者帳號 */
@@ -483,6 +537,111 @@ export class RealAdtService implements AdtService {
 
   async runClass(className: string) {
     return this.guard(() => this.client.runClass(className.toUpperCase()));
+  }
+
+  async revisions(url: string) {
+    // class include(…/includes/testclasses)要以 class + include 名稱查詢
+    const inc = url.match(/^(.*\/oo\/classes\/[^/]+)\/includes\/([^/]+)$/);
+    const list = inc
+      ? await this.guard(() => this.client.revisions(inc[1], inc[2] as never))
+      : await this.guard(() => this.client.revisions(baseObjectUrl(url)));
+    return [...list].sort((a, b) => b.date.localeCompare(a.date));
+  }
+
+  async revisionContent(revisionUri: string, sourceUrl: string) {
+    const m = revisionUri.match(/^\/sap\/bc\/adt\/.+\/versions\/[^/]+\/([^/]+)\/content$/);
+    if (!m) throw new Error("版本 URI 格式不正確:必須是 get_revisions 回傳的 …/versions/…/content。");
+    // A4H 實測:class 的版本內容(includes/main/versions/…)排版與 source/main 不同,且剛寫入後偶爾讀到舊內容;
+    // active(00000)/ inactive(99999)直接以 source URI + version 讀取,與 read_source 看到的一致
+    if (m[1] === "00000") return this.guard(() => this.client.getObjectSource(sourceUrl, { version: "active" }));
+    if (m[1] === "99999") return this.guard(() => this.client.getObjectSource(sourceUrl, { version: "inactive" }));
+    return this.guard(() => this.client.getObjectSource(revisionUri));
+  }
+
+  async inactiveObjects() {
+    const records = await this.guard(() => this.client.inactiveObjects());
+    // A4H 實測:清單裡有沒有 object 的空紀錄(只有 transport 或什麼都沒有)
+    return records
+      .filter((r) => r.object)
+      .map((r) => ({
+        uri: r.object!["adtcore:uri"],
+        type: r.object!["adtcore:type"],
+        name: r.object!["adtcore:name"],
+        parentUri: r.object!["adtcore:parentUri"] ?? "",
+        user: r.object!.user ?? "",
+        deleted: !!r.object!.deleted,
+      }));
+  }
+
+  async activateObjects(objects: InactiveEntry[]) {
+    // 只送主物件(子項目會隨主物件一起啟用);請求形狀見 adt/activation.ts(A4H 實測)
+    const mains = new Map<string, string>();
+    for (const o of objects) {
+      // 子項目(例如 class include)的 name 與所屬物件相同;主物件的紀錄優先
+      const uri = o.parentUri || o.uri;
+      if (!o.parentUri || !mains.has(uri)) mains.set(uri, o.name);
+    }
+    const body = activationBody([...mains].map(([uri, name]) => ({ uri, name })));
+    // 走寫入用的獨立 session(呼叫端另經寫入佇列依序執行),與讀取類工具互不干擾
+    const response = await this.guard(() =>
+      this.lockClient.httpClient.request("/sap/bc/adt/activation", {
+        method: "POST",
+        qs: { method: "activate", preauditRequested: true },
+        body,
+        headers: { Accept: "application/xml", "Content-Type": "application/xml" },
+      })
+    );
+    return parseActivationResponse(String(response.body ?? ""));
+  }
+
+  async prettyPrint(source: string) {
+    const settings = await this.guard(() => this.client.prettyPrinterSetting());
+    const formatted = await this.guard(() => this.client.prettyPrinter(source));
+    return {
+      source: formatted,
+      style: String(settings["abapformatter:style"] ?? ""),
+      indentation: !!settings["abapformatter:indentation"],
+    };
+  }
+
+  async listDumps(user?: string) {
+    // A4H 實測:$query 支援 and( equals( user, X ) );日期條件的格式不被接受,改由呼叫端依 id 的時間戳篩選
+    const query = user ? `and( equals( user, ${user.toUpperCase().replace(/[^A-Z0-9_]/g, "")} ) )` : "";
+    const feed = await this.guard(() => this.client.dumps(query));
+    return feed.dumps.map(summarizeDump).sort((a, b) => b.datetime.localeCompare(a.datetime));
+  }
+
+  async dumpDetail(dumpId: string) {
+    const id = normalizeDumpId(dumpId);
+    const xml = await this.guard(() =>
+      this.client.httpClient.request(id, { headers: { Accept: "application/vnd.sap.adt.runtime.dump.v1+xml" } })
+    );
+    const meta = parseDumpMeta(String(xml.body ?? ""));
+    if (!meta.contentsUri) return { meta, text: "" };
+    const body = await this.guard(() =>
+      this.client.httpClient.request(meta.contentsUri, { headers: { Accept: "text/plain" } })
+    );
+    return { meta, text: extractDumpChapters(String(body.body ?? ""), meta.chapters) };
+  }
+
+  async ddicElement(name: string) {
+    return this.guard(() => this.client.ddicElement(name));
+  }
+
+  async dataElementProperties(url: string) {
+    return this.guard(() => this.client.getDataElementProperties(url)) as Promise<DdicTypeProperties>;
+  }
+
+  async domainProperties(url: string) {
+    return this.guard(() => this.client.getDomainProperties(url)) as Promise<DdicTypeProperties>;
+  }
+
+  async tableContents(table: string, rows: number) {
+    return this.guard(() => this.client.tableContents(table, rows));
+  }
+
+  async runQuery(sql: string, rows: number) {
+    return this.guard(() => this.client.runQuery(sql, rows));
   }
 
   async createTransport(refUrl: string, description: string, packageName: string) {

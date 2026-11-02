@@ -1,0 +1,28 @@
+{
+ "categories": [
+  {
+   "term": "COMPUTE_INT_ZERODIVIDE",
+   "label": "ABAP runtime error"
+  },
+  {
+   "term": "ZCL_MCP_V04DMP2===============CP",
+   "label": "Terminated ABAP program"
+  }
+ ],
+ "links": [
+  {
+   "href": "adt://A4H/sap/bc/adt/vit/runtime/dumps/20261102142307vhcala4hci_A4H_00%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20DEVELOPER%20%20%20001%20%20%20%20%20%20%20%201",
+   "rel": "alternate",
+   "type": "application/vnd.sap.adt.sapgui"
+  },
+  {
+   "href": "adt://A4H/sap/bc/adt/runtime/dump/20261102142307vhcala4hci_A4H_00%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20DEVELOPER%20%20%20001%20%20%20%20%20%20%20%201",
+   "rel": "self",
+   "type": "text/plain"
+  }
+ ],
+ "id": "/sap/bc/adt/vit/runtime/dumps/20261102142307vhcala4hci_A4H_00%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20DEVELOPER%20%20%20001%20%20%20%20%20%20%20%201",
+ "author": "DEVELOPER",
+ "text": "",
+ "type": "html"
+}

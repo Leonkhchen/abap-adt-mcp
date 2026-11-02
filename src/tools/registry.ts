@@ -15,6 +15,7 @@ import { assertPackageAllowed, assertWriteAllowed, objectNameFromUrl } from "../
 import { ensureTestInclude, lockedWrite } from "../workflows/lockedWrite.js";
 import { SerialQueue } from "../safety/serialQueue.js";
 import { registerAnalysisTools, registerWriteDevTools } from "./devTools.js";
+import { registerDiagnosticTools } from "./diagTools.js";
 import { baseObjectUrl as baseOf, isSourceUrl } from "../adt/objectTypes.js";
 import { VERSION } from "../version.js";
 
@@ -272,6 +273,9 @@ export function registerTools(
 
   // v0.3 分析類工具(唯讀模式也可用,見 tools/devTools.ts)
   registerAnalysisTools(server, adt);
+
+  // v0.4 診斷與資料工具(各工具自行判斷唯讀 / 開關,見 tools/diagTools.ts)
+  registerDiagnosticTools(server, adt, cfg, audit, writes);
 
   // ───────────────────────────── 寫入(唯讀模式下不註冊)─────────────────────────────
   if (cfg.safety.readonly) {

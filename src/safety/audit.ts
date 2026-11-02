@@ -17,7 +17,8 @@ export interface AuditEntry {
     | "create_object"
     | "create_test_include"
     | "run_class"
-    | "create_transport";
+    | "create_transport"
+    | "data_preview";
   objectUrl: string;
   objectName: string;
   transport?: string;

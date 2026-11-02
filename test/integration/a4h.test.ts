@@ -5,7 +5,7 @@
  * 預設全部略過；需設定環境變數才會執行：
  *
  *   ABAP_MCP_IT=1          執行唯讀組（T01–T07、T14）
- *   ABAP_MCP_IT_WRITE=1    另外執行寫入組（T08–T13、T15–T16）與 v0.3 開發循環組（T17–T22），
+ *   ABAP_MCP_IT_WRITE=1    另外執行寫入組（T08–T13、T15–T16）、v0.3 開發循環組（T17–T22）與 v0.4 診斷組（T23–T30），
  *                          只在 $TMP 建立暫存物件，測完全部刪除
  *
  * 一般用 npm 指令即可（PowerShell / bash 皆可）：
@@ -391,4 +391,198 @@ describe.skipIf(!RUN_WRITE)("v0.3 開發循環工具（A4H，$TMP 暫存物件�
     expect(r.isError, r.text).toBe(false);
     expect(r.text).toContain("MCP-IT3-RUN-5");
   }, 600_000);
+});
+
+// ───────────────────────────── v0.4 診斷組（$TMP） ─────────────────────────────
+describe.skipIf(!RUN_WRITE)("v0.4 診斷與資料工具（A4H，$TMP 暫存物件）", () => {
+  const sfx = Date.now().toString(36).toUpperCase().slice(-6);
+  const DMP = `ZCL_MCP_IT4D_${sfx}`; // T26 會短傾印
+  const INA = `ZCL_MCP_IT4I_${sfx}`; // T28 inactive
+  const REV = `ZCL_MCP_IT4R_${sfx}`; // T29 / T30 版本與並行
+  const url = (n: string) => `/sap/bc/adt/oo/classes/${n.toLowerCase()}`;
+  const simple = (n: string, marker: string) =>
+    [
+      `CLASS ${n.toLowerCase()} DEFINITION PUBLIC FINAL CREATE PUBLIC.`,
+      `  PUBLIC SECTION.`,
+      `    METHODS m RETURNING VALUE(r) TYPE string.`,
+      `ENDCLASS.`,
+      ``,
+      `CLASS ${n.toLowerCase()} IMPLEMENTATION.`,
+      `  METHOD m.`,
+      `    r = '${marker}'.`,
+      `  ENDMETHOD.`,
+      `ENDCLASS.`,
+    ].join("\n");
+  // 第 9 行除以零(dump_detail 應指出 source/main 第 9 行)
+  const dumpSource = [
+    `CLASS ${DMP.toLowerCase()} DEFINITION PUBLIC FINAL CREATE PUBLIC.`,
+    `  PUBLIC SECTION.`,
+    `    INTERFACES if_oo_adt_classrun.`,
+    `ENDCLASS.`,
+    ``,
+    `CLASS ${DMP.toLowerCase()} IMPLEMENTATION.`,
+    `  METHOD if_oo_adt_classrun~main.`,
+    `    DATA(zero) = 0.`,
+    `    DATA(result) = 10 / zero.`,
+    `    out->write( result ).`,
+    `  ENDMETHOD.`,
+    `ENDCLASS.`,
+  ].join("\n");
+
+  let s: Awaited<ReturnType<typeof startServer>>;
+  let raw: ADTClient;
+
+  beforeAll(async () => {
+    s = await startServer({
+      ...process.env,
+      ABAP_MCP_READONLY: "false",
+      ABAP_MCP_SYSTEM_ROLE: "dev",
+      ABAP_MCP_ALLOW_DATA_PREVIEW: "true",
+    });
+    raw = new ADTClient(s.cfg.sap.url, s.cfg.sap.user, s.cfg.sap.password, s.cfg.sap.client, s.cfg.sap.language);
+    await raw.login();
+    for (const n of [DMP, INA, REV]) {
+      const r = await s.call("create_object", { object_type: "CLAS/OC", name: n, package_name: "$TMP", description: "abap-adt-mcp IT4" });
+      if (r.isError) throw new Error(r.text);
+    }
+  }, 300_000);
+
+  afterAll(async () => {
+    for (const u of [DMP, INA, REV].map(url)) {
+      try {
+        raw.stateful = session_types.stateful;
+        const lock = await raw.lock(u);
+        await raw.deleteObject(u, lock.LOCK_HANDLE);
+      } catch (e) {
+        if (!/does not exist|not found|404/i.test(String(e))) {
+          console.error(`清除暫存物件 ${u} 失敗,請在 Eclipse 的 $TMP 手動刪除:${String(e)}`);
+        }
+      } finally {
+        raw.stateful = session_types.stateless;
+      }
+    }
+    await s?.close();
+  }, 300_000);
+
+  it("T23 data_preview 未開啟時工具不存在", async () => {
+    const off = await startServer({ ...process.env, ABAP_MCP_ALLOW_DATA_PREVIEW: "false" });
+    try {
+      const tools = (await off.client.listTools()).tools.map((t) => t.name);
+      expect(tools).toContain("ddic_info");
+      expect(tools).not.toContain("data_preview");
+    } finally {
+      await off.close();
+    }
+  }, 60_000);
+
+  it("T24 data_preview 查 /DMO/TRAVEL 前 5 筆;UPDATE / 多語句 / 白名單外的表被拒", async () => {
+    const r = await s.call("data_preview", { table: "/DMO/TRAVEL", max_rows: 5 });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("📊 5 筆");
+    expect(r.text).toContain("TRAVEL_ID");
+    const q = await s.call("data_preview", { sql: "SELECT status, COUNT(*) AS cnt FROM /dmo/travel GROUP BY status" });
+    expect(q.isError, q.text).toBe(false);
+    expect(q.text).toMatch(/STATUS \| CNT/);
+    for (const bad of [
+      { sql: "UPDATE /dmo/travel SET status = 'X'" },
+      { sql: "SELECT * FROM /dmo/travel; DELETE FROM /dmo/travel" },
+      { table: "USR02" },
+      { sql: "SELECT bname FROM usr02" },
+    ]) {
+      const x = await s.call("data_preview", bad);
+      expect(x.isError, JSON.stringify(bad)).toBe(true);
+      expect(x.text).toContain("已拒絕");
+    }
+  }, 300_000);
+
+  it("T25 ddic_info 讀 /DMO/TRAVEL 欄位", async () => {
+    const r = await s.call("ddic_info", { name: "/DMO/TRAVEL" });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("[TABL/DT 資料表]");
+    expect(r.text).toContain("欄位(15 個)");
+    expect(r.text).toContain("travel_id | key | /dmo/travel_id | numc | 8");
+  }, 300_000);
+
+  it("T26 run_class 觸發短傾印 → list_dumps 找得到 → dump_detail 指出第 9 行", async () => {
+    const w = await s.call("write_source", { object_url: url(DMP), new_source: dumpSource, activate: true });
+    expect(w.isError, w.text).toBe(false);
+    const run = await s.call("run_class", { class_name: DMP });
+    expect(run.isError).toBe(true);
+    expect(run.text).toContain("執行時發生短傾印:COMPUTE_INT_ZERODIVIDE");
+    const id = run.text.match(/dump_id:(\S+)/)?.[1] ?? "";
+    expect(id).toMatch(/^\/sap\/bc\/adt\/runtime\/dump\//);
+    const list = await s.call("list_dumps", { user: s.cfg.sap.user, max_results: 20 });
+    expect(list.text).toContain(id);
+    const d = await s.call("dump_detail", { dump_id: id });
+    expect(d.isError, d.text).toBe(false);
+    expect(d.text).toContain(`${url(DMP)}/source/main 第 9 行`);
+    expect(d.text).toContain("CX_SY_ZERODIVIDE");
+    expect(d.text).not.toContain("Selected Variables");
+  }, 300_000);
+
+  it("T27 pretty_print 回傳格式化結果且系統內容不變", async () => {
+    const lower = simple(REV, "PP").replace("METHODS m", "methods m").replace("ENDMETHOD.", "endmethod.");
+    const w = await s.call("write_source", { object_url: url(REV), new_source: lower, activate: true });
+    expect(w.isError, w.text).toBe(false);
+    const before = await s.call("read_source", { object_url: url(REV) });
+    const p = await s.call("pretty_print", { object_url: url(REV) });
+    expect(p.isError, p.text).toBe(false);
+    expect(p.text).toContain("METHODS m RETURNING");
+    expect(p.text).toContain("ENDMETHOD.");
+    expect(p.text).toContain("尚未寫回系統");
+    const after = await s.call("read_source", { object_url: url(REV) });
+    expect(after.text).toBe(before.text);
+    expect(after.text).toContain("methods m");
+  }, 300_000);
+
+  it("T28 list_inactive 列出 inactive 物件;activate_objects 白名單外整批拒絕、白名單內成功", async () => {
+    const w = await s.call("write_source", { object_url: url(INA), new_source: simple(INA, "INACTIVE") });
+    expect(w.isError, w.text).toBe(false);
+    const l1 = await s.call("list_inactive");
+    expect(l1.text).toContain(INA);
+    const denied = await s.call("activate_objects", { object_urls: [url(INA), "/sap/bc/adt/oo/classes/cl_abap_char_utilities"] });
+    expect(denied.isError).toBe(true);
+    expect(denied.text).toContain("整批拒絕");
+    expect((await s.call("list_inactive")).text).toContain(INA);
+    const okr = await s.call("activate_objects", { object_urls: [url(INA)] });
+    expect(okr.isError, okr.text).toBe(false);
+    expect(okr.text).toContain(`已啟用 1 個物件:${INA}`);
+    expect((await s.call("list_inactive")).text).not.toContain(INA);
+  }, 300_000);
+
+  it("T29 write_source 兩次後 get_revisions 列得到版本並能比較", async () => {
+    const v1 = await s.call("write_source", { object_url: url(REV), new_source: simple(REV, "V1"), activate: true });
+    expect(v1.isError, v1.text).toBe(false);
+    const v2 = await s.call("write_source", { object_url: url(REV), new_source: simple(REV, "V2") });
+    expect(v2.isError, v2.text).toBe(false);
+    const r = await s.call("get_revisions", { object_url: url(REV), compare_from: 2, compare_to: 1 });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("inactive");
+    expect(r.text).toContain("active");
+    expect(r.text).toContain("-    r = 'V1'.");
+    expect(r.text).toContain("+    r = 'V2'.");
+  }, 300_000);
+
+  it("T30 回歸:write_source 鎖定期間並行執行 data_preview 與 read_source,三者都成功", async () => {
+    const [w, dp, rd] = await Promise.all([
+      s.call("write_source", { object_url: url(REV), new_source: simple(REV, "PARALLEL"), activate: true }),
+      s.call("data_preview", { table: "/DMO/FLIGHT", max_rows: 3 }),
+      s.call("read_source", { object_url: url(INA) }),
+    ]);
+    expect(w.isError, w.text).toBe(false);
+    expect(w.text).toContain("已啟用");
+    expect(dp.isError, dp.text).toBe(false);
+    expect(dp.text).toContain("📊 3 筆");
+    expect(rd.isError, rd.text).toBe(false);
+    expect(rd.text).toContain("INACTIVE");
+    // 寫入確實生效、沒有殘留鎖定
+    expect((await s.call("read_source", { object_url: url(REV) })).text).toContain("PARALLEL");
+    raw.stateful = session_types.stateful;
+    try {
+      const lock = await raw.lock(url(REV));
+      await raw.unLock(url(REV), lock.LOCK_HANDLE);
+    } finally {
+      raw.stateful = session_types.stateless;
+    }
+  }, 300_000);
 });

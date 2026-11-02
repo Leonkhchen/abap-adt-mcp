@@ -1,8 +1,8 @@
 /**
  * tools/formatters.ts — 把 ADT 回傳的結構整理成 AI 好讀的文字
  */
-import type { ClassComponent, UnitTestAlert, UnitTestClass } from "abap-adt-api";
-import type { AtcResult } from "../adt/client.js";
+import type { ClassComponent, DdicElement, QueryResult, UnitTestAlert, UnitTestClass } from "abap-adt-api";
+import type { AtcResult, DdicTypeProperties } from "../adt/client.js";
 import type { UsageObject, UsageSnippet } from "../adt/whereUsed.js";
 import { objectNameFromUrl } from "../safety/guards.js";
 
@@ -133,6 +133,87 @@ export function formatClassComponents(root: ClassComponent): string {
   walk(root.components ?? [], "");
   if ((root.components ?? []).length === 0) out.push("(沒有任何元件)");
   return out.join("\n");
+}
+
+/**
+ * Data Preview 結果 → 以 | 分隔的文字表格;每格截斷 maxCell 字元,整體超過 maxTotal 字元時停止並標註。
+ * 換行與 | 會被替換,避免破壞表格。
+ */
+export function formatQueryResult(
+  r: QueryResult,
+  opts: { maxCell?: number; maxTotal?: number } = {}
+): { text: string; rows: number; truncatedRows: boolean } {
+  const maxCell = opts.maxCell ?? 200;
+  const maxTotal = opts.maxTotal ?? 20_000;
+  const cols = r.columns.map((c) => c.name);
+  const cell = (v: unknown) => {
+    // abap-adt-api 會把 DATS 解成 Date(UTC 午夜);印成 YYYY-MM-DD,不要變成本機時區的長字串
+    if (v instanceof Date) {
+      const iso = isNaN(v.getTime()) ? "" : v.toISOString();
+      v = iso.endsWith("T00:00:00.000Z") ? iso.slice(0, 10) : iso;
+    }
+    const s = v === null || v === undefined ? "" : String(v).replace(/[\r\n]+/g, " ").replace(/\|/g, "¦").trimEnd();
+    return s.length > maxCell ? `${s.slice(0, maxCell)}…` : s;
+  };
+  const lines = [cols.join(" | ")];
+  let total = lines[0].length;
+  let shown = 0;
+  for (const row of r.values) {
+    const line = cols.map((c) => cell((row as Record<string, unknown>)[c])).join(" | ");
+    if (total + line.length + 1 > maxTotal) break;
+    lines.push(line);
+    total += line.length + 1;
+    shown++;
+  }
+  return { text: lines.join("\n"), rows: shown, truncatedRows: shown < r.values.length };
+}
+
+/** 表 / CDS view 的欄位 → 文字表格(欄位、key、資料元素、型別、長度) */
+export function formatDdicFields(el: DdicElement): string {
+  // A4H 實測:children 也含 .include 節點與 package 節點,它們沒有 elementProps,不是欄位
+  const fields = el.children.filter((c) => !!c.properties.elementProps);
+  const rows = fields.map((c) => {
+    const p = c.properties.elementProps || undefined;
+    const len = p ? `${p.ddicLength ?? ""}${p.ddicDecimals ? `,${p.ddicDecimals}` : ""}` : "";
+    return [c.name, p?.ddicIsKey ? "key" : "", p?.ddicDataElement ?? "", p?.ddicDataType ?? "", len, p?.ddicLabelMedium ?? ""].join(" | ");
+  });
+  return [`欄位(${fields.length} 個):`, "欄位 | key | 資料元素 | 型別 | 長度 | 標籤", ...rows].join("\n");
+}
+
+/** 資料元素:型別、長度與各長度的欄位標籤 */
+export function formatDataElement(p: DdicTypeProperties): string {
+  const x = p.properties as {
+    typeName?: string; dataType?: string; dataTypeLength?: number; dataTypeDecimals?: number;
+    fieldLabels?: Record<string, string | number>;
+  };
+  const labels = x.fieldLabels ?? {};
+  return [
+    `資料元素 ${p.metaData.name}:${p.metaData.description ?? ""}`,
+    `型別:${x.typeName && x.typeName !== p.metaData.name ? `${x.typeName}(` : ""}${x.dataType ?? "?"} 長度 ${x.dataTypeLength ?? "?"}` +
+      `${x.dataTypeDecimals ? ` 小數 ${x.dataTypeDecimals}` : ""}${x.typeName && x.typeName !== p.metaData.name ? ")" : ""}`,
+    `欄位標籤:短「${labels.shortFieldLabel ?? ""}」、中「${labels.mediumFieldLabel ?? ""}」、長「${labels.longFieldLabel ?? ""}」、標題「${labels.headingFieldLabel ?? ""}」`,
+    p.metaData.packageName ? `package:${p.metaData.packageName}` : "",
+  ].filter(Boolean).join("\n");
+}
+
+/** domain:型別、長度、固定值(value table) */
+export function formatDomain(p: DdicTypeProperties): string {
+  const x = p.properties as {
+    typeInformation?: { datatype?: string; length?: number; decimals?: number };
+    outputInformation?: { lowercase?: boolean };
+    valueInformation?: { valueTableRef?: string; fixValues?: { low: string; high?: string; text?: string }[] };
+  };
+  const t = x.typeInformation ?? {};
+  const fix = x.valueInformation?.fixValues ?? [];
+  return [
+    `domain ${p.metaData.name}:${p.metaData.description ?? ""}`,
+    `型別:${t.datatype ?? "?"} 長度 ${t.length ?? "?"}${t.decimals ? ` 小數 ${t.decimals}` : ""}${x.outputInformation?.lowercase ? "(可小寫)" : ""}`,
+    x.valueInformation?.valueTableRef ? `value table:${x.valueInformation.valueTableRef}` : "",
+    fix.length
+      ? `固定值(${fix.length} 個):\n${fix.map((f) => `- ${f.low}${f.high ? `–${f.high}` : ""}:${f.text ?? ""}`).join("\n")}`
+      : "沒有固定值。",
+    p.metaData.packageName ? `package:${p.metaData.packageName}` : "",
+  ].filter(Boolean).join("\n");
 }
 
 /** ATC 優先級說明(1 最嚴重) */

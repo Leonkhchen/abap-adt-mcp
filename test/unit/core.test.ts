@@ -45,7 +45,21 @@ import {
   newObjectUrl,
   parseValidation,
 } from "../../src/adt/objectTypes.js";
-import { formatAtcResult, formatClassComponents, formatUnitTestResults, formatWhereUsed } from "../../src/tools/formatters.js";
+import {
+  formatAtcResult,
+  formatClassComponents,
+  formatDataElement,
+  formatDdicFields,
+  formatDomain,
+  formatQueryResult,
+  formatUnitTestResults,
+  formatWhereUsed,
+} from "../../src/tools/formatters.js";
+import { assertTablesAllowed, validateSelectSql } from "../../src/safety/sql.js";
+import { extractDumpChapters, normalizeDumpId, parseDumpMeta, summarizeDump } from "../../src/adt/dumps.js";
+import { activationBody, parseActivationResponse } from "../../src/adt/activation.js";
+import { groupInactive, revisionLabel } from "../../src/tools/diagTools.js";
+import { unifiedDiff } from "../../src/tools/diff.js";
 import { parseUsageReferences, parseUsageSnippets, usageSnippetsBody } from "../../src/adt/whereUsed.js";
 import type { UnitTestClass } from "abap-adt-api";
 
@@ -88,6 +102,18 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     findDefinition: vi.fn(async () => ({ identifier: "x", url: "", line: 0, column: 0, sourceLine: "" })),
     runClass: vi.fn(async () => ""),
     createTransport: vi.fn(async () => ""),
+    tableContents: vi.fn(async () => ({ columns: [], values: [] }) as never),
+    ddicElement: vi.fn(async () => ({ type: "", name: "", properties: { elementProps: false, annotations: [] }, children: [] }) as never),
+    dataElementProperties: vi.fn(async () => ({ metaData: { name: "" }, properties: {} })),
+    domainProperties: vi.fn(async () => ({ metaData: { name: "" }, properties: {} })),
+    listDumps: vi.fn(async () => []),
+    prettyPrint: vi.fn(async (s: string) => ({ source: s, style: "", indentation: false })),
+    inactiveObjects: vi.fn(async () => []),
+    revisions: vi.fn(async () => []),
+    revisionContent: vi.fn(async () => ""),
+    activateObjects: vi.fn(async () => ({ success: true, messages: [], inactive: [] })),
+    dumpDetail: vi.fn(async () => ({ meta: { title: "", error: "", exception: "", program: "", datetime: "", author: "", contentsUri: "", chapters: [] }, text: "" })),
+    runQuery: vi.fn(async () => ({ columns: [], values: [] }) as never),
     classComponents: vi.fn(async () => ({ "adtcore:name": "ZCL_X", "adtcore:type": "CLAS/OC", visibility: "public", links: [], components: [] }) as never),
     username: () => "DEVELOPER",
     baseUrl: () => "https://sap.example.com:44300",
@@ -161,7 +187,7 @@ describe("ping", () => {
   it("ping_system 顯示版本,且版本取自 package.json(E2;v0.3 起為 0.3.0)", async () => {
     const pkg = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8"));
     expect(VERSION).toBe(pkg.version);
-    expect(VERSION).toBe("0.3.1");
+    expect(VERSION).toBe("0.4.0");
     const call = await connectTools(mockAdt());
     const r = await call("ping_system");
     expect(r.text).toContain(`版本:${VERSION}`);
@@ -917,6 +943,436 @@ describe("鎖定/寫入使用獨立的 ADTClient", () => {
     const adt = realAdt(one);
     await adt.lock("/u");
     expect(one.lock).toHaveBeenCalled();
+  });
+});
+
+// ───────────────────────── data_preview(v0.4 D1)─────────────────────────
+
+describe("data_preview 的 SQL 護欄", () => {
+  const dp = { ABAP_MCP_ALLOW_DATA_PREVIEW: "true" };
+
+  it("接受單一 SELECT,回傳 FROM / JOIN 的表", () => {
+    expect(validateSelectSql("SELECT * FROM /dmo/travel").tables).toEqual(["/DMO/TRAVEL"]);
+    expect(
+      validateSelectSql(
+        "SELECT t~travel_id, b~booking_id FROM /dmo/travel AS t INNER JOIN /dmo/booking AS b ON b~travel_id = t~travel_id"
+      ).tables
+    ).toEqual(["/DMO/TRAVEL", "/DMO/BOOKING"]);
+    expect(validateSelectSql("select status, count(*) as cnt from /dmo/travel group by status").tables).toEqual(["/DMO/TRAVEL"]);
+  });
+
+  it("字串常值與註解裡的關鍵字、分號不算", () => {
+    expect(validateSelectSql("SELECT * FROM /dmo/travel WHERE description = 'DELETE; UPDATE it''s'").tables).toEqual(["/DMO/TRAVEL"]);
+    expect(validateSelectSql("SELECT * FROM /dmo/travel \" UPDATE x;\n WHERE status = 'N'").tables).toEqual(["/DMO/TRAVEL"]);
+    expect(validateSelectSql("* DELETE FROM usr02;\nSELECT * FROM /dmo/travel").tables).toEqual(["/DMO/TRAVEL"]);
+    expect(validateSelectSql("SELECT * FROM /dmo/travel -- ; DROP\n").tables).toEqual(["/DMO/TRAVEL"]);
+  });
+
+  it("拒絕變更類語法、多語句與非 SELECT", () => {
+    expect(() => validateSelectSql("UPDATE /dmo/travel SET status = 'X'")).toThrow(/SELECT/);
+    expect(() => validateSelectSql("SELECT * FROM /dmo/travel; DELETE FROM /dmo/travel")).toThrow(/;/);
+    expect(() => validateSelectSql("SELECT * FROM /dmo/travel INTO TABLE @DATA(t)")).toThrow(/INTO/);
+    expect(() => validateSelectSql("WITH +x AS ( SELECT * FROM /dmo/travel ) SELECT * FROM +x")).toThrow(/SELECT/);
+    expect(() => validateSelectSql("")).toThrow(/不可為空/);
+    expect(() => validateSelectSql("SELECT * FROM /dmo/travel WHERE x = 'abc")).toThrow(/未結束/);
+  });
+
+  it("無法可靠解析來源時拒絕:FROM 子查詢、表函式參數、逗號 join、沒有 FROM", () => {
+    expect(() => validateSelectSql("SELECT * FROM ( SELECT * FROM /dmo/travel ) AS x")).toThrow(/子查詢/);
+    expect(() => validateSelectSql("SELECT * FROM zcds_with_params( p_date = '20260101' )")).toThrow(/參數/);
+    expect(() => validateSelectSql("SELECT * FROM /dmo/travel, usr02")).toThrow(/逗號/);
+    expect(() => validateSelectSql("SELECT 1 AS x")).toThrow(/FROM/);
+  });
+
+  it("CDS 關聯路徑(\\_)一律拒絕:關聯目標不出現在 SQL 裡,白名單無從檢查", () => {
+    // FROM 後面接關聯:原本會被解析成 /DMO/I_TRAVEL_U 而通過白名單,實際讀的是關聯目標
+    expect(() => validateSelectSql("SELECT * FROM /dmo/i_travel_u\\_agency")).toThrow(/關聯路徑/);
+    expect(() => validateSelectSql("SELECT travelid, \\_agency-name AS agency FROM /dmo/i_travel_u")).toThrow(/關聯路徑/);
+    expect(() => validateSelectSql("SELECT * FROM /dmo/i_travel_u WHERE \\_agency-countrycode = 'DE'")).toThrow(/關聯路徑/);
+    expect(() => validateSelectSql("SELECT * FROM /dmo/i_travel_u AS t INNER JOIN t\\_agency AS a ON a~agencyid = t~agencyid")).toThrow(/關聯路徑/);
+    // 字串常值裡的 \_ 不算
+    expect(validateSelectSql("SELECT * FROM /dmo/travel WHERE description = 'a\\_b'").tables).toEqual(["/DMO/TRAVEL"]);
+  });
+
+  it("每張表都要在白名單內:WHERE 子查詢裡的 USR02 也擋", () => {
+    const cfg = makeConfig(dp);
+    // 預設只有 /DMO/*:Z* / Y* 會讓 AI 能以自建 CDS view 包住任意表
+    expect(cfg.safety.dataPreviewTables).toEqual(["/DMO/*"]);
+    expect(() => assertTablesAllowed(cfg, ["ZI_WRAPS_USR02"])).toThrow(/ZI_WRAPS_USR02/);
+    const sub = validateSelectSql("SELECT * FROM /dmo/travel WHERE agency_id IN ( SELECT bname FROM usr02 )");
+    expect(sub.tables).toEqual(["/DMO/TRAVEL", "USR02"]);
+    expect(() => assertTablesAllowed(cfg, sub.tables)).toThrow(/USR02/);
+    const custom = makeConfig({ ...dp, ABAP_MCP_DATA_PREVIEW_TABLES: "/DMO/*,ZTAB" });
+    expect(() => assertTablesAllowed(custom, ["/DMO/TRAVEL", "ZTAB"])).not.toThrow();
+  });
+
+  it("預設不註冊;開啟後唯讀模式也可用", async () => {
+    const names = async (cfg: ReturnType<typeof makeConfig>) => {
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerTools(server, mockAdt(), cfg, new AuditLogger(""));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(clientT);
+      return (await client.listTools()).tools.map((t) => t.name);
+    };
+    expect(await names(makeConfig())).not.toContain("data_preview");
+    expect(await names(makeConfig({ ...dp, ABAP_MCP_READONLY: "true" }))).toContain("data_preview");
+  });
+
+  it("工具:表名稱轉大寫、預設 100 筆;白名單外與 UPDATE 不送到 SAP", async () => {
+    const qr = { columns: [{ name: "TRAVEL_ID" }, { name: "STATUS" }], values: [{ TRAVEL_ID: 1, STATUS: "N" }] } as never;
+    const adt = mockAdt({ tableContents: vi.fn(async () => qr), runQuery: vi.fn(async () => qr) });
+    const call = await connectTools(adt, makeConfig(dp));
+    const r = await call("data_preview", { table: "/dmo/travel" });
+    expect(adt.tableContents).toHaveBeenCalledWith("/DMO/TRAVEL", 100);
+    expect(r.text).toContain("TRAVEL_ID | STATUS");
+    expect(r.text).toContain("1 | N");
+    await call("data_preview", { sql: "SELECT travel_id, status FROM /dmo/travel", max_rows: 5 });
+    expect(adt.runQuery).toHaveBeenCalledWith("SELECT travel_id, status FROM /dmo/travel", 5);
+    expect((await call("data_preview", { table: "USR02" })).text).toContain("白名單");
+    expect((await call("data_preview", { sql: "UPDATE /dmo/travel SET status = 'X'" })).isError).toBe(true);
+    expect((await call("data_preview", { table: "/dmo/travel", max_rows: 5000 })).isError).toBe(true);
+    expect(adt.tableContents).toHaveBeenCalledTimes(1);
+    expect(adt.runQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it("audit 記 SQL 與筆數,不記資料內容", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "abap-mcp-dp-"));
+    const auditPath = path.join(dir, "audit.jsonl");
+    try {
+      const qr = { columns: [{ name: "SECRET" }], values: [{ SECRET: "TOP-SECRET-VALUE" }] } as never;
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerTools(
+        server,
+        mockAdt({ runQuery: vi.fn(async () => qr) }),
+        makeConfig({ ...dp, ABAP_MCP_DATA_PREVIEW_TABLES: "/DMO/*,ZTAB" }),
+        new AuditLogger(auditPath)
+      );
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(clientT);
+      await client.callTool({ name: "data_preview", arguments: { sql: "SELECT secret FROM ztab" } });
+      const log = fs.readFileSync(auditPath, "utf8");
+      expect(JSON.parse(log.trim())).toMatchObject({ action: "data_preview", success: true, summary: "SELECT secret FROM ztab(回傳 1 筆)" });
+      expect(log).not.toContain("TOP-SECRET-VALUE");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("日期印成 YYYY-MM-DD;SAP 多回的筆數會截到要求的筆數(A4H 實測)", async () => {
+    const f = formatQueryResult({ columns: [{ name: "D" }], values: [{ D: new Date("2024-09-07T00:00:00Z") }] } as never);
+    expect(f.text).toBe("D\n2024-09-07");
+    const qr = { columns: [{ name: "N" }], values: [{ N: 1 }, { N: 2 }, { N: 3 }, { N: 4 }] } as never;
+    const call = await connectTools(mockAdt({ tableContents: vi.fn(async () => qr) }), makeConfig(dp));
+    const r = await call("data_preview", { table: "/DMO/TRAVEL", max_rows: 3 });
+    expect(r.text).toContain("📊 3 筆;已達筆數上限 3");
+    expect(r.text).not.toMatch(/\n4$/);
+  });
+
+  it("輸出:每格截斷 200 字元,整體超過上限時停止並標註", () => {
+    const long = "x".repeat(500);
+    const f1 = formatQueryResult({ columns: [{ name: "C" }], values: [{ C: long }] } as never);
+    expect(f1.text.split("\n")[1].length).toBe(201);
+    const many = { columns: [{ name: "C" }], values: Array.from({ length: 300 }, () => ({ C: "y".repeat(100) })) } as never;
+    const f2 = formatQueryResult(many, { maxTotal: 5_000 });
+    expect(f2.truncatedRows).toBe(true);
+    expect(f2.text.length).toBeLessThanOrEqual(5_000);
+  });
+});
+
+// ───────────────────────── ddic_info(v0.4 D2)─────────────────────────
+
+describe("ddic_info", () => {
+  const hit = (name: string, type: string, uri: string) => ({ "adtcore:name": name, "adtcore:type": type, "adtcore:uri": uri }) as never;
+
+  it("表欄位:只列真正的欄位(排除 .include 與 package 節點,A4H 實際回應)", () => {
+    const el = JSON.parse(fs.readFileSync(path.resolve("test/unit/fixtures/ddic-travel.a4h.json"), "utf8"));
+    const text = formatDdicFields(el);
+    expect(text).toContain("欄位(15 個)");
+    expect(text).toContain("travel_id | key | /dmo/travel_id | numc | 8");
+    expect(text).toContain("booking_fee |  | /dmo/booking_fee | curr | 16,2");
+    expect(text).not.toContain(".include");
+    expect(text).not.toContain("/DMO/FLIGHT_LEGACY");
+  });
+
+  it("domain 固定值、資料元素標籤", () => {
+    const dom = formatDomain({
+      metaData: { name: "/DMO/STATUS", description: "Status" },
+      properties: { typeInformation: { datatype: "CHAR", length: 1, decimals: 0 }, valueInformation: { fixValues: [{ low: "B", text: "Booked" }, { low: "N", text: "New" }] } },
+    });
+    expect(dom).toContain("型別:CHAR 長度 1");
+    expect(dom).toContain("固定值(2 個)");
+    expect(dom).toContain("- B:Booked");
+    const de = formatDataElement({
+      metaData: { name: "/DMO/TRAVEL_ID", description: "Travel ID" },
+      properties: { typeName: "/DMO/TRAVEL_ID", dataType: "NUMC", dataTypeLength: 8, fieldLabels: { shortFieldLabel: "Travel ID", longFieldLabel: "Travel Number" } },
+    });
+    expect(de).toContain("型別:NUMC 長度 8");
+    expect(de).toContain("長「Travel Number」");
+  });
+
+  it("同名的資料元素與 domain 一併列出;結構改讀定義原始碼;找不到時說明", async () => {
+    const adt = mockAdt({
+      searchObject: vi.fn(async (q: string) =>
+        q === "/DMO/TRAVEL_ID"
+          ? [hit("/DMO/TRAVEL_ID", "DTEL/DE", "/u/de"), hit("/DMO/TRAVEL_ID", "DOMA/DD", "/u/dom"), hit("/DMO/TRAVEL_ID_X", "DTEL/DE", "/u/x")]
+          : q === "BAPIRET2" ? [hit("BAPIRET2", "TABL/DS", "/sap/bc/adt/ddic/structures/bapiret2")] : []
+      ),
+      dataElementProperties: vi.fn(async () => ({ metaData: { name: "/DMO/TRAVEL_ID" }, properties: { dataType: "NUMC", dataTypeLength: 8 } })),
+      domainProperties: vi.fn(async () => ({ metaData: { name: "/DMO/TRAVEL_ID" }, properties: { typeInformation: { datatype: "NUMC", length: 8 } } })),
+      ddicElement: vi.fn(async () => ({ type: "", name: "", properties: { elementProps: false, annotations: [] }, children: [] }) as never),
+      getObjectSource: vi.fn(async () => "define structure bapiret2 {\n  type : bapi_mtype;\n}"),
+    });
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" }));
+    const r = await call("ddic_info", { name: "/dmo/travel_id" });
+    expect(r.text).toContain("[DTEL/DE 資料元素]");
+    expect(r.text).toContain("[DOMA/DD domain]");
+    expect(r.text).not.toContain("TRAVEL_ID_X");
+    const s = await call("ddic_info", { name: "bapiret2" });
+    expect(adt.getObjectSource).toHaveBeenCalledWith("/sap/bc/adt/ddic/structures/bapiret2/source/main");
+    expect(s.text).toContain("define structure bapiret2");
+    expect((await call("ddic_info", { name: "ZNOPE" })).text).toContain("找不到名為 ZNOPE");
+  });
+});
+
+// ───────────────────────── list_dumps / dump_detail(v0.4 D3)─────────────────────────
+
+describe("短傾印", () => {
+  const fixture = (n: string) => fs.readFileSync(path.resolve("test/unit/fixtures", n), "utf8");
+
+  it("列表項目:id 取 self 路徑、UTC 時間取自 id、錯誤類型與程式取自分類(A4H 實際回應)", () => {
+    const s = summarizeDump(JSON.parse(fixture("dump-entry.a4h.json")));
+    expect(s.id.startsWith("/sap/bc/adt/runtime/dump/20261102142307")).toBe(true);
+    expect(s.datetime).toBe("2026-11-02T14:23:07Z");
+    expect(s.error).toBe("COMPUTE_INT_ZERODIVIDE");
+    expect(s.program).toBe("ZCL_MCP_V04DMP2===============CP");
+    expect(s.user).toBe("DEVELOPER");
+  });
+
+  it("metadata:termination 連結給出以 source/main 為準的行號", () => {
+    const m = parseDumpMeta(fixture("dump-meta.a4h.xml"));
+    expect(m.error).toBe("COMPUTE_INT_ZERODIVIDE");
+    expect(m.exception).toBe("CX_SY_ZERODIVIDE");
+    expect(m.termination).toEqual({ uri: "/sap/bc/adt/oo/classes/zcl_mcp_v04dmp2/source/main", line: 9 });
+    expect(m.contentsUri).toMatch(/^\/sap\/bc\/adt\/runtime\/dump\/.+\/formatted$/);
+    expect(m.chapters.map((c) => c.title)).toContain("Source Code Extract");
+  });
+
+  it("只擷取除錯需要的章節,不含 Selected Variables 與系統環境", () => {
+    const m = parseDumpMeta(fixture("dump-meta.a4h.xml"));
+    const text = extractDumpChapters(fixture("dump-formatted.a4h.txt"), m.chapters);
+    expect(text).toContain("## Short Text");
+    expect(text).toContain("Division by 0");
+    expect(text).toContain("## Source Code Extract");
+    expect(text).toMatch(/>>>>>\|\s+DATA\(result\) = 10 \/ zero\./);
+    expect(text).toContain("## Information on where terminated");
+    expect(text).not.toContain("Selected Variables");
+    expect(text).not.toContain("System environment");
+  });
+
+  it("dump_id 只接受 runtime/dump 路徑", () => {
+    expect(normalizeDumpId("adt://A4H/sap/bc/adt/runtime/dump/2026%20X")).toBe("/sap/bc/adt/runtime/dump/2026%20X");
+    expect(() => normalizeDumpId("/sap/bc/adt/oo/classes/zcl_x")).toThrow(/dump_id/);
+    expect(() => normalizeDumpId("/sap/bc/adt/runtime/dump/../../oo/classes/x")).toThrow(/dump_id/);
+    expect(() => normalizeDumpId("/sap/bc/adt/runtime/dump/x?y=1")).toThrow(/dump_id/);
+  });
+
+  it("list_dumps 依天數篩選、新的在前;dump_detail 標出出錯位置", async () => {
+    const now = new Date();
+    const ts = (minAgo: number) => new Date(now.getTime() - minAgo * 60_000).toISOString().replace(/\.\d+Z$/, "Z");
+    const adt = mockAdt({
+      listDumps: vi.fn(async () => [
+        { id: "/sap/bc/adt/runtime/dump/new", datetime: ts(5), error: "COMPUTE_INT_ZERODIVIDE", program: "ZCL_A=====CP", user: "DEVELOPER" },
+        { id: "/sap/bc/adt/runtime/dump/old", datetime: ts(3 * 24 * 60), error: "ITAB_LINE_NOT_FOUND", program: "ZCL_B=====CP", user: "DEVELOPER" },
+      ]),
+      dumpDetail: vi.fn(async () => ({
+        meta: { title: "", error: "COMPUTE_INT_ZERODIVIDE", exception: "CX_SY_ZERODIVIDE", program: "ZCL_A=====CP", datetime: ts(5), author: "DEVELOPER", contentsUri: "", termination: { uri: "/sap/bc/adt/oo/classes/zcl_a/source/main", line: 9 }, chapters: [] },
+        text: "## Short Text\nDivision by 0",
+      })),
+    });
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" }));
+    const l = await call("list_dumps", {});
+    expect(l.text).toContain("共 1 筆");
+    expect(l.text).toContain("/sap/bc/adt/runtime/dump/new");
+    expect(l.text).not.toContain("/old");
+    expect((await call("list_dumps", { days: 7 })).text).toContain("共 2 筆");
+    const d = await call("dump_detail", { dump_id: "/sap/bc/adt/runtime/dump/new" });
+    expect(d.text).toContain("出錯位置:/sap/bc/adt/oo/classes/zcl_a/source/main 第 9 行");
+    expect(d.text).toContain("例外 CX_SY_ZERODIVIDE");
+  });
+
+  it("run_class 遇 500 時附上這個 class 剛產生的短傾印", async () => {
+    const http500 = Object.assign(new Error("Request failed with status code 500"), { status: 500 });
+    const recent = new Date(Date.now() - 60_000).toISOString().replace(/\.\d+Z$/, "Z");
+    const adt = mockAdt({
+      runClass: vi.fn(async () => { throw http500; }),
+      listDumps: vi.fn(async () => [
+        { id: "/sap/bc/adt/runtime/dump/other", datetime: recent, error: "X", program: "ZCL_OTHER===CP", user: "DEVELOPER" },
+        { id: "/sap/bc/adt/runtime/dump/mine", datetime: recent, error: "COMPUTE_INT_ZERODIVIDE", program: "ZCL_RUN=====CP", user: "DEVELOPER" },
+      ]),
+    });
+    const call = await connectTools(adt);
+    const r = await call("run_class", { class_name: "ZCL_RUN" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("執行時發生短傾印:COMPUTE_INT_ZERODIVIDE");
+    expect(r.text).toContain("/sap/bc/adt/runtime/dump/mine");
+    expect(r.text).not.toContain("逾時");
+    expect(adt.listDumps).toHaveBeenCalledWith("DEVELOPER");
+  });
+});
+
+// ───────────────────────── pretty_print(v0.4 D4)─────────────────────────
+
+describe("pretty_print", () => {
+  it("回傳格式化結果、不寫回;object_url 讀系統內容;唯讀模式可用", async () => {
+    const adt = mockAdt({
+      prettyPrint: vi.fn(async (s: string) => ({ source: s.toUpperCase(), style: "keywordUpper", indentation: true })),
+      getObjectSource: vi.fn(async () => "method m.\nendmethod."),
+    });
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" }));
+    const r = await call("pretty_print", { source: "data x type i." });
+    expect(r.text).toContain("keywordUpper、縮排");
+    expect(r.text).toContain("DATA X TYPE I.");
+    expect(r.text).toContain("尚未寫回系統");
+    await call("pretty_print", { object_url: "/sap/bc/adt/oo/classes/zcl_x" });
+    expect(adt.getObjectSource).toHaveBeenCalledWith("/sap/bc/adt/oo/classes/zcl_x/source/main");
+    expect(adt.lock).not.toHaveBeenCalled();
+    expect(adt.setObjectSource).not.toHaveBeenCalled();
+    expect((await call("pretty_print", {})).isError).toBe(true);
+  });
+
+  it("內容沒有變化時說明", async () => {
+    const adt = mockAdt({ prettyPrint: vi.fn(async (s: string) => ({ source: s, style: "keywordUpper", indentation: true })) });
+    const call = await connectTools(adt);
+    expect((await call("pretty_print", { source: "DATA x TYPE i." })).text).toContain("內容沒有變化");
+  });
+});
+
+// ───────────────────────── list_inactive / activate_objects(v0.4 D5)─────────────────────────
+
+describe("inactive 物件與批次啟用", () => {
+  const entry = (name: string, parent = "", user = "DEVELOPER") => ({
+    uri: parent ? `${parent}/includes/x` : `/sap/bc/adt/oo/classes/${name.toLowerCase()}`,
+    type: parent ? "CLAS/OCN/definitions" : "CLAS/OC",
+    name,
+    parentUri: parent,
+    user,
+    deleted: false,
+  });
+  const A = "/sap/bc/adt/oo/classes/zcl_a";
+  const B = "/sap/bc/adt/oo/classes/zcl_b";
+
+  it("啟用請求只帶 uri + name(A4H 對帶 type/parentUri 的請求回 Check of condition failed)", () => {
+    const xml = activationBody([{ uri: A, name: "zcl_a" }, { uri: B, name: "ZCL_B" }]);
+    expect(xml).toContain(`<adtcore:objectReference adtcore:uri="${A}" adtcore:name="ZCL_A"/>`);
+    expect(xml).not.toContain("adtcore:type");
+    expect(xml).not.toContain("parentUri");
+  });
+
+  it("解析啟用回應:A4H 的語法錯誤回應判為失敗並帶出訊息;空回應為成功", () => {
+    const r = parseActivationResponse(fs.readFileSync(path.resolve("test/unit/fixtures/activation-error.a4h.xml"), "utf8"));
+    expect(r.success).toBe(false);
+    expect(r.messages.find((m) => m.type === "E")).toMatchObject({ line: 1, shortText: 'Field "UNDEFINED_VARIABLE" is unknown.' });
+    const okXml = `<chkl:messages xmlns:chkl="x"><chkl:properties checkExecuted="true" activationExecuted="true" generationExecuted="true"/></chkl:messages>`;
+    expect(parseActivationResponse(okXml).success).toBe(true);
+    expect(parseActivationResponse("").success).toBe(true);
+  });
+
+  it("list_inactive:只列目前使用者,子項目歸到主物件", async () => {
+    expect(groupInactive([entry("ZCL_A"), entry("ZCL_A", A), entry("ZCL_A", A)])).toEqual([
+      { uri: A, name: "ZCL_A", type: "CLAS/OC", parts: 2, deleted: false },
+    ]);
+    const adt = mockAdt({ inactiveObjects: vi.fn(async () => [entry("ZCL_A"), entry("ZCL_A", A), entry("ZCL_OTHER", "", "SOMEONE")]) });
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" }));
+    const r = await call("list_inactive");
+    expect(r.text).toContain("DEVELOPER 有 1 個 inactive 物件");
+    expect(r.text).toContain("ZCL_A [CLAS/OC](含 1 個子項目)");
+    expect(r.text).not.toContain("ZCL_OTHER");
+  });
+
+  it("activate_objects:任一物件不過白名單就整批拒絕;唯讀模式不註冊", async () => {
+    const adt = mockAdt({
+      inactiveObjects: vi.fn(async () => [entry("ZCL_A"), entry("ZCL_B")]),
+      objectPackage: vi.fn(async (u: string) => (u === B ? "SAP_PKG" : "$TMP")),
+    });
+    const call = await connectTools(adt);
+    const r1 = await call("activate_objects", { object_urls: [A, "/sap/bc/adt/oo/classes/cl_std"] });
+    expect(r1.text).toContain("整批拒絕");
+    expect(r1.text).toContain("CL_STD");
+    const r2 = await call("activate_objects", { object_urls: [A, B] });
+    expect(r2.text).toContain("package 白名單");
+    expect(adt.activateObjects).not.toHaveBeenCalled();
+
+    const ro = await connectTools(mockAdt(), makeConfig({ ABAP_MCP_READONLY: "true" }));
+    expect((await ro("activate_objects", { object_urls: [A] })).isError).toBe(true);
+  });
+
+  it("activate_objects:只啟用列表中屬於這些物件的紀錄;非 inactive 的略過並說明", async () => {
+    const adt = mockAdt({
+      inactiveObjects: vi.fn(async () => [entry("ZCL_A"), entry("ZCL_A", A), entry("ZTESTAI")]),
+      activateObjects: vi.fn(async () => ({ success: true, messages: [], inactive: [] })),
+    });
+    const call = await connectTools(adt);
+    const r = await call("activate_objects", { object_urls: [`${A}/source/main`, B] });
+    expect(adt.activateObjects).toHaveBeenCalledWith([entry("ZCL_A"), entry("ZCL_A", A)]);
+    expect(r.text).toContain("已啟用 1 個物件:ZCL_A");
+    expect(r.text).toContain("略過(不是 inactive):ZCL_B");
+  });
+});
+
+// ───────────────────────── get_revisions(v0.4 D6)─────────────────────────
+
+describe("版本歷史與 diff", () => {
+  const rev = (num: string, date: string) =>
+    ({ uri: `/sap/bc/adt/oo/classes/zcl_x/includes/main/versions/19700101101123/${num}/content`, date, author: "DEVELOPER", version: "", versionTitle: "" }) as never;
+
+  it("unifiedDiff:區塊標頭、前後 3 行、CRLF 不算差異、超過上限截斷", () => {
+    const a = "a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh";
+    const b = "a\nb\nc\nd\nE\nf\ng\nh";
+    const d = unifiedDiff(a, b, "old", "new");
+    expect(d.text).toBe("--- old\n+++ new\n@@ -2,7 +2,7 @@\n b\n c\n d\n-e\n+E\n f\n g\n h");
+    expect(d).toMatchObject({ added: 1, removed: 1, truncated: false });
+    expect(unifiedDiff(a, a.replace(/\r\n/g, "\n"), "o", "n").text).toBe("");
+    const many = unifiedDiff("", Array.from({ length: 800 }, (_, i) => `l${i}`).join("\n"), "o", "n", { maxLines: 500 });
+    expect(many.truncated).toBe(true);
+    expect(many.text.split("\n").length).toBe(501);
+  });
+
+  it("版本說明:00000 = active、99999 = inactive(A4H 實測)", () => {
+    expect(revisionLabel(rev("00000", ""))).toContain("active");
+    expect(revisionLabel(rev("99999", ""))).toContain("inactive");
+    expect(revisionLabel({ ...(rev("00012", "") as object), version: "A4HK900001", versionTitle: "fix" } as never)).toBe("A4HK900001 fix");
+  });
+
+  it("active / inactive 版本以 source URI + version 讀取;其他版本讀版本 URI;拒絕不合格式的 URI", async () => {
+    const fake = fakeAdtClient({ getObjectSource: vi.fn(async () => "src") });
+    const adt = realAdt(fake);
+    const src = "/sap/bc/adt/oo/classes/zcl_x/source/main";
+    await adt.revisionContent((rev("00000", "") as { uri: string }).uri, src);
+    expect(fake.getObjectSource).toHaveBeenLastCalledWith(src, { version: "active" });
+    await adt.revisionContent((rev("99999", "") as { uri: string }).uri, src);
+    expect(fake.getObjectSource).toHaveBeenLastCalledWith(src, { version: "inactive" });
+    const old = (rev("00012", "") as { uri: string }).uri;
+    await adt.revisionContent(old, src);
+    expect(fake.getObjectSource).toHaveBeenLastCalledWith(old);
+    await expect(adt.revisionContent("/sap/bc/adt/oo/classes/zcl_x", src)).rejects.toThrow("版本 URI");
+  });
+
+  it("工具:列出版本並比較;compare 參數要成對、編號要在範圍內", async () => {
+    const adt = mockAdt({
+      revisions: vi.fn(async () => [rev("99999", "2026-11-02T14:36:53Z"), rev("00000", "2026-11-02T14:36:52Z")]),
+      revisionContent: vi.fn(async (uri: string) => (uri.includes("/99999/") ? "r = 'V2'." : "r = 'V1'.")),
+    });
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" }));
+    const r = await call("get_revisions", { object_url: "/sap/bc/adt/oo/classes/zcl_x", compare_from: 2, compare_to: 1 });
+    expect(r.text).toContain("#1 2026-11-02T14:36:53Z DEVELOPER  inactive");
+    expect(r.text).toContain("-r = 'V1'.\n+r = 'V2'.");
+    expect(adt.revisionContent).toHaveBeenCalledWith(expect.stringContaining("/00000/"), "/sap/bc/adt/oo/classes/zcl_x/source/main");
+    expect((await call("get_revisions", { object_url: "/u", compare_from: 1 })).isError).toBe(true);
+    expect((await call("get_revisions", { object_url: "/u", compare_from: 1, compare_to: 5 })).text).toContain("1–2");
   });
 });
 
