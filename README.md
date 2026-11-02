@@ -33,14 +33,25 @@ AI 可以在 `$TMP` 從零完成「建立 → 寫 → 啟用 → ABAP Unit → A
 | `where_used` | 查詢物件或元件的使用處(含程式碼行,上限 50 筆) |
 | `find_definition` | 跳到定義 / 實作 |
 | `class_components` | 列出 class / interface 的方法、屬性、介面、本地類別 |
+| `ddic_info` | DDIC 定義:表與 CDS 欄位、結構、資料元素、domain(含固定值) |
+| `list_dumps` | ST22 短傾印列表(依天數、使用者篩選) |
+| `dump_detail` | 短傾印內容與出錯位置(以 source/main 為準的行號;不含變數內容) |
+| `pretty_print` | 以系統 Pretty Printer 設定格式化原始碼(不寫回) |
+| `list_inactive` | 目前使用者的 inactive 物件 |
+| `get_revisions` | 版本歷史與兩版比較(unified diff) |
+| `data_preview` | 🔒 **讀取資料表內容**:單表或單一 SELECT;**預設不註冊**,需 `ABAP_MCP_ALLOW_DATA_PREVIEW=true`,只能讀表白名單內的表 |
 | `write_source` | ✏️ 寫入原始碼(自動鎖定編排 + 並行保護 + 語法檢查 + 可選啟用;可寫測試 include) |
 | `activate_object` | ✏️ 啟用物件 |
+| `activate_objects` | ✏️ 批次啟用(每個物件都要通過兩道白名單,任一不過整批拒絕) |
 | `create_object` | ✏️ 建立 CLAS/OC、INTF/OI、PROG/P、DDLS/DF、BDEF/BDO |
 | `run_unit_tests` | ⚠️ **會執行測試程式碼**:ABAP Unit(物件或 package;只跑宣告為 RISK LEVEL HARMLESS 的測試) |
 | `run_class` | ⚠️ **會在 SAP 系統上執行程式**:執行 IF_OO_ADT_CLASSRUN(輸出上限 20,000 字元) |
 | `create_transport` | ✏️ 建立 workbench transport request(只在 `SYSTEM_ROLE=dev`) |
 
 ✏️ / ⚠️ = 寫入或執行類工具,唯讀模式下不會註冊(AI 完全看不到),且必須通過名稱前綴與 package 兩道白名單。
+🔒 = 資料讀取工具,預設關閉;開啟後唯讀模式也可用(只讀資料)。
+
+v0.4 起還能診斷:AI 可以讀 DDIC 結構、查資料、從 ST22 短傾印定位出錯行號後自己修正,再用 `run_class` 驗證。
 
 ## 系統需求
 
@@ -104,6 +115,8 @@ PowerShell 的換行符號是反引號 `` ` ``(行尾不可有空白)。密碼�
 | `ABAP_MCP_SYSTEM_ROLE` | | `dev` | `dev`/`qa`/`prod`;**prod 強制唯讀** |
 | `ABAP_MCP_ALLOWED_PREFIXES` | | `Z,Y,$` | 可寫入的物件名稱前綴白名單 |
 | `ABAP_MCP_ALLOWED_PACKAGES` | | `$TMP,Z*,Y*` | 可寫入/建立/執行物件所在的 package 白名單(`*` 結尾為前綴比對) |
+| `ABAP_MCP_ALLOW_DATA_PREVIEW` | | `false` | `true` 時才註冊 `data_preview`(讀資料表內容) |
+| `ABAP_MCP_DATA_PREVIEW_TABLES` | | `/DMO/*,Z*,Y*` | `data_preview` 可讀的表/view 白名單(`*` 結尾為前綴比對) |
 | `ABAP_MCP_ALLOW_SELF_SIGNED` | | `false` | 允許自簽憑證(限內網開發系統) |
 | `ABAP_MCP_AUDIT_LOG` | | (停用) | 寫入操作稽核紀錄檔路徑 |
 | `ABAP_MCP_MAX_SOURCE_LINES` | | `5000` | `read_source` 回傳行數上限 |
@@ -121,6 +134,8 @@ AI 直接寫入 SAP 系統風險很高,本專案內建多層防護,詳見 [docs/
 7. **Audit log** — JSON Lines 紀錄所有寫入、建立、執行操作(不含憑證與原始碼內容)
 8. **鎖定保證釋放** — try/finally,不留殘留鎖定,也不讓連線卡在 stateful
 9. **401 斷路** — 連續 2 次認證失敗後停止連線 SAP,避免重試把帳號鎖住
+10. **資料讀取預設關閉** — `data_preview` 需明確開啟;只接受單一 SELECT、每張表都要在表白名單內、audit 不記資料內容
+11. **短傾印不帶出變數內容** — `dump_detail` 只取除錯需要的章節,不含 Selected Variables
 
 ## 開發
 
@@ -136,7 +151,7 @@ npm run test:it:write  # 整合測試唯讀 + 寫入組(只在 $TMP 建暫存 cl
 ## Roadmap
 
 - ~~**Phase 2**:`create_object`、ABAP Unit 測試、ATC、where-used~~(v0.3 完成)
-- **Phase 3**:SQL 資料查詢(Data Preview)、ST22 dump 分析、DDIC 資訊
+- ~~**Phase 3**:SQL 資料查詢(Data Preview)、ST22 dump 分析、DDIC 資訊~~(v0.4 完成)
 - **Phase 4**:BTP ABAP Environment(JWT / Service Key)
 
 ## 致謝
