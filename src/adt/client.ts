@@ -27,6 +27,14 @@ import * as https from "node:https";
 import type { AppConfig } from "../config.js";
 import { AuthCircuitOpenError, hasHttpStatus, isAuthFailure } from "./errors.js";
 import {
+  extractDumpChapters,
+  normalizeDumpId,
+  parseDumpMeta,
+  summarizeDump,
+  type DumpMeta,
+  type DumpSummary,
+} from "./dumps.js";
+import {
   parseUsageReferences,
   parseUsageSnippets,
   usageReferencesBody,
@@ -154,6 +162,10 @@ export interface AdtService {
   classComponents(objectUrl: string): Promise<ClassComponent>;
   /** 執行 class 的 IF_OO_ADT_CLASSRUN~MAIN,回傳 out->write 的輸出 */
   runClass(className: string): Promise<string>;
+  /** ST22 短傾印列表(新的在前);user 指定時只列該使用者 */
+  listDumps(user?: string): Promise<DumpSummary[]>;
+  /** 單筆短傾印:metadata + 擷取後的章節文字(不含 Selected Variables 等可能含資料的章節) */
+  dumpDetail(dumpId: string): Promise<{ meta: DumpMeta; text: string }>;
   /** DDIC 元素(表、CDS view 的欄位);結構與資料元素在 A4H 會回空 */
   ddicElement(name: string): Promise<DdicElement>;
   /** 資料元素屬性(型別、長度、欄位標籤) */
@@ -501,6 +513,26 @@ export class RealAdtService implements AdtService {
 
   async runClass(className: string) {
     return this.guard(() => this.client.runClass(className.toUpperCase()));
+  }
+
+  async listDumps(user?: string) {
+    // A4H 實測:$query 支援 and( equals( user, X ) );日期條件的格式不被接受,改由呼叫端依 id 的時間戳篩選
+    const query = user ? `and( equals( user, ${user.toUpperCase().replace(/[^A-Z0-9_]/g, "")} ) )` : "";
+    const feed = await this.guard(() => this.client.dumps(query));
+    return feed.dumps.map(summarizeDump).sort((a, b) => b.datetime.localeCompare(a.datetime));
+  }
+
+  async dumpDetail(dumpId: string) {
+    const id = normalizeDumpId(dumpId);
+    const xml = await this.guard(() =>
+      this.client.httpClient.request(id, { headers: { Accept: "application/vnd.sap.adt.runtime.dump.v1+xml" } })
+    );
+    const meta = parseDumpMeta(String(xml.body ?? ""));
+    if (!meta.contentsUri) return { meta, text: "" };
+    const body = await this.guard(() =>
+      this.client.httpClient.request(meta.contentsUri, { headers: { Accept: "text/plain" } })
+    );
+    return { meta, text: extractDumpChapters(String(body.body ?? ""), meta.chapters) };
   }
 
   async ddicElement(name: string) {

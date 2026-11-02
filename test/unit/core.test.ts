@@ -56,6 +56,7 @@ import {
   formatWhereUsed,
 } from "../../src/tools/formatters.js";
 import { assertTablesAllowed, validateSelectSql } from "../../src/safety/sql.js";
+import { extractDumpChapters, normalizeDumpId, parseDumpMeta, summarizeDump } from "../../src/adt/dumps.js";
 import { parseUsageReferences, parseUsageSnippets, usageSnippetsBody } from "../../src/adt/whereUsed.js";
 import type { UnitTestClass } from "abap-adt-api";
 
@@ -102,6 +103,8 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     ddicElement: vi.fn(async () => ({ type: "", name: "", properties: { elementProps: false, annotations: [] }, children: [] }) as never),
     dataElementProperties: vi.fn(async () => ({ metaData: { name: "" }, properties: {} })),
     domainProperties: vi.fn(async () => ({ metaData: { name: "" }, properties: {} })),
+    listDumps: vi.fn(async () => []),
+    dumpDetail: vi.fn(async () => ({ meta: { title: "", error: "", exception: "", program: "", datetime: "", author: "", contentsUri: "", chapters: [] }, text: "" })),
     runQuery: vi.fn(async () => ({ columns: [], values: [] }) as never),
     classComponents: vi.fn(async () => ({ "adtcore:name": "ZCL_X", "adtcore:type": "CLAS/OC", visibility: "public", links: [], components: [] }) as never),
     username: () => "DEVELOPER",
@@ -1106,6 +1109,92 @@ describe("ddic_info", () => {
     expect(adt.getObjectSource).toHaveBeenCalledWith("/sap/bc/adt/ddic/structures/bapiret2/source/main");
     expect(s.text).toContain("define structure bapiret2");
     expect((await call("ddic_info", { name: "ZNOPE" })).text).toContain("找不到名為 ZNOPE");
+  });
+});
+
+// ───────────────────────── list_dumps / dump_detail(v0.4 D3)─────────────────────────
+
+describe("短傾印", () => {
+  const fixture = (n: string) => fs.readFileSync(path.resolve("test/unit/fixtures", n), "utf8");
+
+  it("列表項目:id 取 self 路徑、UTC 時間取自 id、錯誤類型與程式取自分類(A4H 實際回應)", () => {
+    const s = summarizeDump(JSON.parse(fixture("dump-entry.a4h.json")));
+    expect(s.id.startsWith("/sap/bc/adt/runtime/dump/20261102142307")).toBe(true);
+    expect(s.datetime).toBe("2026-11-02T14:23:07Z");
+    expect(s.error).toBe("COMPUTE_INT_ZERODIVIDE");
+    expect(s.program).toBe("ZCL_MCP_V04DMP2===============CP");
+    expect(s.user).toBe("DEVELOPER");
+  });
+
+  it("metadata:termination 連結給出以 source/main 為準的行號", () => {
+    const m = parseDumpMeta(fixture("dump-meta.a4h.xml"));
+    expect(m.error).toBe("COMPUTE_INT_ZERODIVIDE");
+    expect(m.exception).toBe("CX_SY_ZERODIVIDE");
+    expect(m.termination).toEqual({ uri: "/sap/bc/adt/oo/classes/zcl_mcp_v04dmp2/source/main", line: 9 });
+    expect(m.contentsUri).toMatch(/^\/sap\/bc\/adt\/runtime\/dump\/.+\/formatted$/);
+    expect(m.chapters.map((c) => c.title)).toContain("Source Code Extract");
+  });
+
+  it("只擷取除錯需要的章節,不含 Selected Variables 與系統環境", () => {
+    const m = parseDumpMeta(fixture("dump-meta.a4h.xml"));
+    const text = extractDumpChapters(fixture("dump-formatted.a4h.txt"), m.chapters);
+    expect(text).toContain("## Short Text");
+    expect(text).toContain("Division by 0");
+    expect(text).toContain("## Source Code Extract");
+    expect(text).toMatch(/>>>>>\|\s+DATA\(result\) = 10 \/ zero\./);
+    expect(text).toContain("## Information on where terminated");
+    expect(text).not.toContain("Selected Variables");
+    expect(text).not.toContain("System environment");
+  });
+
+  it("dump_id 只接受 runtime/dump 路徑", () => {
+    expect(normalizeDumpId("adt://A4H/sap/bc/adt/runtime/dump/2026%20X")).toBe("/sap/bc/adt/runtime/dump/2026%20X");
+    expect(() => normalizeDumpId("/sap/bc/adt/oo/classes/zcl_x")).toThrow(/dump_id/);
+    expect(() => normalizeDumpId("/sap/bc/adt/runtime/dump/../../oo/classes/x")).toThrow(/dump_id/);
+    expect(() => normalizeDumpId("/sap/bc/adt/runtime/dump/x?y=1")).toThrow(/dump_id/);
+  });
+
+  it("list_dumps 依天數篩選、新的在前;dump_detail 標出出錯位置", async () => {
+    const now = new Date();
+    const ts = (minAgo: number) => new Date(now.getTime() - minAgo * 60_000).toISOString().replace(/\.\d+Z$/, "Z");
+    const adt = mockAdt({
+      listDumps: vi.fn(async () => [
+        { id: "/sap/bc/adt/runtime/dump/new", datetime: ts(5), error: "COMPUTE_INT_ZERODIVIDE", program: "ZCL_A=====CP", user: "DEVELOPER" },
+        { id: "/sap/bc/adt/runtime/dump/old", datetime: ts(3 * 24 * 60), error: "ITAB_LINE_NOT_FOUND", program: "ZCL_B=====CP", user: "DEVELOPER" },
+      ]),
+      dumpDetail: vi.fn(async () => ({
+        meta: { title: "", error: "COMPUTE_INT_ZERODIVIDE", exception: "CX_SY_ZERODIVIDE", program: "ZCL_A=====CP", datetime: ts(5), author: "DEVELOPER", contentsUri: "", termination: { uri: "/sap/bc/adt/oo/classes/zcl_a/source/main", line: 9 }, chapters: [] },
+        text: "## Short Text\nDivision by 0",
+      })),
+    });
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" }));
+    const l = await call("list_dumps", {});
+    expect(l.text).toContain("共 1 筆");
+    expect(l.text).toContain("/sap/bc/adt/runtime/dump/new");
+    expect(l.text).not.toContain("/old");
+    expect((await call("list_dumps", { days: 7 })).text).toContain("共 2 筆");
+    const d = await call("dump_detail", { dump_id: "/sap/bc/adt/runtime/dump/new" });
+    expect(d.text).toContain("出錯位置:/sap/bc/adt/oo/classes/zcl_a/source/main 第 9 行");
+    expect(d.text).toContain("例外 CX_SY_ZERODIVIDE");
+  });
+
+  it("run_class 遇 500 時附上這個 class 剛產生的短傾印", async () => {
+    const http500 = Object.assign(new Error("Request failed with status code 500"), { status: 500 });
+    const recent = new Date(Date.now() - 60_000).toISOString().replace(/\.\d+Z$/, "Z");
+    const adt = mockAdt({
+      runClass: vi.fn(async () => { throw http500; }),
+      listDumps: vi.fn(async () => [
+        { id: "/sap/bc/adt/runtime/dump/other", datetime: recent, error: "X", program: "ZCL_OTHER===CP", user: "DEVELOPER" },
+        { id: "/sap/bc/adt/runtime/dump/mine", datetime: recent, error: "COMPUTE_INT_ZERODIVIDE", program: "ZCL_RUN=====CP", user: "DEVELOPER" },
+      ]),
+    });
+    const call = await connectTools(adt);
+    const r = await call("run_class", { class_name: "ZCL_RUN" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("執行時發生短傾印:COMPUTE_INT_ZERODIVIDE");
+    expect(r.text).toContain("/sap/bc/adt/runtime/dump/mine");
+    expect(r.text).not.toContain("逾時");
+    expect(adt.listDumps).toHaveBeenCalledWith("DEVELOPER");
   });
 });
 

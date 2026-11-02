@@ -138,6 +138,28 @@ export function registerAnalysisTools(server: McpServer, adt: AdtService): void 
   );
 }
 
+/**
+ * run_class 失敗(5xx)時,找出這個 class 在最近 10 分鐘內產生的短傾印;找不到或查詢失敗時回空字串。
+ * 短傾印的「Terminated ABAP program」是 class pool 名稱:<CLASS>=====…CP
+ */
+export async function recentDumpHint(adt: AdtService, user: string, className: string, err: unknown): Promise<string> {
+  const status = (err as { status?: unknown } | null)?.status;
+  if (typeof status !== "number" || status < 500) return "";
+  try {
+    const since = Date.now() - 10 * 60_000;
+    const d = (await adt.listDumps(user)).find(
+      (x) => x.program.startsWith(`${className}=`) && Date.parse(x.datetime) >= since
+    );
+    if (!d) return "";
+    return (
+      `💥 執行時發生短傾印:${d.error}(${d.datetime})。` +
+      `請用 dump_detail 查看原因與出錯行號,dump_id:${d.id}`
+    );
+  } catch {
+    return "";
+  }
+}
+
 /** run_class 輸出上限(字元) */
 export const RUN_CLASS_MAX_OUTPUT = 20_000;
 
@@ -301,7 +323,14 @@ export function registerWriteDevTools(
           success: false,
           error: e instanceof Error ? e.message : String(e),
         });
-        return fail(e);
+        // A4H 實測:執行中發生短傾印時 SAP 只回 500、沒有訊息;找出這個 class 剛產生的 dump 告訴 AI
+        // (找到時不再附上一般的 5xx「可能逾時」建議,以免誤導)
+        const hint = await recentDumpHint(adt, cfg.sap.user, name, e);
+        if (!hint) return fail(e);
+        return {
+          content: [{ type: "text" as const, text: `❌ 執行 ${name} 失敗(SAP 回 500)。\n${hint}` }],
+          isError: true,
+        };
       }
     }
   );

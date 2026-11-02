@@ -156,6 +156,75 @@ export function registerDiagnosticTools(
       }
     }
   );
+
+  // ───────────────────────────── D3 list_dumps / dump_detail ─────────────────────────────
+  server.registerTool(
+    "list_dumps",
+    {
+      title: "列出 ST22 短傾印",
+      description:
+        "列出 ST22 短傾印(runtime dump):時間(UTC)、錯誤類型、中斷的程式、使用者與 dump_id。" +
+        "預設最近 1 天、最多 20 筆,新的在前;可依天數與使用者篩選。用 dump_detail 看單筆內容。唯讀。",
+      inputSchema: {
+        days: z.number().int().positive().max(30).optional().describe("最近幾天,預設 1,上限 30"),
+        user: z.string().optional().describe("選填:只列此使用者的短傾印,例如 DEVELOPER"),
+        max_results: z.number().int().positive().max(100).optional().describe("最多筆數,預設 20,上限 100"),
+      },
+    },
+    async ({ days, user, max_results }) => {
+      try {
+        const since = Date.now() - (days ?? 1) * 86_400_000;
+        const all = await adt.listDumps(user);
+        const recent = all.filter((d) => d.datetime && Date.parse(d.datetime) >= since);
+        const shown = recent.slice(0, max_results ?? 20);
+        if (shown.length === 0) {
+          return ok(`最近 ${days ?? 1} 天沒有${user ? ` ${user.toUpperCase()} 的` : ""}短傾印。`);
+        }
+        const lines = shown.map(
+          (d) => `- ${d.datetime} ${d.error}(程式 ${d.program},使用者 ${d.user})\n  dump_id:${d.id}`
+        );
+        return ok(
+          `💥 最近 ${days ?? 1} 天共 ${recent.length} 筆短傾印` +
+            (recent.length > shown.length ? `,顯示最新 ${shown.length} 筆` : "") +
+            `:\n${lines.join("\n")}`
+        );
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "dump_detail",
+    {
+      title: "讀取短傾印內容",
+      description:
+        "讀取單筆短傾印:錯誤類型、例外類別、出錯位置(以 source/main 為準的 URI 與行號,可直接用於 read_source / write_source)、" +
+        "以及 Short Text、Error analysis、How to correct、where terminated、Source Code Extract、Active Calls 等章節。" +
+        "為避免帶出業務資料,不包含 Selected Variables 等變數內容章節;輸出上限 20,000 字元。唯讀。",
+      inputSchema: {
+        dump_id: z.string().min(1).describe("list_dumps 回傳的 dump_id"),
+      },
+    },
+    async ({ dump_id }) => {
+      try {
+        const { meta, text } = await adt.dumpDetail(dump_id);
+        const where = meta.termination
+          ? `📍 出錯位置:${meta.termination.uri} 第 ${meta.termination.line} 行(以 source/main 為準)`
+          : "📍 出錯位置:SAP 沒有提供可對應到原始碼的位置(物件可能已刪除或不是一般 ABAP 原始碼),請參考下方 where terminated";
+        const head = [
+          `💥 ${meta.error}${meta.exception ? `(例外 ${meta.exception})` : ""}`,
+          `程式:${meta.program}`,
+          `時間:${meta.datetime}  使用者:${meta.author}`,
+          where,
+          "ℹ️ 下方章節裡的行號是相對於方法 include,修改時請以上面的出錯位置為準。",
+        ].join("\n");
+        return ok(truncate(`${head}\n\n${text}`, DIAG_MAX_OUTPUT));
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
 }
 
 /** ddic_info 支援的類型 */

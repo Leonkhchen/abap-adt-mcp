@@ -1,0 +1,298 @@
+----------------------------------------------------------------------------------------------------
+Category               ABAP programming error                                                                                                                                                                                                                                                       
+Runtime Errors         COMPUTE_INT_ZERODIVIDE                                                                                                                                                                                                                                                       
+Except.                CX_SY_ZERODIVIDE                                                                                                                                                                                                                                                             
+ABAP: Program          ZCL_MCP_V04DMP2===============CP                                                                                                                                                                                                                                             
+Application Component  Not assigned                                                                                                                                                                                                                                                                 
+Date and Time          02.11.2026 14:23:07 (UTC)                                                                                                                                                                                                                                                    
+----------------------------------------------------------------------------------------------------
+
+----------------------------------------------------------------------------------------------------
+|Short Text                                                                                        |
+|    Division by 0 (type I or INT8)                                                                |
+----------------------------------------------------------------------------------------------------
+
+----------------------------------------------------------------------------------------------------
+|What happened?                                                                                    |
+|    Error in the ABAP application program.                                                        |
+|                                                                                                  |
+|    The current ABAP program "ZCL_MCP_V04DMP2===============CP" had to be                         |
+|     terminated because it found a                                                                |
+|    statement that could not be executed.                                                         |
+----------------------------------------------------------------------------------------------------
+
+----------------------------------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+----------------------------------------------------------------------------------------------------
+|Error analysis                                                                                    |
+|    An exception has occurred in class "CX_SY_ZERODIVIDE". This exception was not                 |
+|     caught                                                                                       |
+|    in procedure "IF_OO_ADT_CLASSRUN~MAIN" "(METHOD)" or propagated by a RAISING                  |
+|     clause.                                                                                      |
+|    Since the caller of the procedure could not have anticipated this                             |
+|    exception, the current program was terminated.                                                |
+|    The reason for the exception occurring was:                                                   |
+|    The reason for the exception is:                                                              |
+|    In the current program "ZCL_MCP_V04DMP2===============CP", a division                         |
+|     ('DIVIDE', '/', 'DIV' or 'MOD')                                                              |
+|    attempted to use operands of type I or INT8 to divide by 0.                                   |
+|    by 0.                                                                                         |
+----------------------------------------------------------------------------------------------------
+
+----------------------------------------------------------------------------------------------------
+|How to correct the error                                                                          |
+|    If the exception cannot be prevented, "CX_SY_ZERODIVIDE" must be caught within                |
+|    procedure "IF_OO_ADT_CLASSRUN~MAIN" "(METHOD)" or declared in the procedure's                 |
+|     RAISING clause.                                                                              |
+|    To prevent the exception, note the following:                                                 |
+|                                                                                                  |
+|    If the error occurs in one of your own ABAP programs or an SAP program                        |
+|    that you have modified, try to remedy the error.                                              |
+|    If the error occurs in a non-modfied SAP program, you might be able to                        |
+|    find a solution in the SAP Notes system. If you have access to the SAP                        |
+|    Notes system, check there first using the following keywords:                                 |
+|                                                                                                  |
+|    "COMPUTE_INT_ZERODIVIDE" CX_SY_ZERODIVIDE                                                     |
+|    "ZCL_MCP_V04DMP2===============CP" bzw. ZCL_MCP_V04DMP2===============CM001                   |
+|    "IF_OO_ADT_CLASSRUN~MAIN"                                                                     |
+|    If you cannot solve the problem yourself, please send the following                           |
+|    information to SAP:                                                                           |
+|                                                                                                  |
+|    1. The description of the problem (short dump)                                                |
+|    Please press the "Local File” button in the current display.                                  |
+|                                                                                                  |
+|    2. The relevant system log                                                                    |
+|    To do this, call the system log in transaction SM21. Restrict the time                        |
+|    interval to ten minutes before the short dump and five minutes after                          |
+|    it. In the display, choose System -> List -> Save -> Local File                               |
+|    (unconverted).                                                                                |
+|                                                                                                  |
+|    3. If these are programs of your own, or modified SAP programs: The                           |
+|    source text of the programs                                                                   |
+|    To do this, please choose                                                                     |
+|    "Other Utilities -> Upload/Download -> Download".                                             |
+|                                                                                                  |
+|    4. Details regarding the conditions under which the error occurred or                         |
+|    which actions and input caused the error.                                                     |
+|    which actions and input caused the error.                                                     |
+----------------------------------------------------------------------------------------------------
+
+----------------------------------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+----------------------------------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+----------------------------------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+----------------------------------------------------------------------------------------------------
+|Chain of Exception Objects                                                                        |
+----------------------------------------------------------------------------------------------------
+|Level        Class                                                                                |
+|Attrib. Name                   Value                                                              |
+----------------------------------------------------------------------------------------------------
+|1            CX_SY_ZERODIVIDE                                                                     |
+|(Program)                      ZCL_MCP_V04DMP2===============CP                                   |
+|(Include)                      ZCL_MCP_V04DMP2===============CM001                                |
+|(Row)                          3                                                                  |
+|(Short Text)                   Division by zero                                                   |
+|(Long Text)                    You tried to divide by zero during the operation '/'.              |
+|IS_RESUMABLE                                                                                      |
+|KERNEL_ERRID                   COMPUTE_INT_ZERODIVIDE                                             |
+|OPERATION                      /                                                                  |
+----------------------------------------------------------------------------------------------------
+
+----------------------------------------------------------------------------------------------------
+|Information on where terminated                                                                   |
+|    The termination occurred in ABAP program or include                                           |
+|     "ZCL_MCP_V04DMP2===============CP", in "IF_OO_ADT_CLASSRUN~MAIN". The                        |
+|    main program was "SAPMHTTP".                                                                  |
+|                                                                                                  |
+|    In the source code, the termination point is in line 3 of include                             |
+|     "ZCL_MCP_V04DMP2===============CM001".                                                       |
+|    include "ZCL_MCP_V04DMP2===============CM001".                                                |
+|    The termination is due to exception "CX_SY_ZERODIVIDE" occurring in procedure                 |
+|     "IF_OO_ADT_CLASSRUN~MAIN" "(METHOD)",                                                        |
+|    but not being handled locally there or being declared in the RAISING                          |
+|    clause.                                                                                       |
+|    The procedure is in program "ZCL_MCP_V04DMP2===============CP". Its source                    |
+|     code begins in line 1 of                                                                     |
+|    include "ZCL_MCP_V04DMP2===============CM001".                                                |
+----------------------------------------------------------------------------------------------------
+
+----------------------------------------------------------------------------------------------------
+|Source Code Extract                                                                               |
+----------------------------------------------------------------------------------------------------
+|Line |Code                                                                                        |
+----------------------------------------------------------------------------------------------------
+|    1|  METHOD if_oo_adt_classrun~main.                                                           |
+|    2|    DATA(zero) = 0.                                                                         |
+|>>>>>|    DATA(result) = 10 / zero.                                                               |
+|    4|    out->write( result ).                                                                   |
+|    5|  ENDMETHOD.                                                                                |
+----------------------------------------------------------------------------------------------------
+
+----------------------------------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+----------------------------------------------------------------------------------------------------
+|Active Calls/Events                                                                               |
+----------------------------------------------------------------------------------------------------
+|No.   Ty.          Program                             Include                             Line   |
+|      Name                                                                                        |
+----------------------------------------------------------------------------------------------------
+|   12 METHOD       ZCL_MCP_V04DMP2===============CP    ZCL_MCP_V04DMP2===============CM001     3  |
+|      ZCL_MCP_V04DMP2=>IF_OO_ADT_CLASSRUN~MAIN                                                    |
+|   11 METHOD       CL_OO_ADT_RES_CLASSRUN========CP    CL_OO_ADT_RES_CLASSRUN========CM003   111  |
+|      CL_OO_ADT_RES_CLASSRUN=>EXECUTE_CLAS                                                        |
+|   10 METHOD       CL_OO_ADT_RES_CLASSRUN========CP    CL_OO_ADT_RES_CLASSRUN========CM004    29  |
+|      CL_OO_ADT_RES_CLASSRUN=>POST                                                                |
+|    9 METHOD       CL_ADT_REST_RESOURCE==========CP    CL_ADT_REST_RESOURCE==========CM004    24  |
+|      CL_ADT_REST_RESOURCE=>IF_REST_HANDLER~HANDLE                                                |
+|    8 METHOD       CL_REST_ROUTER================CP    CL_REST_ROUTER================CM003    60  |
+|      CL_REST_ROUTER=>IF_REST_HANDLER~HANDLE                                                      |
+|    7 METHOD       CL_REST_HTTP_HANDLER==========CP    CL_REST_HTTP_HANDLER==========CM001    99  |
+|      CL_REST_HTTP_HANDLER=>IF_HTTP_EXTENSION~HANDLE_REQUEST                                      |
+|    6 METHOD       CL_ADT_WB_RES_APP=============CP    CL_ADT_WB_RES_APP=============CCIMP    19  |
+|      LCL_REQUEST_HANDLER=>LIF_REQUEST_HANDLER~HANDLE_REQUEST                                     |
+|    5 METHOD       CL_ADT_WB_RES_APP=============CP    CL_ADT_WB_RES_APP=============CCIMP   319  |
+|      LCL_HTTP_REQUEST_PROXY=>HANDLE_REQUEST                                                      |
+|    4 METHOD       CL_ADT_WB_RES_APP=============CP    CL_ADT_WB_RES_APP=============CM002    23  |
+|      CL_ADT_WB_RES_APP=>IF_HTTP_EXTENSION~HANDLE_REQUEST                                         |
+|    3 METHOD       CL_HTTP_SERVER================CP    CL_HTTP_SERVER================CM00I   814  |
+|      CL_HTTP_SERVER=>EXECUTE_REQUEST                                                             |
+|    2 FUNCTION     SAPLHTTP_RUNTIME                    LHTTP_RUNTIMEU02                     1800  |
+|      HTTP_DISPATCH_REQUEST                                                                       |
+|    1 MODULE (PBO) SAPMHTTP                            SAPMHTTP                               12  |
+|      %_HTTP_START                                                                                |
+----------------------------------------------------------------------------------------------------
+
+----------------------------------------------------------------------------------------------------
+
+
+
