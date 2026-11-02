@@ -18,9 +18,80 @@ import {
   type SyntaxCheckResult,
   type TransportInfo,
   type TransportsOfUser,
+  type UnitTestClass,
+  type ClassComponent,
 } from "abap-adt-api";
 import * as https from "node:https";
 import type { AppConfig } from "../config.js";
+import { AuthCircuitOpenError, hasHttpStatus, isAuthFailure } from "./errors.js";
+import {
+  parseUsageReferences,
+  parseUsageSnippets,
+  usageReferencesBody,
+  usageSnippetsBody,
+  type UsageObject,
+  type UsageSnippet,
+} from "./whereUsed.js";
+import {
+  bdefCreateBody,
+  packageUrl,
+  parseValidation,
+  TYPE_INFO,
+  type CreatableType,
+} from "./objectTypes.js";
+
+/** ATC 單筆 finding(已攤平) */
+export interface AtcFinding {
+  objectName: string;
+  priority: number;
+  checkTitle: string;
+  messageTitle: string;
+  /** 位置 URI(含 #start=行,欄) */
+  location: string;
+  line: number;
+}
+
+export interface AtcResult {
+  checkVariant: string;
+  /** ATC 執行資訊,例如 TOOL_FAILURE(部分檢查無法執行)、FINDING_STATS */
+  infos: { type: string; description: string }[];
+  findings: AtcFinding[];
+}
+
+/** find_definition 結果 */
+export interface DefinitionResult {
+  /** 查詢的識別字 */
+  identifier: string;
+  /** 定義所在的 source URI;找不到定義時為空字串 */
+  url: string;
+  /** 1 起算的行與欄 */
+  line: number;
+  column: number;
+  /** 定義那一行的原始碼(讀取失敗時為空字串) */
+  sourceLine: string;
+}
+
+/**
+ * 找出某行第 column0 欄(0 起算)所在的 ABAP 識別字範圍。
+ * ABAP 名稱可含 /(namespace)與 ~(介面元件,例如 if_x~method)。
+ */
+export function identifierAt(lineText: string, column0: number): { start: number; end: number; text: string } | undefined {
+  const isId = (ch: string | undefined) => !!ch && /[A-Za-z0-9_\/~]/.test(ch);
+  if (!isId(lineText[column0])) return undefined;
+  let start = column0;
+  let end = column0;
+  while (isId(lineText[start - 1])) start--;
+  while (isId(lineText[end])) end++;
+  return { start, end, text: lineText.slice(start, end) };
+}
+
+/** 建立物件的參數 */
+export interface NewObjectSpec {
+  type: CreatableType;
+  name: string;
+  packageName: string;
+  description: string;
+}
 
 /** MCP 工具層所依賴的 ADT 操作介面(僅暴露 MVP 需要的方法) */
 export interface AdtService {
@@ -29,6 +100,8 @@ export interface AdtService {
   ping(): Promise<{ elapsedMs: number }>;
   searchObject(query: string, objType?: string, max?: number): Promise<SearchResult[]>;
   objectStructure(objectUrl: string): Promise<AbapObjectStructure>;
+  /** 取得物件所在的 package 名稱(大寫);找不到時回傳空字串 */
+  objectPackage(objectUrl: string): Promise<string>;
   /** 由物件結構推導主要 include 的 source URL */
   mainInclude(structure: AbapObjectStructure): string;
   getObjectSource(sourceUrl: string): Promise<string>;
@@ -39,6 +112,8 @@ export interface AdtService {
     transport?: string
   ): Promise<void>;
   lock(objectUrl: string): Promise<AdtLock>;
+  /** 為 class 建立測試 include(/includes/testclasses);需在鎖定中呼叫 */
+  createTestInclude(className: string, lockHandle: string, transport?: string): Promise<void>;
   unLock(objectUrl: string, lockHandle: string): Promise<void>;
   activate(objectName: string, objectUrl: string): Promise<ActivationResult>;
   syntaxCheck(
@@ -49,6 +124,30 @@ export interface AdtService {
   nodeContents(parentType: "DEVC/K", packageName: string): Promise<NodeStructure>;
   transportInfo(objSourceUrl: string, devClass?: string): Promise<TransportInfo>;
   userTransports(user: string): Promise<TransportsOfUser>;
+  /** 建立前檢查名稱是否可用;不可用時回傳 ok=false 與 SAP 的說明 */
+  validateNewObject(o: NewObjectSpec): Promise<{ ok: boolean; message: string }>;
+  /** 建立新物件(只建立空殼;原始碼另以 write_source 寫入) */
+  createObject(o: NewObjectSpec & { transport?: string }): Promise<void>;
+  /** 執行 ABAP Unit(物件或 package URI);只跑 RISK LEVEL HARMLESS 的測試 */
+  runUnitTests(url: string): Promise<UnitTestClass[]>;
+  /** 執行 ATC;checkVariant 省略時用系統預設(atcCustomizing 的 systemCheckVariant) */
+  runAtc(url: string, checkVariant?: string, maxFindings?: number): Promise<AtcResult>;
+  /**
+   * where-used:url 為物件或 source URI;給 line/column0 時查該位置的元件(例如方法),
+   * column0 是 ADT 的 0 起算欄位
+   */
+  whereUsed(url: string, line?: number, column0?: number): Promise<{ objects: UsageObject[]; snippets: UsageSnippet[] }>;
+  /**
+   * 跳到定義:sourceUrl 第 line 行(1 起算)、column0(0 起算)所在的識別字。
+   * implementation=true 時跳到實作(例如方法的 METHOD 區塊)
+   */
+  findDefinition(sourceUrl: string, line: number, column0: number, implementation: boolean): Promise<DefinitionResult>;
+  /** class / interface 的元件結構(方法、屬性、型別、實作的介面…) */
+  classComponents(objectUrl: string): Promise<ClassComponent>;
+  /** 執行 class 的 IF_OO_ADT_CLASSRUN~MAIN,回傳 out->write 的輸出 */
+  runClass(className: string): Promise<string>;
+  /** 建立 workbench transport request,回傳 TR 編號;refUrl 為相關物件(或 package)的 URI */
+  createTransport(refUrl: string, description: string, packageName: string): Promise<string>;
   /** 取得目前登入的使用者帳號 */
   username(): string;
   /** 取得系統 base URL(供診斷訊息使用) */
@@ -66,9 +165,20 @@ export function adtClientOptions(cfg: AppConfig): ClientOptions {
     : {};
 }
 
+/** 從 ADT 物件 XML 取出 adtcore:packageRef 的 package 名稱 */
+export function packageFromObjectXml(xml: string): string {
+  const m = xml.match(/<adtcore:packageRef\b[^>]*\badtcore:name="([^"]*)"/);
+  return m ? m[1].toUpperCase() : "";
+}
+
+/** 連續認證失敗達此次數後斷路:不再連 SAP,避免重試把帳號鎖住(SAP 預設失敗 5 次即鎖定) */
+export const MAX_AUTH_FAILURES = 2;
+
 /** 真實實作:包裝 abap-adt-api 的 ADTClient */
 export class RealAdtService implements AdtService {
   private client: ADTClient;
+  /** 連續認證失敗次數;成功一次(或收到非認證類的 SAP 回應)即歸零 */
+  private authFailures = 0;
 
   /** @param client 選填:注入既有的 ADTClient(單元測試用) */
   constructor(private cfg: AppConfig, client?: ADTClient) {
@@ -85,12 +195,39 @@ export class RealAdtService implements AdtService {
   }
 
   /**
+   * 所有連 SAP 的呼叫都經過這裡(401 斷路器)。
+   * 連續 MAX_AUTH_FAILURES 次認證失敗後,之後的呼叫直接拋出 AuthCircuitOpenError、不再連線;
+   * 要恢復必須修正密碼後重開 MCP(密碼只在啟動時讀取,重試也不會變對)。
+   */
+  private async guard<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.authFailures >= MAX_AUTH_FAILURES) {
+      throw new AuthCircuitOpenError(this.authFailures);
+    }
+    try {
+      const result = await fn();
+      this.authFailures = 0;
+      return result;
+    } catch (e) {
+      if (isAuthFailure(e)) {
+        this.authFailures++;
+      } else if (hasHttpStatus(e)) {
+        // SAP 有回應且不是認證問題(例如 404):代表帳密是對的
+        this.authFailures = 0;
+      }
+      // 網路層錯誤(SAP 未啟動等)無法判斷帳密,不改變計數
+      throw e;
+    }
+  }
+
+  /**
    * 確保已登入(冪等)。登入狀態以 abap-adt-api 的 ADTClient.loggedin 為準,
    * 不另外快取:其 request() 在未登入時會自動登入,stateless 下遇 401 也會自動重登一次,
    * 因此一般方法不需要先呼叫 login()。
    */
   async login(): Promise<void> {
-    if (!this.client.loggedin) await this.client.login();
+    await this.guard(async () => {
+      if (!this.client.loggedin) await this.client.login();
+    });
   }
 
   /**
@@ -99,7 +236,7 @@ export class RealAdtService implements AdtService {
    */
   async ping() {
     const start = Date.now();
-    await this.client.httpClient.request("/sap/bc/adt/compatibility/graph");
+    await this.guard(() => this.client.httpClient.request("/sap/bc/adt/compatibility/graph"));
     return { elapsedMs: Date.now() - start };
   }
 
@@ -112,19 +249,25 @@ export class RealAdtService implements AdtService {
   }
 
   async searchObject(query: string, objType?: string, max?: number) {
-    return this.client.searchObject(query, objType, max);
+    return this.guard(() => this.client.searchObject(query, objType, max));
   }
 
   async objectStructure(objectUrl: string) {
-    return this.client.objectStructure(objectUrl);
+    return this.guard(() => this.client.objectStructure(objectUrl));
   }
 
   mainInclude(structure: AbapObjectStructure): string {
     return ADTClient.mainInclude(structure);
   }
 
+  /** objectStructure 不解析 package,直接讀物件 XML 的 adtcore:packageRef */
+  async objectPackage(objectUrl: string) {
+    const response = await this.guard(() => this.client.httpClient.request(objectUrl));
+    return packageFromObjectXml(String(response.body ?? ""));
+  }
+
   async getObjectSource(sourceUrl: string) {
-    return this.client.getObjectSource(sourceUrl);
+    return this.guard(() => this.client.getObjectSource(sourceUrl));
   }
 
   async setObjectSource(
@@ -133,7 +276,7 @@ export class RealAdtService implements AdtService {
     lockHandle: string,
     transport?: string
   ) {
-    return this.client.setObjectSource(sourceUrl, source, lockHandle, transport);
+    return this.guard(() => this.client.setObjectSource(sourceUrl, source, lockHandle, transport));
   }
 
   /**
@@ -142,43 +285,225 @@ export class RealAdtService implements AdtService {
    * abap-adt-api 透過 client.stateful 切換,這裡集中處理。
    */
   async lock(objectUrl: string) {
-    this.client.stateful = session_types.stateful;
-    try {
-      return await this.client.lock(objectUrl);
-    } catch (e) {
-      // 鎖定失敗必須恢復 stateless:abap-adt-api 在 stateful 模式下不會自動重登,
-      // 若停在 stateful,之後 session 失效時所有呼叫都無法恢復
-      this.client.stateful = session_types.stateless;
-      throw e;
-    }
+    return this.guard(async () => {
+      this.client.stateful = session_types.stateful;
+      try {
+        return await this.client.lock(objectUrl);
+      } catch (e) {
+        // 鎖定失敗必須恢復 stateless:abap-adt-api 在 stateful 模式下不會自動重登,
+        // 若停在 stateful,之後 session 失效時所有呼叫都無法恢復
+        this.endStatefulSession();
+        throw e;
+      }
+    });
+  }
+
+  /**
+   * 回到 stateless,並丟掉 stateful 期間 SAP 發的 sap-contextid cookie。
+   * A4H 實測:解鎖後若保留 sap-contextid,之後任何一次 SAP 端例外(例如讀取尚未建立的 include)
+   * 會結束那個 context,此後所有請求都帶著失效的 context id 而回 400,且無法自行恢復。
+   */
+  private endStatefulSession(): void {
+    this.client.stateful = session_types.stateless;
+    // AdtHTTP.cookie 在型別上是 private,執行期為 Map<cookie 名稱, 值>
+    const jar = (this.client.httpClient as unknown as { cookie?: Map<string, string> }).cookie;
+    jar?.delete("sap-contextid");
+  }
+
+  async createTestInclude(className: string, lockHandle: string, transport?: string) {
+    return this.guard(() => this.client.createTestInclude(className.toUpperCase(), lockHandle, transport));
   }
 
   async unLock(objectUrl: string, lockHandle: string) {
     try {
-      await this.client.unLock(objectUrl, lockHandle);
+      await this.guard(() => this.client.unLock(objectUrl, lockHandle));
     } finally {
-      // 無論解鎖成敗都恢復 stateless,釋放後端資源並保留自動重登能力
-      this.client.stateful = session_types.stateless;
+      // 無論解鎖成敗(含斷路)都恢復 stateless,釋放後端資源並保留自動重登能力
+      this.endStatefulSession();
     }
   }
 
   async activate(objectName: string, objectUrl: string) {
-    return this.client.activate(objectName, objectUrl);
+    return this.guard(() => this.client.activate(objectName, objectUrl));
   }
 
   async syntaxCheck(url: string, mainUrl: string, content: string) {
-    return this.client.syntaxCheck(url, mainUrl, content);
+    return this.guard(() => this.client.syntaxCheck(url, mainUrl, content));
   }
 
   async nodeContents(parentType: "DEVC/K", packageName: string) {
-    return this.client.nodeContents(parentType, packageName);
+    return this.guard(() => this.client.nodeContents(parentType, packageName));
   }
 
   async transportInfo(objSourceUrl: string, devClass?: string) {
-    return this.client.transportInfo(objSourceUrl, devClass);
+    return this.guard(() => this.client.transportInfo(objSourceUrl, devClass));
   }
 
   async userTransports(user: string) {
-    return this.client.userTransports(user);
+    return this.guard(() => this.client.userTransports(user));
+  }
+
+  async validateNewObject(o: NewObjectSpec) {
+    if (o.type === "BDEF/BDO") {
+      // abap-adt-api 不支援 BDEF;validation 端點以 HTTP 200 + SEVERITY 回報結果
+      const response = await this.guard(() =>
+        this.client.httpClient.request("/sap/bc/adt/bo/behaviordefinitions/validation", {
+          method: "POST",
+          qs: { objname: o.name.toUpperCase(), description: o.description, packagename: o.packageName.toUpperCase() },
+        })
+      );
+      const v = parseValidation(String(response.body ?? ""));
+      return { ok: v.severity !== "ERROR", message: v.text };
+    }
+    try {
+      await this.guard(() =>
+        this.client.validateNewObject({
+          objtype: o.type as Exclude<CreatableType, "BDEF/BDO">,
+          objname: o.name.toUpperCase(),
+          packagename: o.packageName.toUpperCase(),
+          description: o.description,
+        })
+      );
+      return { ok: true, message: "" };
+    } catch (e) {
+      // abap-adt-api 在 SEVERITY=ERROR 時丟出 adtException(無 HTTP 狀態碼),訊息即 SAP 的說明
+      if (!hasHttpStatus(e) && e instanceof Error && e.message && !isAuthFailure(e)) {
+        return { ok: false, message: e.message };
+      }
+      throw e;
+    }
+  }
+
+  async runUnitTests(url: string) {
+    // 單元測試會執行程式:只跑 harmless(不改資料庫/系統設定);duration 不含 long
+    const flags = { harmless: true, dangerous: false, critical: false, short: true, medium: true, long: false };
+    return this.guard(() => this.client.unitTestRun(url, flags));
+  }
+
+  async runAtc(url: string, checkVariant?: string, maxFindings = 100) {
+    const variant =
+      checkVariant ||
+      String(
+        (await this.guard(() => this.client.atcCustomizing())).properties.find(
+          (p) => p.name === "systemCheckVariant"
+        )?.value ?? ""
+      );
+    if (!variant) throw new Error("系統沒有設定預設 ATC check variant,請以 check_variant 參數指定。");
+    // A4H 實測:系統啟動後第一次建立 worklist 可能超過 5 分鐘並回 500,但伺服器端已完成,重試一次即成功
+    const worklistId = await this.guard(async () => {
+      try {
+        return await this.client.atcCheckVariant(variant);
+      } catch (e) {
+        const status = (e as { status?: unknown }).status;
+        if (typeof status === "number" && status >= 500) return this.client.atcCheckVariant(variant);
+        throw e;
+      }
+    });
+    const run = await this.guard(() => this.client.createAtcRun(worklistId, url, maxFindings));
+    const worklist = await this.guard(() => this.client.atcWorklists(run.id));
+    const findings: AtcFinding[] = worklist.objects.flatMap((o) =>
+      o.findings.map((f) => ({
+        objectName: o.name,
+        priority: f.priority,
+        // SAP 的標題常帶尾端換行
+        checkTitle: f.checkTitle.trim(),
+        messageTitle: f.messageTitle.trim(),
+        location: f.location.uri,
+        line: f.location.range.start.line,
+      }))
+    );
+    return { checkVariant: variant, infos: run.infos, findings };
+  }
+
+  async whereUsed(url: string, line?: number, column0?: number) {
+    const headers = { "Content-Type": "application/*", Accept: "application/*" };
+    const uri = line ? `${url}#start=${line},${column0 ?? 0}` : url;
+    const refs = await this.guard(() =>
+      this.client.httpClient.request("/sap/bc/adt/repository/informationsystem/usageReferences", {
+        method: "POST",
+        qs: { uri },
+        headers,
+        body: usageReferencesBody(),
+      })
+    );
+    const objects = parseUsageReferences(String(refs.body ?? ""));
+    if (objects.length === 0) return { objects, snippets: [] };
+    const snips = await this.guard(() =>
+      this.client.httpClient.request("/sap/bc/adt/repository/informationsystem/usageSnippets", {
+        method: "POST",
+        headers,
+        body: usageSnippetsBody(objects.map((o) => o.objectIdentifier)),
+      })
+    );
+    return { objects, snippets: parseUsageSnippets(String(snips.body ?? "")) };
+  }
+
+  async findDefinition(sourceUrl: string, line: number, column0: number, implementation: boolean) {
+    const source = await this.guard(() => this.client.getObjectSource(sourceUrl));
+    const lines = source.split(/\r?\n/);
+    const lineText = lines[line - 1];
+    if (lineText === undefined) throw new Error(`第 ${line} 行不存在(原始碼共 ${lines.length} 行)。`);
+    const id = identifierAt(lineText, column0);
+    if (!id) {
+      throw new Error(`第 ${line} 行第 ${column0 + 1} 欄不是識別字:「${lineText.trim()}」。請把 column 指到名稱上。`);
+    }
+    // mainProgram:include(例如 testclasses)需告知所屬主程式,一律用物件的 main source
+    const mainProgram = sourceUrl.replace(/\/(source\/[^/]+|includes\/[^/]+)$/, "") + "/source/main";
+    const loc = await this.guard(() =>
+      this.client.findDefinition(sourceUrl, source, line, id.start, id.end, implementation, mainProgram)
+    );
+    if (!loc.url) return { identifier: id.text, url: "", line: 0, column: 0, sourceLine: "" };
+    let sourceLine = "";
+    try {
+      const target = loc.url === sourceUrl ? source : await this.guard(() => this.client.getObjectSource(loc.url));
+      sourceLine = target.split(/\r?\n/)[loc.line - 1] ?? "";
+    } catch {
+      // 讀不到目標原始碼(例如權限)時只回位置
+    }
+    return { identifier: id.text, url: loc.url, line: loc.line, column: loc.column + 1, sourceLine };
+  }
+
+  async classComponents(objectUrl: string) {
+    return this.guard(() => this.client.classComponents(objectUrl));
+  }
+
+  async runClass(className: string) {
+    return this.guard(() => this.client.runClass(className.toUpperCase()));
+  }
+
+  async createTransport(refUrl: string, description: string, packageName: string) {
+    return this.guard(() => this.client.createTransport(refUrl, description, packageName.toUpperCase()));
+  }
+
+  async createObject(o: NewObjectSpec & { transport?: string }) {
+    const responsible = this.cfg.sap.user.toUpperCase();
+    if (o.type === "BDEF/BDO") {
+      await this.guard(() =>
+        this.client.httpClient.request(TYPE_INFO["BDEF/BDO"].collection, {
+          method: "POST",
+          body: bdefCreateBody({
+            name: o.name,
+            packageName: o.packageName,
+            description: o.description,
+            responsible,
+            language: this.cfg.sap.language || "EN",
+          }),
+          headers: { "Content-Type": "application/vnd.sap.adt.blues.v1+xml" },
+          qs: o.transport ? { corrNr: o.transport } : {},
+        })
+      );
+      return;
+    }
+    await this.guard(() =>
+      this.client.createObject({
+        objtype: o.type as Exclude<CreatableType, "BDEF/BDO">,
+        name: o.name.toUpperCase(),
+        parentName: o.packageName.toUpperCase(),
+        description: o.description,
+        parentPath: packageUrl(o.packageName),
+        responsible,
+        transport: o.transport,
+      })
+    );
   }
 }

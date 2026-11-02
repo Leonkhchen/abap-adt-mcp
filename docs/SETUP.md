@@ -127,7 +127,7 @@ claude mcp add abap-a4h `
 在 Claude Code 中:
 
 ```
-/mcp                      ← 應看到 abap server 與 9 個工具
+/mcp                      ← 應看到 abap server 與 17 個工具(唯讀模式 12 個;create_transport 只在 dev)
 > 請用 ping_system 確認 SAP 連線
 > 搜尋所有 ZCL_ 開頭的 class
 ```

@@ -13,6 +13,32 @@ export interface AdtErrorInfo {
   suggestion?: string;
 }
 
+/** 401 斷路器開啟:連續認證失敗後不再連 SAP(見 RealAdtService.guard) */
+export class AuthCircuitOpenError extends Error {
+  constructor(public readonly failures: number) {
+    super(`SAP 認證已連續失敗 ${failures} 次,為避免帳號被鎖,已停止連線 SAP。`);
+    this.name = "AuthCircuitOpenError";
+  }
+}
+
+/** 取得錯誤上的 HTTP 狀態碼(abap-adt-api 的 AdtHttpException 以 getter 提供 status) */
+function httpStatus(err: unknown): number | undefined {
+  const status = (err as { status?: unknown } | null)?.status;
+  return typeof status === "number" ? status : undefined;
+}
+
+/** SAP 有回 HTTP 狀態碼(不是網路層錯誤) */
+export function hasHttpStatus(err: unknown): boolean {
+  return httpStatus(err) !== undefined;
+}
+
+/** 是否為認證失敗(401) */
+export function isAuthFailure(err: unknown): boolean {
+  if (httpStatus(err) === 401) return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  return /status code 401\b|\bunauthorized\b/i.test(msg);
+}
+
 /**
  * 取出錯誤的可讀描述。
  * abap-adt-api 在網路層失敗(例如 SAP 未啟動)時丟出的 AdtHttpException message 是空字串,
@@ -35,6 +61,19 @@ function describeError(err: unknown): string {
 
 /** 將任意錯誤翻譯為 AI 友善的說明 */
 export function translateAdtError(err: unknown): AdtErrorInfo {
+  if (err instanceof AuthCircuitOpenError) {
+    return {
+      message: err.message,
+      suggestion:
+        "請修正 SAP_PASSWORD(密碼含 # 時 .env 要加引號)後重開 MCP" +
+        "(重新啟動 Claude Code,或在 /mcp 重新連線)。重開前所有工具都不會再連 SAP。" +
+        "若帳號已被鎖,請用同一 client 的管理者帳號以 SU01 解鎖。",
+    };
+  }
+  // 安全護欄的拒絕(白名單、唯讀、參數檢查)是本機判斷,不是 ADT 失敗,原文即是可行動的說明
+  if (err instanceof Error && err.name === "GuardViolationError") {
+    return { message: `已拒絕:${err.message}` };
+  }
   const raw = describeError(err);
   const lower = raw.toLowerCase();
 
@@ -71,7 +110,15 @@ export function translateAdtError(err: unknown): AdtErrorInfo {
       suggestion: "請確認使用者具備 S_DEVELOP 權限,且 SICF 節點 /sap/bc/adt 已啟用。",
     };
   }
-  if (lower.includes("404") || lower.includes("not found")) {
+  if (lower.includes("does not have any inactive version")) {
+    return {
+      message: `原始碼尚未建立:${raw}`,
+      suggestion:
+        "若是 class 的測試 include(…/includes/testclasses),代表還沒有 ABAP Unit 測試類別;" +
+        "直接用 write_source 寫入該 URI 即會自動建立。",
+    };
+  }
+  if (lower.includes("404") || lower.includes("not found") || lower.includes("does not exist")) {
     return {
       message: `物件或服務不存在(404):${raw}`,
       suggestion: "請先用 search_objects 確認物件名稱與 URI 正確;也可能是該 ADT 服務未在此系統啟用。",
@@ -93,6 +140,15 @@ export function translateAdtError(err: unknown): AdtErrorInfo {
     return {
       message: `Transport 相關錯誤:${raw}`,
       suggestion: "可用 list_transports 查詢可用的 transport request,或確認物件的 package 是否需要 TR(本機物件 $TMP 不需要)。",
+    };
+  }
+  const status = httpStatus(err);
+  if (status !== undefined && status >= 500) {
+    return {
+      message: `SAP 伺服器錯誤(${status}):${raw}`,
+      suggestion:
+        "若等了數分鐘才出現,多半是 SAP 端處理逾時:例如 where-used 查詢整個標準物件(結果太多,請改查特定方法)、" +
+        "或系統剛啟動後第一次執行 ATC / 啟用 CDS(稍後重試通常就會成功)。其他情況可在 SAP 的 ST22 查看 dump。",
     };
   }
 

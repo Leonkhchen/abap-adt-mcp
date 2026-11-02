@@ -10,7 +10,7 @@ import * as path from "node:path";
 
 export interface AuditEntry {
   timestamp: string;
-  action: "write_source" | "activate" | "force_unlock";
+  action: "write_source" | "activate" | "force_unlock" | "create_object" | "run_class" | "create_transport";
   objectUrl: string;
   objectName: string;
   transport?: string;

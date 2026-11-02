@@ -8,24 +8,21 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { AdtService } from "../adt/client.js";
-import { formatErrorForAi } from "../adt/errors.js";
+import { ok, fail } from "./result.js";
 import type { AppConfig } from "../config.js";
 import { AuditLogger, diffSummary } from "../safety/audit.js";
-import { assertWriteAllowed, objectNameFromUrl } from "../safety/guards.js";
-import { lockedWrite } from "../workflows/lockedWrite.js";
+import { assertPackageAllowed, assertWriteAllowed, objectNameFromUrl } from "../safety/guards.js";
+import { ensureTestInclude, lockedWrite } from "../workflows/lockedWrite.js";
+import { SerialQueue } from "../safety/serialQueue.js";
+import { registerAnalysisTools, registerWriteDevTools } from "./devTools.js";
+import { baseObjectUrl as baseOf, isSourceUrl } from "../adt/objectTypes.js";
 import { VERSION } from "../version.js";
 
-/** MCP 工具回傳格式的小工具函式 */
-const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
-const fail = (err: unknown) => ({
-  content: [{ type: "text" as const, text: formatErrorForAi(err) }],
-  isError: true,
-});
 
 /** 將物件 URI 解析為 main include 的 source URI */
 async function resolveSourceUrl(adt: AdtService, objectUrl: string): Promise<string> {
-  // 若呼叫端已直接給 source URI,直接使用
-  if (/\/source\/(main|[^/]+)$/.test(objectUrl)) return objectUrl;
+  // 若呼叫端已直接給 source URI(/source/main 或 class include,例如 /includes/testclasses),直接使用
+  if (isSourceUrl(objectUrl)) return objectUrl;
   const structure = await adt.objectStructure(objectUrl);
   return adt.mainInclude(structure);
 }
@@ -36,6 +33,12 @@ export function registerTools(
   cfg: AppConfig,
   audit: AuditLogger
 ): void {
+  // 寫入類操作共用一個佇列依序執行,避免共用的 ADTClient 在 stateful 時被插隊(見 safety/serialQueue.ts)
+  const writes = new SerialQueue();
+  const serialized =
+    <A, R>(handler: (args: A) => Promise<R>) =>
+    (args: A) =>
+      writes.run(() => handler(args));
   // ───────────────────────────── 診斷 ─────────────────────────────
   server.registerTool(
     "ping_system",
@@ -159,7 +162,8 @@ export function registerTools(
     {
       title: "讀取原始碼",
       description:
-        "讀取 ABAP 物件的原始碼。可傳入物件 URI(自動解析 main include)或完整 source URI。" +
+        "讀取 ABAP 物件的原始碼。可傳入物件 URI(自動解析 main include)或完整 source URI;" +
+        "class 的 ABAP Unit 測試類別在 …/includes/testclasses。" +
         "回傳內容含行號,超過上限時會截斷並標註。",
       inputSchema: {
         object_url: z
@@ -214,8 +218,8 @@ export function registerTools(
       try {
         const sourceUrl = await resolveSourceUrl(adt, object_url);
         const content = source ?? (await adt.getObjectSource(sourceUrl));
-        const baseObjectUrl = sourceUrl.replace(/\/source\/[^/]+$/, "");
-        const results = await adt.syntaxCheck(baseObjectUrl, sourceUrl, content);
+        const baseObjectUrl = baseOf(sourceUrl);
+        const results = await adt.syntaxCheck(sourceUrl, baseObjectUrl, content);
         if (results.length === 0) return ok("✅ 語法檢查通過,沒有發現任何問題。");
         const lines = results.map(
           (r) => `- [${r.severity}] 第 ${r.line} 行,第 ${r.offset} 字:${r.text}`
@@ -266,6 +270,9 @@ export function registerTools(
     }
   );
 
+  // v0.3 分析類工具(唯讀模式也可用,見 tools/devTools.ts)
+  registerAnalysisTools(server, adt);
+
   // ───────────────────────────── 寫入(唯讀模式下不註冊)─────────────────────────────
   if (cfg.safety.readonly) {
     console.error(
@@ -282,7 +289,9 @@ export function registerTools(
         "修改 ABAP 物件的原始碼。內部自動完成:讀取現況 → 並行檢查 → 鎖定 → 寫入 → 解鎖," +
         "失敗時保證釋放鎖定。建議流程:先 read_source 取得現況,修改後將舊內容放入 " +
         "expected_current_source 以啟用並行保護,再呼叫本工具。" +
-        "預設會先做語法檢查,有語法錯誤時不寫入。",
+        "預設會先做語法檢查,有語法錯誤時不寫入。" +
+        "要寫 class 的 ABAP Unit 測試類別,object_url 請用 …/oo/classes/<name>/includes/testclasses" +
+        "(尚未建立時會自動建立),寫完後用 activate_object 或 activate:true 啟用整個 class。",
       inputSchema: {
         object_url: z.string().describe("物件 URI,例如 /sap/bc/adt/oo/classes/zcl_demo"),
         new_source: z.string().describe("完整的新原始碼(整份取代,不是 diff)"),
@@ -301,23 +310,29 @@ export function registerTools(
         activate: z.boolean().optional().describe("寫入成功後立即啟用(預設 false)"),
       },
     },
-    async ({ object_url, new_source, transport, expected_current_source, skip_syntax_check, activate }) => {
+    serialized(async ({ object_url, new_source, transport, expected_current_source, skip_syntax_check, activate }) => {
       const objectName = objectNameFromUrl(object_url);
       try {
         // 安全護欄:前綴白名單等
         assertWriteAllowed(cfg, object_url);
 
         const sourceUrl = await resolveSourceUrl(adt, object_url);
-        const baseObjectUrl = sourceUrl.replace(/\/source\/[^/]+$/, "");
+        const baseObjectUrl = baseOf(sourceUrl);
+        // 第二道白名單:物件所在 package(在鎖定前檢查)
+        assertPackageAllowed(cfg, await adt.objectPackage(baseObjectUrl));
+
+        // 測試 include 尚未建立時先建立空的,語法檢查才有效
+        const includeCreated = await ensureTestInclude(adt, baseObjectUrl, sourceUrl, transport);
 
         // 寫入前語法檢查(預設開啟):避免把壞掉的程式碼寫進系統
         if (!skip_syntax_check) {
-          const checks = await adt.syntaxCheck(baseObjectUrl, sourceUrl, new_source);
+          const checks = await adt.syntaxCheck(sourceUrl, baseObjectUrl, new_source);
           const errors = checks.filter((c) => c.severity === "E" || c.severity === "A");
           if (errors.length > 0) {
             const lines = errors.map((r) => `- 第 ${r.line} 行:${r.text}`);
             return ok(
-              `❌ 寫入已中止:新原始碼有 ${errors.length} 個語法錯誤,請修正後重試:\n${lines.join("\n")}`
+              `❌ 寫入已中止:新原始碼有 ${errors.length} 個語法錯誤,請修正後重試:\n${lines.join("\n")}` +
+                (includeCreated ? "\nℹ️ 已先建立空的測試 include(只有註解),內容尚未寫入。" : "")
             );
           }
         }
@@ -378,7 +393,7 @@ export function registerTools(
         });
         return fail(e);
       }
-    }
+    })
   );
 
   server.registerTool(
@@ -394,11 +409,12 @@ export function registerTools(
           .describe("選填:物件名稱;省略時由 URI 推導"),
       },
     },
-    async ({ object_url, object_name }) => {
+    serialized(async ({ object_url, object_name }) => {
       const name = (object_name ?? objectNameFromUrl(object_url)).toUpperCase();
       try {
         assertWriteAllowed(cfg, object_url);
-        const baseObjectUrl = object_url.replace(/\/source\/[^/]+$/, "");
+        const baseObjectUrl = baseOf(object_url);
+        assertPackageAllowed(cfg, await adt.objectPackage(baseObjectUrl));
         const result = await adt.activate(name, baseObjectUrl);
         audit.log({
           timestamp: new Date().toISOString(),
@@ -416,6 +432,9 @@ export function registerTools(
       } catch (e) {
         return fail(e);
       }
-    }
+    })
   );
+
+  // v0.3 開發循環的寫入/執行類工具(見 tools/devTools.ts)
+  registerWriteDevTools(server, adt, cfg, audit, writes);
 }

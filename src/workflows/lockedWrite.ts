@@ -9,12 +9,24 @@
  *
  * 流程:
  *  (0) 樂觀並行檢查:比對呼叫端提供的 base source(若有)
- *  (1) lock(stateful session)
+ *  (1) lock(stateful session);寫入 class 測試 include 而它尚未存在時,在鎖定中先建立
  *  (2) setObjectSource(帶 lockHandle + transport)
  *  (3) finally → unLock
  *  (4) 可選:activate
  */
 import type { AdtService } from "../adt/client.js";
+import { isTestClassesInclude } from "../adt/objectTypes.js";
+import { objectNameFromUrl } from "../safety/guards.js";
+
+/**
+ * 讀取原始碼失敗是否代表「尚未建立」。
+ * A4H 實測:讀取不存在的測試 include 回「…CCAU does not have any inactive version」
+ */
+function isMissingSource(e: unknown): boolean {
+  const status = (e as { status?: unknown } | null)?.status;
+  const msg = e instanceof Error ? e.message : String(e);
+  return status === 404 || /does not have any inactive version|does not exist|not found/i.test(msg);
+}
 
 export interface LockedWriteParams {
   /** 物件 URI(不含 /source/main),例如 /sap/bc/adt/oo/classes/zcl_demo */
@@ -54,8 +66,16 @@ export async function lockedWrite(
   adt: AdtService,
   params: LockedWriteParams
 ): Promise<LockedWriteResult> {
-  // (0) 樂觀並行檢查
-  const currentSource = await adt.getObjectSource(params.sourceUrl);
+  // (0) 樂觀並行檢查;class 的測試 include 尚未建立時視為空內容,鎖定後再建立
+  let currentSource: string;
+  let createTestInclude = false;
+  try {
+    currentSource = await adt.getObjectSource(params.sourceUrl);
+  } catch (e) {
+    if (!isTestClassesInclude(params.sourceUrl) || !isMissingSource(e)) throw e;
+    currentSource = "";
+    createTestInclude = true;
+  }
   if (
     params.expectedCurrentSource !== undefined &&
     normalize(currentSource) !== normalize(params.expectedCurrentSource)
@@ -68,6 +88,9 @@ export async function lockedWrite(
   const lockHandle = lock.LOCK_HANDLE;
 
   try {
+    if (createTestInclude) {
+      await adt.createTestInclude(objectNameFromUrl(params.objectUrl), lockHandle, params.transport);
+    }
     // (2) 寫入
     await adt.setObjectSource(
       params.sourceUrl,
@@ -89,6 +112,32 @@ export async function lockedWrite(
       );
     }
   }
+}
+
+/**
+ * class 的測試 include 尚未存在時先建立(空的,內容只有 SAP 的註解範本),回傳是否有建立。
+ * A4H 實測:include 不存在時語法檢查只回警告、不會檢查內容;建立後才能在寫入前正確擋下語法錯誤。
+ */
+export async function ensureTestInclude(
+  adt: AdtService,
+  objectUrl: string,
+  sourceUrl: string,
+  transport?: string
+): Promise<boolean> {
+  if (!isTestClassesInclude(sourceUrl)) return false;
+  try {
+    await adt.getObjectSource(sourceUrl);
+    return false;
+  } catch (e) {
+    if (!isMissingSource(e)) throw e;
+  }
+  const lock = await adt.lock(objectUrl);
+  try {
+    await adt.createTestInclude(objectNameFromUrl(objectUrl), lock.LOCK_HANDLE, transport);
+  } finally {
+    await adt.unLock(objectUrl, lock.LOCK_HANDLE);
+  }
+  return true;
 }
 
 /** 行尾差異(CRLF vs LF)不應視為內容變更 */

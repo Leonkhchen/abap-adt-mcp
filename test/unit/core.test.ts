@@ -11,12 +11,24 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { loadConfig, hasUnquotedHashPassword, warnIfPasswordUnquoted } from "../../src/config.js";
-import { assertWriteAllowed, objectNameFromUrl, GuardViolationError } from "../../src/safety/guards.js";
+import {
+  assertWriteAllowed,
+  assertPackageAllowed,
+  packageMatches,
+  objectNameFromUrl,
+  GuardViolationError,
+} from "../../src/safety/guards.js";
 import { lockedWrite, ConcurrentModificationError } from "../../src/workflows/lockedWrite.js";
-import { translateAdtError } from "../../src/adt/errors.js";
+import { translateAdtError, AuthCircuitOpenError } from "../../src/adt/errors.js";
 import { diffSummary } from "../../src/safety/audit.js";
 import * as https from "node:https";
-import { RealAdtService, adtClientOptions, type AdtService } from "../../src/adt/client.js";
+import {
+  RealAdtService,
+  adtClientOptions,
+  identifierAt,
+  packageFromObjectXml,
+  type AdtService,
+} from "../../src/adt/client.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -24,6 +36,18 @@ import { session_types, type ADTClient } from "abap-adt-api";
 import { registerTools } from "../../src/tools/registry.js";
 import { AuditLogger } from "../../src/safety/audit.js";
 import { VERSION } from "../../src/version.js";
+import { SerialQueue } from "../../src/safety/serialQueue.js";
+import {
+  baseObjectUrl,
+  bdefCreateBody,
+  isSourceUrl,
+  isTestClassesInclude,
+  newObjectUrl,
+  parseValidation,
+} from "../../src/adt/objectTypes.js";
+import { formatAtcResult, formatClassComponents, formatUnitTestResults, formatWhereUsed } from "../../src/tools/formatters.js";
+import { parseUsageReferences, parseUsageSnippets, usageSnippetsBody } from "../../src/adt/whereUsed.js";
+import type { UnitTestClass } from "abap-adt-api";
 
 // ───────────────────────── 測試用假物件 ─────────────────────────
 
@@ -44,16 +68,27 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     ping: vi.fn(async () => ({ elapsedMs: 12 })),
     searchObject: vi.fn(async () => []),
     objectStructure: vi.fn(async () => ({} as never)),
+    objectPackage: vi.fn(async () => "$TMP"),
     mainInclude: vi.fn(() => "/sap/bc/adt/oo/classes/zcl_demo/source/main"),
     getObjectSource: vi.fn(async () => "old source"),
     setObjectSource: vi.fn(async () => {}),
     lock: vi.fn(async () => ({ LOCK_HANDLE: "LH-123" } as never)),
     unLock: vi.fn(async () => {}),
+    createTestInclude: vi.fn(async () => {}),
     activate: vi.fn(async () => ({ success: true, messages: [] } as never)),
     syntaxCheck: vi.fn(async () => []),
     nodeContents: vi.fn(async () => ({ nodes: [] } as never)),
     transportInfo: vi.fn(async () => ({} as never)),
     userTransports: vi.fn(async () => ({ workbench: [] } as never)),
+    validateNewObject: vi.fn(async () => ({ ok: true, message: "" })),
+    createObject: vi.fn(async () => {}),
+    runUnitTests: vi.fn(async () => []),
+    runAtc: vi.fn(async () => ({ checkVariant: "V", infos: [], findings: [] })),
+    whereUsed: vi.fn(async () => ({ objects: [], snippets: [] })),
+    findDefinition: vi.fn(async () => ({ identifier: "x", url: "", line: 0, column: 0, sourceLine: "" })),
+    runClass: vi.fn(async () => ""),
+    createTransport: vi.fn(async () => ""),
+    classComponents: vi.fn(async () => ({ "adtcore:name": "ZCL_X", "adtcore:type": "CLAS/OC", visibility: "public", links: [], components: [] }) as never),
     username: () => "DEVELOPER",
     baseUrl: () => "https://sap.example.com:44300",
     ...overrides,
@@ -123,10 +158,10 @@ describe("ping", () => {
     expect(r.text).toContain("12 ms");
   });
 
-  it("ping_system 顯示版本,且版本取自 package.json(E2)", async () => {
+  it("ping_system 顯示版本,且版本取自 package.json(E2;v0.3 起為 0.3.0)", async () => {
     const pkg = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8"));
     expect(VERSION).toBe(pkg.version);
-    expect(VERSION).toBe("0.2.0");
+    expect(VERSION).toBe("0.3.0");
     const call = await connectTools(mockAdt());
     const r = await call("ping_system");
     expect(r.text).toContain(`版本:${VERSION}`);
@@ -224,6 +259,631 @@ describe("ALLOW_SELF_SIGNED 只作用於 ADTClient", () => {
     const used = svc.client.httpClient.httpclient.axios.defaults.httpsAgent as typeof agent;
     expect(used.options.rejectUnauthorized).toBe(false);
     expect(process.env.NODE_TLS_REJECT_UNAUTHORIZED).toBe(before);
+  });
+});
+
+// ───────────────────────── 401 斷路(F2)─────────────────────────
+
+describe("401 斷路器", () => {
+  const http = (status: number) =>
+    Object.assign(new Error(`Request failed with status code ${status}`), { status });
+
+  it("連續 2 次認證失敗後不再連 SAP,並提示修正密碼後重開 MCP", async () => {
+    const fake = fakeAdtClient();
+    fake.httpClient.request.mockRejectedValue(http(401));
+    const adt = realAdt(fake);
+    await expect(adt.ping()).rejects.toThrow("401");
+    await expect(adt.ping()).rejects.toThrow("401");
+    await expect(adt.ping()).rejects.toBeInstanceOf(AuthCircuitOpenError);
+    await expect(adt.searchObject("Z*")).rejects.toBeInstanceOf(AuthCircuitOpenError);
+    expect(fake.httpClient.request).toHaveBeenCalledTimes(2);
+    expect(fake.searchObject).not.toHaveBeenCalled();
+
+    const info = translateAdtError(new AuthCircuitOpenError(2));
+    expect(info.message).toContain("連續失敗 2 次");
+    expect(info.suggestion).toContain("修正 SAP_PASSWORD");
+    expect(info.suggestion).toContain("重開 MCP");
+  });
+
+  it("成功一次即歸零", async () => {
+    const fake = fakeAdtClient();
+    fake.httpClient.request
+      .mockRejectedValueOnce(http(401))
+      .mockResolvedValueOnce({ status: 200 })
+      .mockRejectedValueOnce(http(401));
+    const adt = realAdt(fake);
+    await expect(adt.ping()).rejects.toThrow("401");
+    await adt.ping();
+    await expect(adt.ping()).rejects.toThrow("401"); // 只算 1 次,尚未斷路
+    await expect(adt.ping()).resolves.toBeDefined();
+  });
+
+  it("非認證的 SAP 錯誤(404)也代表帳密正確而歸零;網路錯誤不計入", async () => {
+    const fake = fakeAdtClient();
+    fake.httpClient.request
+      .mockRejectedValueOnce(http(401))
+      .mockRejectedValueOnce(http(404))
+      .mockRejectedValueOnce(http(401))
+      .mockRejectedValueOnce(Object.assign(new Error(""), { parent: { code: "ECONNREFUSED" } }));
+    const adt = realAdt(fake);
+    await expect(adt.ping()).rejects.toThrow("401");
+    await expect(adt.ping()).rejects.toThrow("404");
+    await expect(adt.ping()).rejects.toThrow("401");
+    await expect(adt.ping()).rejects.toThrow(); // ECONNREFUSED:計數維持 1
+    await expect(adt.ping()).resolves.toBeDefined(); // 仍可連線
+  });
+
+  it("ping_system 在斷路時回傳提示訊息", async () => {
+    const adt = mockAdt({ ping: vi.fn(async () => { throw new AuthCircuitOpenError(2); }) });
+    const call = await connectTools(adt);
+    const r = await call("ping_system");
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("已停止連線 SAP");
+    expect(r.text).toContain("重開 MCP");
+  });
+});
+
+// ───────────────────────── package 白名單(F4)─────────────────────────
+
+describe("package 白名單", () => {
+  it("預設 $TMP,Z*,Y*;可自訂", () => {
+    expect(makeConfig().safety.allowedPackages).toEqual(["$TMP", "Z*", "Y*"]);
+    expect(makeConfig({ ABAP_MCP_ALLOWED_PACKAGES: "zfi*, $tmp" }).safety.allowedPackages).toEqual(["ZFI*", "$TMP"]);
+  });
+
+  it("* 結尾為前綴比對,否則完全比對", () => {
+    expect(packageMatches("ZFI_TOOLS", "Z*")).toBe(true);
+    expect(packageMatches("$tmp", "$TMP")).toBe(true);
+    expect(packageMatches("$TMP_OTHER", "$TMP")).toBe(false);
+    expect(packageMatches("SABP_CONVERT", "Z*")).toBe(false);
+  });
+
+  it("assertPackageAllowed:白名單外或無法判斷 package 時拒絕", () => {
+    const cfg = makeConfig();
+    expect(() => assertPackageAllowed(cfg, "$TMP")).not.toThrow();
+    expect(() => assertPackageAllowed(cfg, "ZDEMO")).not.toThrow();
+    expect(() => assertPackageAllowed(cfg, "SABP_CONVERT")).toThrow(/package 白名單/);
+    expect(() => assertPackageAllowed(cfg, "$FOO")).toThrow(GuardViolationError);
+    expect(() => assertPackageAllowed(cfg, "")).toThrow(/無法判斷/);
+  });
+
+  it("packageFromObjectXml 讀出 adtcore:packageRef", () => {
+    const xml = `<class:abapClass adtcore:name="ZCL_X"><adtcore:packageRef adtcore:uri="/sap/bc/adt/packages/%24tmp" adtcore:type="DEVC/K" adtcore:name="$TMP"/></class:abapClass>`;
+    expect(packageFromObjectXml(xml)).toBe("$TMP");
+    expect(packageFromObjectXml("<x/>")).toBe("");
+  });
+
+  it("write_source:Z 開頭但 package 不在白名單 → 拒絕且不鎖定", async () => {
+    const adt = mockAdt({ objectPackage: vi.fn(async () => "SOME_SAP_PKG") });
+    const call = await connectTools(adt);
+    const r = await call("write_source", { object_url: "/sap/bc/adt/oo/classes/zcl_x/source/main", new_source: "x" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("SOME_SAP_PKG");
+    expect(adt.lock).not.toHaveBeenCalled();
+  });
+
+  it("activate_object:package 不在白名單 → 拒絕且不啟用", async () => {
+    const adt = mockAdt({ objectPackage: vi.fn(async () => "SOME_SAP_PKG") });
+    const call = await connectTools(adt);
+    const r = await call("activate_object", { object_url: "/sap/bc/adt/oo/classes/zcl_x" });
+    expect(r.isError).toBe(true);
+    expect(adt.activate).not.toHaveBeenCalled();
+  });
+});
+
+// ───────────────────────── create_object(G1)─────────────────────────
+
+describe("create_object", () => {
+  it("$TMP:先 validate 再 create,回傳物件 URI", async () => {
+    const adt = mockAdt();
+    const call = await connectTools(adt);
+    const r = await call("create_object", {
+      object_type: "CLAS/OC", name: "zcl_new", package_name: "$tmp", description: "demo",
+    });
+    expect(r.isError).toBe(false);
+    expect(r.text).toContain("/sap/bc/adt/oo/classes/zcl_new");
+    const spec = { type: "CLAS/OC", name: "ZCL_NEW", packageName: "$TMP", description: "demo" };
+    expect(adt.validateNewObject).toHaveBeenCalledWith(spec);
+    expect(adt.createObject).toHaveBeenCalledWith({ ...spec, transport: undefined });
+  });
+
+  it("名稱檢查未通過 → 不建立,回傳 SAP 說明", async () => {
+    const adt = mockAdt({ validateNewObject: vi.fn(async () => ({ ok: false, message: "Class ZCL_NEW already exists" })) });
+    const call = await connectTools(adt);
+    const r = await call("create_object", { object_type: "CLAS/OC", name: "ZCL_NEW", package_name: "$TMP", description: "d" });
+    expect(r.text).toContain("already exists");
+    expect(adt.createObject).not.toHaveBeenCalled();
+  });
+
+  it("非本機 package 沒給 transport → 拒絕", async () => {
+    const adt = mockAdt();
+    const call = await connectTools(adt);
+    const r = await call("create_object", { object_type: "PROG/P", name: "ZPROG", package_name: "ZPKG", description: "d" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("transport");
+    expect(adt.validateNewObject).not.toHaveBeenCalled();
+  });
+
+  it("非本機 package 有 transport → 帶 transport 建立", async () => {
+    const adt = mockAdt();
+    const call = await connectTools(adt);
+    await call("create_object", { object_type: "INTF/OI", name: "ZIF_X", package_name: "ZPKG", description: "d", transport: "A4HK900001" });
+    expect(adt.createObject).toHaveBeenCalledWith(expect.objectContaining({ transport: "A4HK900001" }));
+  });
+
+  it("名稱前綴或 package 不在白名單 → 拒絕", async () => {
+    const adt = mockAdt();
+    const call = await connectTools(adt);
+    const r1 = await call("create_object", { object_type: "CLAS/OC", name: "CL_STD", package_name: "$TMP", description: "d" });
+    const r2 = await call("create_object", { object_type: "DDLS/DF", name: "ZI_X", package_name: "SAPPKG", description: "d", transport: "T" });
+    expect(r1.text).toContain("前綴白名單");
+    expect(r2.text).toContain("package 白名單");
+    expect(adt.createObject).not.toHaveBeenCalled();
+  });
+
+  it("唯讀模式下不註冊 create_object", async () => {
+    const server = new McpServer({ name: "unit", version: "0" });
+    registerTools(server, mockAdt(), makeConfig({ ABAP_MCP_READONLY: "true" }), new AuditLogger(""));
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverT);
+    const client = new Client({ name: "c", version: "0" });
+    await client.connect(clientT);
+    const names = (await client.listTools()).tools.map((t) => t.name);
+    expect(names).not.toContain("create_object");
+  });
+
+  it("BDEF 建立 XML 與 validation 解析", () => {
+    const xml = bdefCreateBody({ name: "zi_demo", packageName: "$tmp", description: 'a "b" <c>', responsible: "dev", language: "EN" });
+    expect(xml).toContain('adtcore:name="ZI_DEMO"');
+    expect(xml).toContain('adtcore:type="BDEF/BDO"');
+    expect(xml).toContain('<adtcore:packageRef adtcore:name="$TMP"/>');
+    expect(xml).toContain("a &quot;b&quot; &lt;c&gt;");
+    expect(parseValidation("<DATA><SEVERITY>ERROR</SEVERITY><SHORT_TEXT>exists</SHORT_TEXT></DATA>")).toEqual({ severity: "ERROR", text: "exists" });
+    expect(newObjectUrl("BDEF/BDO", "ZI_DEMO")).toBe("/sap/bc/adt/bo/behaviordefinitions/zi_demo");
+  });
+});
+
+// ───────────────────────── run_unit_tests(G2)─────────────────────────
+
+/** 依 A4H 實測回傳的形狀:LTC_TEST 一綠一紅 */
+function unitResult(): UnitTestClass[] {
+  const m = (name: string, alerts: unknown[] = []) =>
+    ({ "adtcore:name": name, "adtcore:uri": "", "adtcore:type": "CLAS/OLI", executionTime: 0.5, unit: "s", uriType: "semantic", alerts }) as never;
+  return [
+    {
+      "adtcore:name": "LTC_TEST", "adtcore:uri": "/sap/bc/adt/oo/classes/zcl_x#testclass=LTC_TEST", "adtcore:type": "CLAS/OP", uriType: "semantic",
+      durationCategory: "short", riskLevel: "harmless", alerts: [],
+      testmethods: [
+        m("GREEN"),
+        m("RED", [{
+          kind: "failedAssertion", severity: "critical", title: "Critical Assertion Error: 'MCP-RED'",
+          details: ["Different values\n\tExpected [4] Actual [3]"],
+          stack: [{ "adtcore:uri": "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses#start=13,0;end=13,0", "adtcore:type": "", "adtcore:name": "", "adtcore:description": "" }],
+        }]),
+      ],
+    } as never,
+  ];
+}
+
+describe("run_unit_tests", () => {
+  it("摘要、失敗訊息與位置;失敗的排前面", () => {
+    const text = formatUnitTestResults(unitResult());
+    expect(text).toContain("❌ ABAP Unit:2 個測試方法,1 通過,1 失敗");
+    expect(text).toContain("ZCL_X / LTC_TEST->RED");
+    expect(text).toContain("Expected [4] Actual [3]");
+    expect(text).toContain("/sap/bc/adt/oo/classes/zcl_x/includes/testclasses 第 13 行");
+    expect(text.indexOf("->RED")).toBeLessThan(text.indexOf("->GREEN"));
+  });
+
+  it("全綠與沒有測試", () => {
+    const green = unitResult();
+    (green[0].testmethods[1] as { alerts: unknown[] }).alerts = [];
+    expect(formatUnitTestResults(green)).toContain("✅ ABAP Unit:2 個測試方法,2 通過,0 失敗");
+    expect(formatUnitTestResults([])).toContain("找不到可執行的 ABAP Unit 測試");
+  });
+
+  it("只跑 harmless 測試;package 轉成 package URI", async () => {
+    const fake = fakeAdtClient({ unitTestRun: vi.fn(async () => []) });
+    await realAdt(fake).runUnitTests("/sap/bc/adt/oo/classes/zcl_x");
+    expect(fake.unitTestRun).toHaveBeenCalledWith(
+      "/sap/bc/adt/oo/classes/zcl_x",
+      expect.objectContaining({ harmless: true, dangerous: false, critical: false })
+    );
+
+    const adt = mockAdt();
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" })); // 唯讀模式也可用
+    await call("run_unit_tests", { package_name: "$TMP" });
+    expect(adt.runUnitTests).toHaveBeenCalledWith("/sap/bc/adt/packages/%24tmp");
+    await call("run_unit_tests", { object_url: "/sap/bc/adt/oo/classes/zcl_x/source/main" });
+    expect(adt.runUnitTests).toHaveBeenLastCalledWith("/sap/bc/adt/oo/classes/zcl_x");
+    const r = await call("run_unit_tests", {});
+    expect(r.isError).toBe(true);
+  });
+});
+
+// ───────────────────────── run_atc(G3)─────────────────────────
+
+describe("run_atc", () => {
+  const finding = (priority: number, msg: string) => ({
+    objectName: "ZCL_X", priority, checkTitle: "Check", messageTitle: msg,
+    location: "/sap/bc/adt/oo/classes/zcl_x/source/main#start=7,4", line: 7,
+  });
+
+  it("依優先級分組並附上執行資訊", () => {
+    const text = formatAtcResult({
+      checkVariant: "ZABAP_CLOUD_DEVELOPMENT",
+      infos: [{ type: "TOOL_FAILURE", description: "Check not executable" }, { type: "FINDING_STATS", description: "1,0,0" }],
+      findings: [finding(2, "warn"), finding(1, "err")],
+    });
+    expect(text).toContain("❌ ATC(check variant ZABAP_CLOUD_DEVELOPMENT):共 2 筆 finding(優先級 1:1 筆)");
+    expect(text.indexOf("優先級 1(錯誤)")).toBeLessThan(text.indexOf("優先級 2(警告)"));
+    expect(text).toContain("source/main 第 7 行");
+    expect(text).toContain("TOOL_FAILURE");
+    expect(text).not.toContain("FINDING_STATS");
+  });
+
+  it("位置 URI 沒有 #start 時改用 range 的行號(A4H 實測的形狀)", () => {
+    const text = formatAtcResult({
+      checkVariant: "V", infos: [],
+      findings: [{ ...finding(1, "red"), location: "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses", line: 13 }],
+    });
+    expect(text).toContain("includes/testclasses 第 13 行");
+  });
+
+  it("沒有 finding;超過上限時截斷", () => {
+    expect(formatAtcResult({ checkVariant: "V", infos: [], findings: [] })).toContain("✅ ATC");
+    const many = Array.from({ length: 120 }, (_, i) => finding(3, `m${i}`));
+    const text = formatAtcResult({ checkVariant: "V", infos: [], findings: many }, 100);
+    expect(text).toContain("共 120 筆");
+    expect(text).toContain("僅顯示前 100 筆");
+    expect(text).toContain("m99");
+    expect(text).not.toContain("m100");
+  });
+
+  it("未指定 variant 時用系統預設;第一次建立 worklist 回 5xx 時重試一次", async () => {
+    const http500 = Object.assign(new Error("Request failed with status code 500"), { status: 500 });
+    const fake = fakeAdtClient({
+      atcCustomizing: vi.fn(async () => ({ properties: [{ name: "systemCheckVariant", value: "SYSVAR" }], excemptions: [] })),
+      atcCheckVariant: vi.fn().mockRejectedValueOnce(http500).mockResolvedValueOnce("WL1"),
+      createAtcRun: vi.fn(async () => ({ id: "RUN1", timestamp: 0, infos: [] })),
+      atcWorklists: vi.fn(async () => ({
+        objects: [{ name: "ZCL_X", findings: [{ priority: 1, checkTitle: "ABAP Unit", messageTitle: "red", location: { uri: "u#start=13,0", range: { start: { line: 13, column: 0 } } } }] }],
+      })),
+    });
+    const r = await realAdt(fake).runAtc("/sap/bc/adt/oo/classes/zcl_x");
+    expect(fake.atcCheckVariant).toHaveBeenCalledTimes(2);
+    expect(fake.atcCheckVariant).toHaveBeenCalledWith("SYSVAR");
+    expect(fake.createAtcRun).toHaveBeenCalledWith("WL1", "/sap/bc/adt/oo/classes/zcl_x", 100);
+    expect(r).toEqual({ checkVariant: "SYSVAR", infos: [], findings: [{ objectName: "ZCL_X", priority: 1, checkTitle: "ABAP Unit", messageTitle: "red", location: "u#start=13,0", line: 13 }] });
+  });
+});
+
+// ───────────────────────── where_used(G4)─────────────────────────
+
+describe("where_used", () => {
+  const fixture = (n: string) => fs.readFileSync(path.resolve("test/unit/fixtures", n), "utf8");
+
+  it("解析 A4H 的 usageReferences(小寫 prefix),只留實際使用處", () => {
+    const objs = parseUsageReferences(fixture("where-used-refs.a4h.xml"));
+    expect(objs).toHaveLength(1);
+    expect(objs[0]).toMatchObject({
+      uri: "/sap/bc/adt/oo/classes/zcl_mcp_expg/includes/testclasses",
+      name: "Local Test Classes",
+      packageName: "$TMP",
+      usageInformation: "gradeDirect,includeTest",
+    });
+    expect(objs[0].objectIdentifier).toContain("\\TY:ZCL_MCP_EXPG\\ME:ADD");
+  });
+
+  it("解析 usageSnippets(大寫 prefix)並還原 XML entity", () => {
+    const snips = parseUsageSnippets(fixture("where-used-snippets.a4h.xml"));
+    expect(snips).toHaveLength(2);
+    expect(snips[0].uri).toBe("/sap/bc/adt/oo/classes/zcl_mcp_expg/includes/testclasses#start=9,67;end=9,70");
+    expect(snips[0].content).toBe("cl_abap_unit_assert=>assert_equals( act = NEW zcl_mcp_expg( )->add( a = 1 b = 2 ) exp = 3 ).");
+  });
+
+  it("snippet 請求帶上 objectIdentifier 並跳脫", () => {
+    expect(usageSnippetsBody(["A;\\TY:X<1>"])).toContain('<usagereferences:objectIdentifier optional="false">A;\\TY:X&lt;1&gt;</usagereferences:objectIdentifier>');
+  });
+
+  it("格式化:列出物件與行號;沒有結果時明確說明;超過上限截斷", () => {
+    const r = {
+      objects: parseUsageReferences(fixture("where-used-refs.a4h.xml")),
+      snippets: parseUsageSnippets(fixture("where-used-snippets.a4h.xml")),
+    };
+    const text = formatWhereUsed("ADD", r);
+    expect(text).toContain("共 2 處(1 個物件)");
+    expect(text).toContain("第 9 行:cl_abap_unit_assert=>");
+    expect(text).toContain("第 13 行:");
+    expect(formatWhereUsed("X", { objects: [], snippets: [] })).toContain("找不到 X 的使用處");
+    expect(formatWhereUsed("ADD", r, 1)).toContain("僅顯示前 1 筆");
+    expect(formatWhereUsed("ADD", r, 1)).not.toContain("第 13 行");
+  });
+
+  it("工具:位置轉成 source URI 與 0 起算欄位", async () => {
+    const adt = mockAdt();
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" }));
+    await call("where_used", { object_url: "/sap/bc/adt/oo/classes/zcl_x", line: 4, column: 13 });
+    expect(adt.whereUsed).toHaveBeenCalledWith("/sap/bc/adt/oo/classes/zcl_x/source/main", 4, 12);
+    await call("where_used", { object_url: "/sap/bc/adt/oo/classes/zcl_x" });
+    expect(adt.whereUsed).toHaveBeenLastCalledWith("/sap/bc/adt/oo/classes/zcl_x", undefined, undefined);
+  });
+});
+
+// ───────────────────────── find_definition / class_components(G5)─────────────────────────
+
+describe("find_definition", () => {
+  it("identifierAt:找出識別字範圍(含 / 與 ~)", () => {
+    const line = "    out->write( |MCP-RUN-{ add( a = 1 b = 2 ) }| ).";
+    expect(identifierAt(line, 28)).toEqual({ start: 27, end: 30, text: "add" });
+    expect(identifierAt("  CALL METHOD if_x~run.", 15)?.text).toBe("if_x~run");
+    expect(identifierAt("  DATA x TYPE /dmo/travel_id.", 20)?.text).toBe("/dmo/travel_id");
+    expect(identifierAt(line, 3)).toBeUndefined();
+  });
+
+  it("把 1 起算的欄位轉成識別字範圍,include 帶上主程式;回傳 1 起算欄位與定義行", async () => {
+    const src = "line1\nline2\n    x = add( 1 ).\n";
+    const fake = fakeAdtClient({
+      getObjectSource: vi.fn(async () => src),
+      findDefinition: vi.fn(async () => ({ url: "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses", line: 2, column: 4 })),
+    });
+    const r = await realAdt(fake).findDefinition("/sap/bc/adt/oo/classes/zcl_x/includes/testclasses", 3, 9, false);
+    expect(fake.findDefinition).toHaveBeenCalledWith(
+      "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses", src, 3, 8, 11, false, "/sap/bc/adt/oo/classes/zcl_x/source/main"
+    );
+    expect(r).toEqual({ identifier: "add", url: "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses", line: 2, column: 5, sourceLine: "line2" });
+  });
+
+  it("位置不在識別字上 → 清楚的錯誤;工具會補上 /source/main", async () => {
+    const fake = fakeAdtClient({ getObjectSource: vi.fn(async () => "  x = 1.") });
+    await expect(realAdt(fake).findDefinition("/u/source/main", 1, 1, false)).rejects.toThrow("不是識別字");
+    await expect(realAdt(fake).findDefinition("/u/source/main", 5, 1, false)).rejects.toThrow("第 5 行不存在");
+
+    const adt = mockAdt({ findDefinition: vi.fn(async () => ({ identifier: "add", url: "/u/source/main", line: 13, column: 10, sourceLine: "  METHOD add." })) });
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" }));
+    const r = await call("find_definition", { object_url: "/sap/bc/adt/oo/classes/zcl_x", line: 10, column: 29 });
+    expect(adt.findDefinition).toHaveBeenCalledWith("/sap/bc/adt/oo/classes/zcl_x/source/main", 10, 28, false);
+    expect(r.text).toContain("「add」的定義:/u/source/main 第 13 行第 10 欄");
+    expect(r.text).toContain("13|   METHOD add.");
+  });
+});
+
+describe("class_components", () => {
+  it("格式化 A4H 實際回傳:方法、介面、本地測試類別(標示 include)", () => {
+    const root = JSON.parse(fs.readFileSync(path.resolve("test/unit/fixtures/class-components.a4h.json"), "utf8"));
+    const text = formatClassComponents(root);
+    expect(text).toContain("ZCL_MCP_EXPG(CLAS/OC,public,final)");
+    expect(text).toContain("- ADD(方法,public,instance) 定義於第 4 行");
+    expect(text).toContain("- IF_OO_ADT_CLASSRUN(實作的介面) 定義於第 3 行");
+    expect(text).toContain("- LTC_TEST(本地類別) 定義於testclasses include 第 1 行");
+    expect(text).toContain("  - RED(本地類別方法,private,instance) 定義於testclasses include 第 4 行");
+    expect(text).toContain("- ZCL_MCP_EXPG(文字元素)");
+  });
+});
+
+// ───────────────────────── 測試 include 與語法檢查參數 ─────────────────────────
+
+describe("source URI 與語法檢查", () => {
+  it("baseObjectUrl / isSourceUrl / isTestClassesInclude", () => {
+    expect(baseObjectUrl("/sap/bc/adt/oo/classes/zcl_x/includes/testclasses")).toBe("/sap/bc/adt/oo/classes/zcl_x");
+    expect(baseObjectUrl("/sap/bc/adt/oo/classes/zcl_x/source/main")).toBe("/sap/bc/adt/oo/classes/zcl_x");
+    expect(baseObjectUrl("/sap/bc/adt/oo/classes/zcl_x")).toBe("/sap/bc/adt/oo/classes/zcl_x");
+    expect(isSourceUrl("/sap/bc/adt/oo/classes/zcl_x/includes/testclasses")).toBe(true);
+    expect(isSourceUrl("/sap/bc/adt/oo/classes/zcl_x")).toBe(false);
+    expect(isTestClassesInclude("/sap/bc/adt/oo/classes/zcl_x/includes/testclasses")).toBe(true);
+    expect(isTestClassesInclude("/sap/bc/adt/oo/classes/zcl_x/source/main")).toBe(false);
+  });
+
+  it("write_source / syntax_check 以 (source URI, 物件 URI) 順序做語法檢查(A4H 實測 include 需此順序)", async () => {
+    const adt = mockAdt();
+    const call = await connectTools(adt);
+    const inc = "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses";
+    await call("write_source", { object_url: inc, new_source: "tests" });
+    expect(adt.syntaxCheck).toHaveBeenCalledWith(inc, "/sap/bc/adt/oo/classes/zcl_x", "tests");
+    expect(adt.lock).toHaveBeenCalledWith("/sap/bc/adt/oo/classes/zcl_x");
+    expect(adt.objectStructure).not.toHaveBeenCalled();
+    await call("syntax_check", { object_url: inc, source: "x" });
+    expect(adt.syntaxCheck).toHaveBeenLastCalledWith(inc, "/sap/bc/adt/oo/classes/zcl_x", "x");
+  });
+
+  it("測試 include 尚未建立 → 先建立空 include 再做語法檢查;語法錯誤時不寫入", async () => {
+    const order: string[] = [];
+    let exists = false;
+    const adt = mockAdt({
+      getObjectSource: vi.fn(async () => {
+        if (!exists) throw new Error("ZCL_X=====CCAU does not have any inactive version");
+        return "* empty";
+      }),
+      lock: vi.fn(async () => { order.push("lock"); return { LOCK_HANDLE: "LH" } as never; }),
+      createTestInclude: vi.fn(async () => { order.push("createTestInclude"); exists = true; }),
+      unLock: vi.fn(async () => { order.push("unlock"); }),
+      syntaxCheck: vi.fn(async () => { order.push("syntaxCheck"); return [{ severity: "E", line: 8, text: "\".\" expected", offset: 0, uri: "" }] as never; }),
+      setObjectSource: vi.fn(async () => { order.push("write"); }),
+    });
+    const call = await connectTools(adt);
+    const r = await call("write_source", { object_url: "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses", new_source: "bad" });
+    expect(r.text).toContain("寫入已中止");
+    expect(r.text).toContain("已先建立空的測試 include");
+    expect(order).toEqual(["lock", "createTestInclude", "unlock", "syntaxCheck"]);
+    expect(adt.setObjectSource).not.toHaveBeenCalled();
+  });
+
+  it("解鎖或鎖定失敗回到 stateless 時丟掉 sap-contextid cookie(A4H 實測會導致之後全部 400)", async () => {
+    const cookie = new Map([["SAP_SESSIONID_A4H_001", "s"], ["sap-contextid", "c"]]);
+    const fake = fakeAdtClient();
+    (fake.httpClient as unknown as { cookie: Map<string, string> }).cookie = cookie;
+    const adt = realAdt(fake);
+    await adt.lock("/u");
+    await adt.unLock("/u", "LH-1");
+    expect([...cookie.keys()]).toEqual(["SAP_SESSIONID_A4H_001"]);
+
+    cookie.set("sap-contextid", "c2");
+    fake.lock.mockRejectedValueOnce(new Error("locked by OTHER"));
+    await expect(adt.lock("/u")).rejects.toThrow("locked");
+    expect(cookie.has("sap-contextid")).toBe(false);
+    expect(fake.stateful).toBe(session_types.stateless);
+  });
+
+  it("讀不到尚未建立的測試 include → 提示用 write_source 建立", () => {
+    const info = translateAdtError(new Error("ZCL_X=====CCAU does not have any inactive version"));
+    expect(info.message).toContain("原始碼尚未建立");
+    expect(info.suggestion).toContain("write_source");
+  });
+});
+
+// ───────────────────────── run_class(G6)─────────────────────────
+
+describe("run_class", () => {
+  it("說明開頭明寫會在 SAP 系統上執行程式;唯讀模式不註冊", async () => {
+    const list = async (cfg: ReturnType<typeof makeConfig>) => {
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerTools(server, mockAdt(), cfg, new AuditLogger(""));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(clientT);
+      return (await client.listTools()).tools;
+    };
+    const tool = (await list(makeConfig())).find((t) => t.name === "run_class");
+    expect(tool?.description?.startsWith("⚠️ 會在 SAP 系統上執行程式")).toBe(true);
+    expect((await list(makeConfig({ ABAP_MCP_READONLY: "true" }))).map((t) => t.name)).not.toContain("run_class");
+  });
+
+  it("執行並回傳輸出;寫 audit log", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "abap-mcp-run-"));
+    const auditPath = path.join(dir, "audit.jsonl");
+    try {
+      const adt = mockAdt({ runClass: vi.fn(async () => "MCP-RUN-3\n") });
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerTools(server, adt, makeConfig(), new AuditLogger(auditPath));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(clientT);
+      const r = (await client.callTool({ name: "run_class", arguments: { class_name: "zcl_run" } })) as { content: { text: string }[] };
+      expect(r.content[0].text).toContain("已執行 ZCL_RUN");
+      expect(r.content[0].text).toContain("MCP-RUN-3");
+      expect(adt.objectPackage).toHaveBeenCalledWith("/sap/bc/adt/oo/classes/zcl_run");
+      const entry = JSON.parse(fs.readFileSync(auditPath, "utf8").trim());
+      expect(entry).toMatchObject({ action: "run_class", objectName: "ZCL_RUN", success: true });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("白名單外的 class 或 package 不執行;輸出超過 20,000 字元截斷", async () => {
+    const adt = mockAdt({ runClass: vi.fn(async () => "x".repeat(25_000)) });
+    const call = await connectTools(adt);
+    expect((await call("run_class", { class_name: "CL_STANDARD" })).text).toContain("前綴白名單");
+    (adt.objectPackage as ReturnType<typeof vi.fn>).mockResolvedValueOnce("SAP_PKG");
+    expect((await call("run_class", { class_name: "ZCL_X" })).text).toContain("package 白名單");
+    expect(adt.runClass).not.toHaveBeenCalled();
+    const big = await call("run_class", { class_name: "ZCL_BIG" });
+    expect(big.text).toContain("已截斷");
+    expect(big.text.length).toBeLessThan(21_000);
+  });
+});
+
+// ───────────────────────── create_transport(G7)─────────────────────────
+
+describe("create_transport", () => {
+  const toolNames = async (cfg: ReturnType<typeof makeConfig>) => {
+    const server = new McpServer({ name: "unit", version: "0" });
+    registerTools(server, mockAdt(), cfg, new AuditLogger(""));
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverT);
+    const client = new Client({ name: "c", version: "0" });
+    await client.connect(clientT);
+    return (await client.listTools()).tools.map((t) => t.name);
+  };
+
+  it("只在 dev 且非唯讀時註冊", async () => {
+    expect(await toolNames(makeConfig())).toContain("create_transport");
+    expect(await toolNames(makeConfig({ ABAP_MCP_SYSTEM_ROLE: "qa" }))).not.toContain("create_transport");
+    expect(await toolNames(makeConfig({ ABAP_MCP_READONLY: "true" }))).not.toContain("create_transport");
+    expect(await toolNames(makeConfig({ ABAP_MCP_SYSTEM_ROLE: "prod" }))).not.toContain("create_transport");
+  });
+
+  it("以 package 為參照建立並回傳 TR 編號", async () => {
+    const adt = mockAdt({ createTransport: vi.fn(async () => "A4HK900123") });
+    const call = await connectTools(adt);
+    const r = await call("create_transport", { package_name: "zpkg", description: "demo" });
+    expect(r.text).toContain("A4HK900123");
+    expect(adt.createTransport).toHaveBeenCalledWith("/sap/bc/adt/packages/zpkg", "demo", "ZPKG");
+  });
+
+  it("本機 package 或白名單外 package → 拒絕", async () => {
+    const adt = mockAdt();
+    const call = await connectTools(adt);
+    expect((await call("create_transport", { package_name: "$TMP", description: "d" })).text).toContain("不需要 transport");
+    expect((await call("create_transport", { package_name: "SAPPKG", description: "d" })).text).toContain("package 白名單");
+    expect(adt.createTransport).not.toHaveBeenCalled();
+  });
+});
+
+// ───────────────────────── 寫入互斥(F1)─────────────────────────
+
+describe("寫入類操作依序執行", () => {
+  const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  it("SerialQueue:先進先出,前一個失敗不影響下一個", async () => {
+    const q = new SerialQueue();
+    const order: string[] = [];
+    const a = q.run(async () => { await delay(20); order.push("a"); throw new Error("a failed"); });
+    const b = q.run(async () => { order.push("b"); return "B"; });
+    await expect(a).rejects.toThrow("a failed");
+    await expect(b).resolves.toBe("B");
+    expect(order).toEqual(["a", "b"]);
+  });
+
+  it("兩個 write_source 同時送出仍依序完成,lock → write → unlock 不交錯", async () => {
+    const events: string[] = [];
+    let n = 0;
+    const adt = mockAdt({
+      lock: vi.fn(async (url: string) => {
+        events.push(`lock ${url}`);
+        await delay(15);
+        return { LOCK_HANDLE: `LH-${++n}` } as never;
+      }),
+      setObjectSource: vi.fn(async (url: string) => {
+        events.push(`write ${url}`);
+        await delay(15);
+      }),
+      unLock: vi.fn(async (url: string) => {
+        events.push(`unlock ${url}`);
+      }),
+    });
+    const call = await connectTools(adt);
+    const src = (n: string) => `/sap/bc/adt/oo/classes/${n}/source/main`;
+    const [r1, r2] = await Promise.all([
+      call("write_source", { object_url: src("zcl_a"), new_source: "A" }),
+      call("write_source", { object_url: src("zcl_b"), new_source: "B" }),
+    ]);
+    expect(r1.isError).toBe(false);
+    expect(r2.isError).toBe(false);
+    expect(events).toEqual([
+      "lock /sap/bc/adt/oo/classes/zcl_a",
+      `write ${src("zcl_a")}`,
+      "unlock /sap/bc/adt/oo/classes/zcl_a",
+      "lock /sap/bc/adt/oo/classes/zcl_b",
+      `write ${src("zcl_b")}`,
+      "unlock /sap/bc/adt/oo/classes/zcl_b",
+    ]);
+  });
+
+  it("write_source 與 activate_object 同時送出也依序執行", async () => {
+    const events: string[] = [];
+    const adt = mockAdt({
+      lock: vi.fn(async () => { events.push("lock"); await delay(15); return { LOCK_HANDLE: "LH" } as never; }),
+      unLock: vi.fn(async () => { events.push("unlock"); }),
+      activate: vi.fn(async () => { events.push("activate"); return { success: true, messages: [] } as never; }),
+    });
+    const call = await connectTools(adt);
+    await Promise.all([
+      call("write_source", { object_url: "/sap/bc/adt/oo/classes/zcl_a/source/main", new_source: "A" }),
+      call("activate_object", { object_url: "/sap/bc/adt/oo/classes/zcl_a" }),
+    ]);
+    expect(events).toEqual(["lock", "unlock", "activate"]);
   });
 });
 
@@ -389,6 +1049,33 @@ describe("lockedWrite", () => {
     expect(result.success).toBe(true);
   });
 
+  it("class 測試 include 尚未建立 → 鎖定中先建立再寫入", async () => {
+    const order: string[] = [];
+    const adt = mockAdt({
+      getObjectSource: vi.fn(async () => {
+        throw new Error("ZCL_DEMO=====================CCAU does not have any inactive version");
+      }),
+      lock: vi.fn(async () => { order.push("lock"); return { LOCK_HANDLE: "LH-1" } as never; }),
+      createTestInclude: vi.fn(async () => { order.push("createTestInclude"); }),
+      setObjectSource: vi.fn(async () => { order.push("write"); }),
+      unLock: vi.fn(async () => { order.push("unlock"); }),
+    });
+    const inc = "/sap/bc/adt/oo/classes/zcl_demo/includes/testclasses";
+    const r = await lockedWrite(adt, { objectUrl: "/sap/bc/adt/oo/classes/zcl_demo", sourceUrl: inc, newSource: "tests" });
+    expect(r.previousSource).toBe("");
+    expect(adt.createTestInclude).toHaveBeenCalledWith("ZCL_DEMO", "LH-1", undefined);
+    expect(order).toEqual(["lock", "createTestInclude", "write", "unlock"]);
+  });
+
+  it("main source 讀取失敗不會被當成新 include(原錯誤照拋)", async () => {
+    const adt = mockAdt({
+      getObjectSource: vi.fn(async () => { throw new Error("Resource does not exist"); }),
+    });
+    await expect(lockedWrite(adt, params)).rejects.toThrow("does not exist");
+    expect(adt.lock).not.toHaveBeenCalled();
+    expect(adt.createTestInclude).not.toHaveBeenCalled();
+  });
+
   it("transport 編號正確傳遞", async () => {
     const adt = mockAdt();
     await lockedWrite(adt, { ...params, transport: "DEVK900123" });
@@ -444,6 +1131,24 @@ describe("translateAdtError", () => {
     expect(info.message).toContain("ECONNREFUSED");
     expect(info.suggestion).toContain("a4h-start.bat");
     expect(JSON.stringify(info)).not.toContain("TopSecret");
+  });
+
+  it("安全護欄的拒絕不會被關鍵字誤分類(例如含 transport 字樣)", () => {
+    const info = translateAdtError(new GuardViolationError("package $TMP 是本機 package,不需要 transport。"));
+    expect(info.message).toBe("已拒絕:package $TMP 是本機 package,不需要 transport。");
+    expect(info.suggestion).toBeUndefined();
+  });
+
+  it("SAP 的 does not exist 訊息 → 物件不存在的建議", () => {
+    const info = translateAdtError(new Error("Resource CLASS zcl_x does not exist."));
+    expect(info.suggestion).toContain("search_objects");
+  });
+
+  it("5xx → 提示可能是 SAP 端逾時與縮小範圍", () => {
+    const info = translateAdtError(Object.assign(new Error("Request failed with status code 500"), { status: 500 }));
+    expect(info.message).toContain("SAP 伺服器錯誤(500)");
+    expect(info.suggestion).toContain("逾時");
+    expect(info.suggestion).toContain("where-used");
   });
 
   it("沒有任何訊息的錯誤也不會回傳空白描述", () => {
