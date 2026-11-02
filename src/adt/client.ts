@@ -26,6 +26,7 @@ import {
 import * as https from "node:https";
 import type { AppConfig } from "../config.js";
 import { AuthCircuitOpenError, hasHttpStatus, isAuthFailure } from "./errors.js";
+import { activationBody, parseActivationResponse } from "./activation.js";
 import {
   extractDumpChapters,
   normalizeDumpId,
@@ -72,6 +73,17 @@ export interface AtcResult {
 export interface DdicTypeProperties {
   metaData: { name: string; description?: string; packageName?: string };
   properties: object;
+}
+
+/** inactive 物件(或其子項目) */
+export interface InactiveEntry {
+  uri: string;
+  type: string;
+  name: string;
+  /** 子項目(例如 class include)所屬物件的 URI;主物件為空字串 */
+  parentUri: string;
+  user: string;
+  deleted: boolean;
 }
 
 /** find_definition 結果 */
@@ -162,6 +174,10 @@ export interface AdtService {
   classComponents(objectUrl: string): Promise<ClassComponent>;
   /** 執行 class 的 IF_OO_ADT_CLASSRUN~MAIN,回傳 out->write 的輸出 */
   runClass(className: string): Promise<string>;
+  /** 目前 inactive 的物件(含子項目,例如 class 的 include);已過濾掉空紀錄 */
+  inactiveObjects(): Promise<InactiveEntry[]>;
+  /** 批次啟用(一次送出;呼叫端負責白名單檢查) */
+  activateObjects(objects: InactiveEntry[]): Promise<ActivationResult>;
   /** 以系統的 Pretty Printer 設定格式化原始碼(只回傳結果,不寫入系統) */
   prettyPrint(source: string): Promise<{ source: string; style: string; indentation: boolean }>;
   /** ST22 短傾印列表(新的在前);user 指定時只列該使用者 */
@@ -515,6 +531,42 @@ export class RealAdtService implements AdtService {
 
   async runClass(className: string) {
     return this.guard(() => this.client.runClass(className.toUpperCase()));
+  }
+
+  async inactiveObjects() {
+    const records = await this.guard(() => this.client.inactiveObjects());
+    // A4H 實測:清單裡有沒有 object 的空紀錄(只有 transport 或什麼都沒有)
+    return records
+      .filter((r) => r.object)
+      .map((r) => ({
+        uri: r.object!["adtcore:uri"],
+        type: r.object!["adtcore:type"],
+        name: r.object!["adtcore:name"],
+        parentUri: r.object!["adtcore:parentUri"] ?? "",
+        user: r.object!.user ?? "",
+        deleted: !!r.object!.deleted,
+      }));
+  }
+
+  async activateObjects(objects: InactiveEntry[]) {
+    // 只送主物件(子項目會隨主物件一起啟用);請求形狀見 adt/activation.ts(A4H 實測)
+    const mains = new Map<string, string>();
+    for (const o of objects) {
+      // 子項目(例如 class include)的 name 與所屬物件相同;主物件的紀錄優先
+      const uri = o.parentUri || o.uri;
+      if (!o.parentUri || !mains.has(uri)) mains.set(uri, o.name);
+    }
+    const body = activationBody([...mains].map(([uri, name]) => ({ uri, name })));
+    // 走寫入用的獨立 session(呼叫端另經寫入佇列依序執行),與讀取類工具互不干擾
+    const response = await this.guard(() =>
+      this.lockClient.httpClient.request("/sap/bc/adt/activation", {
+        method: "POST",
+        qs: { method: "activate", preauditRequested: true },
+        body,
+        headers: { Accept: "application/xml", "Content-Type": "application/xml" },
+      })
+    );
+    return parseActivationResponse(String(response.body ?? ""));
   }
 
   async prettyPrint(source: string) {

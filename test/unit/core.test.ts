@@ -57,6 +57,8 @@ import {
 } from "../../src/tools/formatters.js";
 import { assertTablesAllowed, validateSelectSql } from "../../src/safety/sql.js";
 import { extractDumpChapters, normalizeDumpId, parseDumpMeta, summarizeDump } from "../../src/adt/dumps.js";
+import { activationBody, parseActivationResponse } from "../../src/adt/activation.js";
+import { groupInactive } from "../../src/tools/diagTools.js";
 import { parseUsageReferences, parseUsageSnippets, usageSnippetsBody } from "../../src/adt/whereUsed.js";
 import type { UnitTestClass } from "abap-adt-api";
 
@@ -105,6 +107,8 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     domainProperties: vi.fn(async () => ({ metaData: { name: "" }, properties: {} })),
     listDumps: vi.fn(async () => []),
     prettyPrint: vi.fn(async (s: string) => ({ source: s, style: "", indentation: false })),
+    inactiveObjects: vi.fn(async () => []),
+    activateObjects: vi.fn(async () => ({ success: true, messages: [], inactive: [] })),
     dumpDetail: vi.fn(async () => ({ meta: { title: "", error: "", exception: "", program: "", datetime: "", author: "", contentsUri: "", chapters: [] }, text: "" })),
     runQuery: vi.fn(async () => ({ columns: [], values: [] }) as never),
     classComponents: vi.fn(async () => ({ "adtcore:name": "ZCL_X", "adtcore:type": "CLAS/OC", visibility: "public", links: [], components: [] }) as never),
@@ -1223,6 +1227,78 @@ describe("pretty_print", () => {
     const adt = mockAdt({ prettyPrint: vi.fn(async (s: string) => ({ source: s, style: "keywordUpper", indentation: true })) });
     const call = await connectTools(adt);
     expect((await call("pretty_print", { source: "DATA x TYPE i." })).text).toContain("內容沒有變化");
+  });
+});
+
+// ───────────────────────── list_inactive / activate_objects(v0.4 D5)─────────────────────────
+
+describe("inactive 物件與批次啟用", () => {
+  const entry = (name: string, parent = "", user = "DEVELOPER") => ({
+    uri: parent ? `${parent}/includes/x` : `/sap/bc/adt/oo/classes/${name.toLowerCase()}`,
+    type: parent ? "CLAS/OCN/definitions" : "CLAS/OC",
+    name,
+    parentUri: parent,
+    user,
+    deleted: false,
+  });
+  const A = "/sap/bc/adt/oo/classes/zcl_a";
+  const B = "/sap/bc/adt/oo/classes/zcl_b";
+
+  it("啟用請求只帶 uri + name(A4H 對帶 type/parentUri 的請求回 Check of condition failed)", () => {
+    const xml = activationBody([{ uri: A, name: "zcl_a" }, { uri: B, name: "ZCL_B" }]);
+    expect(xml).toContain(`<adtcore:objectReference adtcore:uri="${A}" adtcore:name="ZCL_A"/>`);
+    expect(xml).not.toContain("adtcore:type");
+    expect(xml).not.toContain("parentUri");
+  });
+
+  it("解析啟用回應:A4H 的語法錯誤回應判為失敗並帶出訊息;空回應為成功", () => {
+    const r = parseActivationResponse(fs.readFileSync(path.resolve("test/unit/fixtures/activation-error.a4h.xml"), "utf8"));
+    expect(r.success).toBe(false);
+    expect(r.messages.find((m) => m.type === "E")).toMatchObject({ line: 1, shortText: 'Field "UNDEFINED_VARIABLE" is unknown.' });
+    const okXml = `<chkl:messages xmlns:chkl="x"><chkl:properties checkExecuted="true" activationExecuted="true" generationExecuted="true"/></chkl:messages>`;
+    expect(parseActivationResponse(okXml).success).toBe(true);
+    expect(parseActivationResponse("").success).toBe(true);
+  });
+
+  it("list_inactive:只列目前使用者,子項目歸到主物件", async () => {
+    expect(groupInactive([entry("ZCL_A"), entry("ZCL_A", A), entry("ZCL_A", A)])).toEqual([
+      { uri: A, name: "ZCL_A", type: "CLAS/OC", parts: 2, deleted: false },
+    ]);
+    const adt = mockAdt({ inactiveObjects: vi.fn(async () => [entry("ZCL_A"), entry("ZCL_A", A), entry("ZCL_OTHER", "", "SOMEONE")]) });
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" }));
+    const r = await call("list_inactive");
+    expect(r.text).toContain("DEVELOPER 有 1 個 inactive 物件");
+    expect(r.text).toContain("ZCL_A [CLAS/OC](含 1 個子項目)");
+    expect(r.text).not.toContain("ZCL_OTHER");
+  });
+
+  it("activate_objects:任一物件不過白名單就整批拒絕;唯讀模式不註冊", async () => {
+    const adt = mockAdt({
+      inactiveObjects: vi.fn(async () => [entry("ZCL_A"), entry("ZCL_B")]),
+      objectPackage: vi.fn(async (u: string) => (u === B ? "SAP_PKG" : "$TMP")),
+    });
+    const call = await connectTools(adt);
+    const r1 = await call("activate_objects", { object_urls: [A, "/sap/bc/adt/oo/classes/cl_std"] });
+    expect(r1.text).toContain("整批拒絕");
+    expect(r1.text).toContain("CL_STD");
+    const r2 = await call("activate_objects", { object_urls: [A, B] });
+    expect(r2.text).toContain("package 白名單");
+    expect(adt.activateObjects).not.toHaveBeenCalled();
+
+    const ro = await connectTools(mockAdt(), makeConfig({ ABAP_MCP_READONLY: "true" }));
+    expect((await ro("activate_objects", { object_urls: [A] })).isError).toBe(true);
+  });
+
+  it("activate_objects:只啟用列表中屬於這些物件的紀錄;非 inactive 的略過並說明", async () => {
+    const adt = mockAdt({
+      inactiveObjects: vi.fn(async () => [entry("ZCL_A"), entry("ZCL_A", A), entry("ZTESTAI")]),
+      activateObjects: vi.fn(async () => ({ success: true, messages: [], inactive: [] })),
+    });
+    const call = await connectTools(adt);
+    const r = await call("activate_objects", { object_urls: [`${A}/source/main`, B] });
+    expect(adt.activateObjects).toHaveBeenCalledWith([entry("ZCL_A"), entry("ZCL_A", A)]);
+    expect(r.text).toContain("已啟用 1 個物件:ZCL_A");
+    expect(r.text).toContain("略過(不是 inactive):ZCL_B");
   });
 });
 

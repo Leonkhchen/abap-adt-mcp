@@ -6,11 +6,11 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { AdtService } from "../adt/client.js";
-import { isSourceUrl } from "../adt/objectTypes.js";
+import type { AdtService, InactiveEntry } from "../adt/client.js";
+import { baseObjectUrl, isSourceUrl } from "../adt/objectTypes.js";
 import type { AppConfig } from "../config.js";
 import type { AuditLogger } from "../safety/audit.js";
-import { GuardViolationError } from "../safety/guards.js";
+import { assertPackageAllowed, assertWriteAllowed, GuardViolationError, objectNameFromUrl } from "../safety/guards.js";
 import type { SerialQueue } from "../safety/serialQueue.js";
 import { assertTableName, assertTablesAllowed, validateSelectSql } from "../safety/sql.js";
 import { formatDataElement, formatDdicFields, formatDomain, formatQueryResult } from "./formatters.js";
@@ -25,7 +25,7 @@ export function registerDiagnosticTools(
   adt: AdtService,
   cfg: AppConfig,
   audit: AuditLogger,
-  _writes: SerialQueue
+  writes: SerialQueue
 ): void {
   // ───────────────────────────── D1 data_preview(預設不註冊)─────────────────────────────
   if (cfg.safety.allowDataPreview) {
@@ -158,6 +158,95 @@ export function registerDiagnosticTools(
     }
   );
 
+  // ───────────────────────────── D5 list_inactive ─────────────────────────────
+  server.registerTool(
+    "list_inactive",
+    {
+      title: "列出 inactive 物件",
+      description:
+        "列出目前使用者尚未啟用(inactive)的物件,子項目(例如 class 的 include)歸在所屬物件下。" +
+        "可再用 activate_objects 批次啟用。唯讀。",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const mine = (await adt.inactiveObjects()).filter((o) => o.user.toUpperCase() === cfg.sap.user.toUpperCase());
+        const groups = groupInactive(mine);
+        if (groups.length === 0) return ok(`${cfg.sap.user.toUpperCase()} 目前沒有 inactive 的物件。`);
+        const lines = groups.map(
+          (g) =>
+            `- ${g.name} [${g.type}]${g.deleted ? "(已刪除,待啟用)" : ""}` +
+            (g.parts > 0 ? `(含 ${g.parts} 個子項目)` : "") +
+            `\n  uri:${g.uri}`
+        );
+        return ok(`📝 ${cfg.sap.user.toUpperCase()} 有 ${groups.length} 個 inactive 物件:\n${lines.join("\n")}`);
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
+
+  // ───────────────────────────── D5 activate_objects(唯讀模式不註冊)─────────────────────────────
+  if (!cfg.safety.readonly) {
+    server.registerTool(
+      "activate_objects",
+      {
+        title: "批次啟用物件",
+        description:
+          "一次啟用多個 inactive 物件(object_urls 可用 list_inactive 的 uri)。每個物件都必須通過名稱前綴與 package 兩道白名單," +
+          "任一不過就整批拒絕、不啟用任何物件。回傳啟用結果與錯誤訊息。",
+        inputSchema: {
+          object_urls: z.array(z.string().min(1)).min(1).max(ACTIVATE_MAX_OBJECTS).describe("物件 URI 清單,例如 /sap/bc/adt/oo/classes/zcl_a"),
+        },
+      },
+      async ({ object_urls }) =>
+        writes.run(async () => {
+          const urls = [...new Set(object_urls.map((u) => baseObjectUrl(u.trim())))];
+          try {
+            // 兩道白名單:先全部檢查,任一不過就整批拒絕
+            const denied: string[] = [];
+            for (const u of urls) {
+              try {
+                assertWriteAllowed(cfg, u);
+                assertPackageAllowed(cfg, await adt.objectPackage(u));
+              } catch (e) {
+                denied.push(`- ${objectNameFromUrl(u)}:${e instanceof Error ? e.message : String(e)}`);
+              }
+            }
+            if (denied.length > 0) {
+              return fail(new GuardViolationError(`整批拒絕,沒有啟用任何物件:\n${denied.join("\n")}`));
+            }
+
+            const inactive = (await adt.inactiveObjects()).filter((o) => o.user.toUpperCase() === cfg.sap.user.toUpperCase());
+            const toActivate = inactive.filter((o) => urls.includes(o.uri) || urls.includes(o.parentUri));
+            const skipped = urls.filter((u) => !toActivate.some((o) => o.uri === u || o.parentUri === u));
+            if (toActivate.length === 0) {
+              return ok(`沒有需要啟用的物件:${skipped.map(objectNameFromUrl).join("、")} 目前都不是 inactive。`);
+            }
+            const result = await adt.activateObjects(toActivate);
+            for (const u of urls.filter((x) => !skipped.includes(x))) {
+              audit.log({
+                timestamp: new Date().toISOString(),
+                action: "activate",
+                objectUrl: u,
+                objectName: objectNameFromUrl(u),
+                summary: `activate_objects 批次(${urls.length - skipped.length} 個物件)`,
+                success: result.success,
+                error: result.success ? undefined : JSON.stringify(result.messages),
+              });
+            }
+            const names = urls.filter((x) => !skipped.includes(x)).map(objectNameFromUrl);
+            const note = skipped.length ? `\nℹ️ 略過(不是 inactive):${skipped.map(objectNameFromUrl).join("、")}` : "";
+            if (result.success) return ok(`✅ 已啟用 ${names.length} 個物件:${names.join("、")}${note}`);
+            const msgs = (result.messages ?? []).map((m) => `- [${m.type}] ${m.objDescr ?? ""} ${m.shortText}(第 ${m.line ?? "?"} 行)`);
+            return ok(`❌ 啟用失敗(${names.join("、")}):\n${msgs.join("\n") || "(無詳細訊息)"}${note}`);
+          } catch (e) {
+            return fail(e);
+          }
+        })
+    );
+  }
+
   // ───────────────────────────── D4 pretty_print ─────────────────────────────
   server.registerTool(
     "pretty_print",
@@ -258,6 +347,26 @@ export function registerDiagnosticTools(
       }
     }
   );
+}
+
+/** activate_objects 一次最多物件數 */
+const ACTIVATE_MAX_OBJECTS = 50;
+
+/** inactive 清單 → 以主物件分組(子項目歸到 parentUri 下;只有子項目時以 parentUri 當主物件) */
+export function groupInactive(entries: InactiveEntry[]) {
+  const groups = new Map<string, { uri: string; name: string; type: string; parts: number; deleted: boolean }>();
+  for (const e of entries) {
+    const key = e.parentUri || e.uri;
+    const g = groups.get(key) ?? { uri: key, name: e.name, type: e.parentUri ? "" : e.type, parts: 0, deleted: false };
+    if (e.parentUri) g.parts++;
+    else {
+      g.type = e.type;
+      g.name = e.name;
+      g.deleted = e.deleted;
+    }
+    groups.set(key, g);
+  }
+  return [...groups.values()].map((g) => ({ ...g, type: g.type || "子項目" }));
 }
 
 /** ddic_info 支援的類型 */
