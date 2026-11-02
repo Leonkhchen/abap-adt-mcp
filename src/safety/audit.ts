@@ -50,8 +50,9 @@ export class AuditLogger {
 
 /** 產生變更摘要:舊/新行數與粗略差異統計(不含程式碼內容) */
 export function diffSummary(oldSource: string, newSource: string): string {
-  const oldLines = oldSource.split("\n");
-  const newLines = newSource.split("\n");
+  // SAP 回傳的原始碼是 CRLF、AI 送來的多半是 LF:不先統一,每一行都會被當成不同
+  const oldLines = oldSource.replace(/\r\n/g, "\n").split("\n");
+  const newLines = newSource.replace(/\r\n/g, "\n").split("\n");
   const oldSet = new Set(oldLines);
   const newSet = new Set(newLines);
   let added = 0;

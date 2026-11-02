@@ -1273,4 +1273,10 @@ describe("diffSummary", () => {
     const s = diffSummary("a\nb\nc", "a\nb\nc\nd");
     expect(s).toContain("3 → 4");
   });
+
+  it("CRLF 與 LF 混用時只計實際變更的行(v0.3 審查 #4;A4H 實測曾顯示 +8 / -9)", () => {
+    const sapSource = "CLASS x.\r\n  METHOD m.\r\n    out->write( 'R3-INITIAL' ).\r\n  ENDMETHOD.\r\nENDCLASS.";
+    const aiSource = "CLASS x.\n  METHOD m.\n    out->write( 'R3-AFTER-RESTART' ).\n  ENDMETHOD.\nENDCLASS.";
+    expect(diffSummary(sapSource, aiSource)).toBe("行數 5 → 5(約 +1 / -1)");
+  });
 });
