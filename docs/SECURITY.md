@@ -9,7 +9,7 @@
 | AI 誤改 SAP 標準物件 | 前綴白名單(預設僅 `Z`/`Y`/`$`)+ package 白名單(預設僅 `$TMP`、`Z*`、`Y*`) |
 | AI 在 SAP 上執行任意程式(`run_class`) | 唯讀模式不註冊;只能執行通過兩道白名單的 class;工具說明開頭明寫「會在 SAP 系統上執行程式」;audit log |
 | AI 大量建立物件或放進錯誤的 package(`create_object`) | 兩道白名單;非本機 package 必須明確給 transport;建立前先做名稱檢查;audit log |
-| ABAP Unit 測試改到資料 | `run_unit_tests` 只執行 RISK LEVEL HARMLESS 的測試 |
+| ABAP Unit 測試改到資料 | `run_unit_tests` 唯讀模式(含 prod)不註冊;只執行宣告為 RISK LEVEL HARMLESS 的測試 |
 | 密碼錯誤時自動重試把帳號鎖住 | 401 斷路:連續 2 次認證失敗後停止連線 SAP,需修正密碼後重開 MCP |
 | 並行寫入互相干擾(共用 stateful session) | 寫入類操作在 process 內依序執行;解鎖後回到 stateless 並清除 stateful context |
 | AI 在 prod 系統執行寫入 | `SYSTEM_ROLE=prod` 強制唯讀,程式內無覆寫路徑 |
@@ -67,7 +67,7 @@ ABAP_MCP_ALLOWED_PACKAGES=$TMP,ZFI_*
 
 ### 3-3. ABAP Unit 與建立物件
 
-- `run_unit_tests` 只執行 `RISK LEVEL HARMLESS`、`DURATION SHORT/MEDIUM` 的測試類別(不跑 DANGEROUS / CRITICAL),因此唯讀模式也提供
+- `run_unit_tests` 會在 SAP 上執行測試程式碼,因此與 `run_class` 一樣**唯讀模式(含 prod)不註冊**。它只執行宣告為 `RISK LEVEL HARMLESS`、`DURATION SHORT/MEDIUM` 的測試類別(不跑 DANGEROUS / CRITICAL),但 RISK LEVEL 是測試類別自己的宣告,不保證測試不寫資料,所以不能當作唯讀的依據(v0.3.1 起)
 - `create_object` 在建立前呼叫 SAP 的名稱檢查;非 `$` 開頭的 package 必須給 transport;`create_transport` 只在 `SYSTEM_ROLE=dev` 且非唯讀時註冊
 
 ### 3-4. 401 斷路

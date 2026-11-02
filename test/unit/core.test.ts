@@ -491,13 +491,29 @@ describe("run_unit_tests", () => {
     );
 
     const adt = mockAdt();
-    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" })); // 唯讀模式也可用
+    const call = await connectTools(adt);
     await call("run_unit_tests", { package_name: "$TMP" });
     expect(adt.runUnitTests).toHaveBeenCalledWith("/sap/bc/adt/packages/%24tmp");
     await call("run_unit_tests", { object_url: "/sap/bc/adt/oo/classes/zcl_x/source/main" });
     expect(adt.runUnitTests).toHaveBeenLastCalledWith("/sap/bc/adt/oo/classes/zcl_x");
     const r = await call("run_unit_tests", {});
     expect(r.isError).toBe(true);
+  });
+
+  it("會執行程式碼:唯讀模式與 prod 都不註冊,說明寫明會執行測試程式碼(v0.3 審查 #2)", async () => {
+    const list = async (cfg: ReturnType<typeof makeConfig>) => {
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerTools(server, mockAdt(), cfg, new AuditLogger(""));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(clientT);
+      return (await client.listTools()).tools;
+    };
+    expect((await list(makeConfig({ ABAP_MCP_READONLY: "true" }))).map((t) => t.name)).not.toContain("run_unit_tests");
+    expect((await list(makeConfig({ ABAP_MCP_SYSTEM_ROLE: "prod" }))).map((t) => t.name)).not.toContain("run_unit_tests");
+    const tool = (await list(makeConfig())).find((t) => t.name === "run_unit_tests");
+    expect(tool?.description).toContain("會在 SAP 系統上執行測試程式碼");
   });
 });
 
