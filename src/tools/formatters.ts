@@ -1,7 +1,7 @@
 /**
  * tools/formatters.ts — 把 ADT 回傳的結構整理成 AI 好讀的文字
  */
-import type { ClassComponent, UnitTestAlert, UnitTestClass } from "abap-adt-api";
+import type { ClassComponent, QueryResult, UnitTestAlert, UnitTestClass } from "abap-adt-api";
 import type { AtcResult } from "../adt/client.js";
 import type { UsageObject, UsageSnippet } from "../adt/whereUsed.js";
 import { objectNameFromUrl } from "../safety/guards.js";
@@ -133,6 +133,39 @@ export function formatClassComponents(root: ClassComponent): string {
   walk(root.components ?? [], "");
   if ((root.components ?? []).length === 0) out.push("(沒有任何元件)");
   return out.join("\n");
+}
+
+/**
+ * Data Preview 結果 → 以 | 分隔的文字表格;每格截斷 maxCell 字元,整體超過 maxTotal 字元時停止並標註。
+ * 換行與 | 會被替換,避免破壞表格。
+ */
+export function formatQueryResult(
+  r: QueryResult,
+  opts: { maxCell?: number; maxTotal?: number } = {}
+): { text: string; rows: number; truncatedRows: boolean } {
+  const maxCell = opts.maxCell ?? 200;
+  const maxTotal = opts.maxTotal ?? 20_000;
+  const cols = r.columns.map((c) => c.name);
+  const cell = (v: unknown) => {
+    // abap-adt-api 會把 DATS 解成 Date(UTC 午夜);印成 YYYY-MM-DD,不要變成本機時區的長字串
+    if (v instanceof Date) {
+      const iso = isNaN(v.getTime()) ? "" : v.toISOString();
+      v = iso.endsWith("T00:00:00.000Z") ? iso.slice(0, 10) : iso;
+    }
+    const s = v === null || v === undefined ? "" : String(v).replace(/[\r\n]+/g, " ").replace(/\|/g, "¦").trimEnd();
+    return s.length > maxCell ? `${s.slice(0, maxCell)}…` : s;
+  };
+  const lines = [cols.join(" | ")];
+  let total = lines[0].length;
+  let shown = 0;
+  for (const row of r.values) {
+    const line = cols.map((c) => cell((row as Record<string, unknown>)[c])).join(" | ");
+    if (total + line.length + 1 > maxTotal) break;
+    lines.push(line);
+    total += line.length + 1;
+    shown++;
+  }
+  return { text: lines.join("\n"), rows: shown, truncatedRows: shown < r.values.length };
 }
 
 /** ATC 優先級說明(1 最嚴重) */

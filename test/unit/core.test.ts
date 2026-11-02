@@ -45,7 +45,14 @@ import {
   newObjectUrl,
   parseValidation,
 } from "../../src/adt/objectTypes.js";
-import { formatAtcResult, formatClassComponents, formatUnitTestResults, formatWhereUsed } from "../../src/tools/formatters.js";
+import {
+  formatAtcResult,
+  formatClassComponents,
+  formatQueryResult,
+  formatUnitTestResults,
+  formatWhereUsed,
+} from "../../src/tools/formatters.js";
+import { assertTablesAllowed, validateSelectSql } from "../../src/safety/sql.js";
 import { parseUsageReferences, parseUsageSnippets, usageSnippetsBody } from "../../src/adt/whereUsed.js";
 import type { UnitTestClass } from "abap-adt-api";
 
@@ -88,6 +95,8 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     findDefinition: vi.fn(async () => ({ identifier: "x", url: "", line: 0, column: 0, sourceLine: "" })),
     runClass: vi.fn(async () => ""),
     createTransport: vi.fn(async () => ""),
+    tableContents: vi.fn(async () => ({ columns: [], values: [] }) as never),
+    runQuery: vi.fn(async () => ({ columns: [], values: [] }) as never),
     classComponents: vi.fn(async () => ({ "adtcore:name": "ZCL_X", "adtcore:type": "CLAS/OC", visibility: "public", links: [], components: [] }) as never),
     username: () => "DEVELOPER",
     baseUrl: () => "https://sap.example.com:44300",
@@ -917,6 +926,125 @@ describe("鎖定/寫入使用獨立的 ADTClient", () => {
     const adt = realAdt(one);
     await adt.lock("/u");
     expect(one.lock).toHaveBeenCalled();
+  });
+});
+
+// ───────────────────────── data_preview(v0.4 D1)─────────────────────────
+
+describe("data_preview 的 SQL 護欄", () => {
+  const dp = { ABAP_MCP_ALLOW_DATA_PREVIEW: "true" };
+
+  it("接受單一 SELECT,回傳 FROM / JOIN 的表", () => {
+    expect(validateSelectSql("SELECT * FROM /dmo/travel").tables).toEqual(["/DMO/TRAVEL"]);
+    expect(
+      validateSelectSql(
+        "SELECT t~travel_id, b~booking_id FROM /dmo/travel AS t INNER JOIN /dmo/booking AS b ON b~travel_id = t~travel_id"
+      ).tables
+    ).toEqual(["/DMO/TRAVEL", "/DMO/BOOKING"]);
+    expect(validateSelectSql("select status, count(*) as cnt from /dmo/travel group by status").tables).toEqual(["/DMO/TRAVEL"]);
+  });
+
+  it("字串常值與註解裡的關鍵字、分號不算", () => {
+    expect(validateSelectSql("SELECT * FROM /dmo/travel WHERE description = 'DELETE; UPDATE it''s'").tables).toEqual(["/DMO/TRAVEL"]);
+    expect(validateSelectSql("SELECT * FROM /dmo/travel \" UPDATE x;\n WHERE status = 'N'").tables).toEqual(["/DMO/TRAVEL"]);
+    expect(validateSelectSql("* DELETE FROM usr02;\nSELECT * FROM /dmo/travel").tables).toEqual(["/DMO/TRAVEL"]);
+    expect(validateSelectSql("SELECT * FROM /dmo/travel -- ; DROP\n").tables).toEqual(["/DMO/TRAVEL"]);
+  });
+
+  it("拒絕變更類語法、多語句與非 SELECT", () => {
+    expect(() => validateSelectSql("UPDATE /dmo/travel SET status = 'X'")).toThrow(/SELECT/);
+    expect(() => validateSelectSql("SELECT * FROM /dmo/travel; DELETE FROM /dmo/travel")).toThrow(/;/);
+    expect(() => validateSelectSql("SELECT * FROM /dmo/travel INTO TABLE @DATA(t)")).toThrow(/INTO/);
+    expect(() => validateSelectSql("WITH +x AS ( SELECT * FROM /dmo/travel ) SELECT * FROM +x")).toThrow(/SELECT/);
+    expect(() => validateSelectSql("")).toThrow(/不可為空/);
+    expect(() => validateSelectSql("SELECT * FROM /dmo/travel WHERE x = 'abc")).toThrow(/未結束/);
+  });
+
+  it("無法可靠解析來源時拒絕:FROM 子查詢、表函式參數、逗號 join、沒有 FROM", () => {
+    expect(() => validateSelectSql("SELECT * FROM ( SELECT * FROM /dmo/travel ) AS x")).toThrow(/子查詢/);
+    expect(() => validateSelectSql("SELECT * FROM zcds_with_params( p_date = '20260101' )")).toThrow(/參數/);
+    expect(() => validateSelectSql("SELECT * FROM /dmo/travel, usr02")).toThrow(/逗號/);
+    expect(() => validateSelectSql("SELECT 1 AS x")).toThrow(/FROM/);
+  });
+
+  it("每張表都要在白名單內:WHERE 子查詢裡的 USR02 也擋", () => {
+    const cfg = makeConfig(dp);
+    expect(cfg.safety.dataPreviewTables).toEqual(["/DMO/*", "Z*", "Y*"]);
+    const sub = validateSelectSql("SELECT * FROM /dmo/travel WHERE agency_id IN ( SELECT bname FROM usr02 )");
+    expect(sub.tables).toEqual(["/DMO/TRAVEL", "USR02"]);
+    expect(() => assertTablesAllowed(cfg, sub.tables)).toThrow(/USR02/);
+    expect(() => assertTablesAllowed(cfg, ["/DMO/TRAVEL", "ZTAB"])).not.toThrow();
+  });
+
+  it("預設不註冊;開啟後唯讀模式也可用", async () => {
+    const names = async (cfg: ReturnType<typeof makeConfig>) => {
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerTools(server, mockAdt(), cfg, new AuditLogger(""));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(clientT);
+      return (await client.listTools()).tools.map((t) => t.name);
+    };
+    expect(await names(makeConfig())).not.toContain("data_preview");
+    expect(await names(makeConfig({ ...dp, ABAP_MCP_READONLY: "true" }))).toContain("data_preview");
+  });
+
+  it("工具:表名稱轉大寫、預設 100 筆;白名單外與 UPDATE 不送到 SAP", async () => {
+    const qr = { columns: [{ name: "TRAVEL_ID" }, { name: "STATUS" }], values: [{ TRAVEL_ID: 1, STATUS: "N" }] } as never;
+    const adt = mockAdt({ tableContents: vi.fn(async () => qr), runQuery: vi.fn(async () => qr) });
+    const call = await connectTools(adt, makeConfig(dp));
+    const r = await call("data_preview", { table: "/dmo/travel" });
+    expect(adt.tableContents).toHaveBeenCalledWith("/DMO/TRAVEL", 100);
+    expect(r.text).toContain("TRAVEL_ID | STATUS");
+    expect(r.text).toContain("1 | N");
+    await call("data_preview", { sql: "SELECT travel_id, status FROM /dmo/travel", max_rows: 5 });
+    expect(adt.runQuery).toHaveBeenCalledWith("SELECT travel_id, status FROM /dmo/travel", 5);
+    expect((await call("data_preview", { table: "USR02" })).text).toContain("白名單");
+    expect((await call("data_preview", { sql: "UPDATE /dmo/travel SET status = 'X'" })).isError).toBe(true);
+    expect((await call("data_preview", { table: "/dmo/travel", max_rows: 5000 })).isError).toBe(true);
+    expect(adt.tableContents).toHaveBeenCalledTimes(1);
+    expect(adt.runQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it("audit 記 SQL 與筆數,不記資料內容", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "abap-mcp-dp-"));
+    const auditPath = path.join(dir, "audit.jsonl");
+    try {
+      const qr = { columns: [{ name: "SECRET" }], values: [{ SECRET: "TOP-SECRET-VALUE" }] } as never;
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerTools(server, mockAdt({ runQuery: vi.fn(async () => qr) }), makeConfig(dp), new AuditLogger(auditPath));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(clientT);
+      await client.callTool({ name: "data_preview", arguments: { sql: "SELECT secret FROM ztab" } });
+      const log = fs.readFileSync(auditPath, "utf8");
+      expect(JSON.parse(log.trim())).toMatchObject({ action: "data_preview", success: true, summary: "SELECT secret FROM ztab(回傳 1 筆)" });
+      expect(log).not.toContain("TOP-SECRET-VALUE");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("日期印成 YYYY-MM-DD;SAP 多回的筆數會截到要求的筆數(A4H 實測)", async () => {
+    const f = formatQueryResult({ columns: [{ name: "D" }], values: [{ D: new Date("2024-09-07T00:00:00Z") }] } as never);
+    expect(f.text).toBe("D\n2024-09-07");
+    const qr = { columns: [{ name: "N" }], values: [{ N: 1 }, { N: 2 }, { N: 3 }, { N: 4 }] } as never;
+    const call = await connectTools(mockAdt({ tableContents: vi.fn(async () => qr) }), makeConfig(dp));
+    const r = await call("data_preview", { table: "/DMO/TRAVEL", max_rows: 3 });
+    expect(r.text).toContain("📊 3 筆;已達筆數上限 3");
+    expect(r.text).not.toMatch(/\n4$/);
+  });
+
+  it("輸出:每格截斷 200 字元,整體超過上限時停止並標註", () => {
+    const long = "x".repeat(500);
+    const f1 = formatQueryResult({ columns: [{ name: "C" }], values: [{ C: long }] } as never);
+    expect(f1.text.split("\n")[1].length).toBe(201);
+    const many = { columns: [{ name: "C" }], values: Array.from({ length: 300 }, () => ({ C: "y".repeat(100) })) } as never;
+    const f2 = formatQueryResult(many, { maxTotal: 5_000 });
+    expect(f2.truncatedRows).toBe(true);
+    expect(f2.text.length).toBeLessThanOrEqual(5_000);
   });
 });
 

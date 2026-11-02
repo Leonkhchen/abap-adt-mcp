@@ -20,6 +20,7 @@ import {
   type TransportsOfUser,
   type UnitTestClass,
   type ClassComponent,
+  type QueryResult,
 } from "abap-adt-api";
 import * as https from "node:https";
 import type { AppConfig } from "../config.js";
@@ -146,6 +147,10 @@ export interface AdtService {
   classComponents(objectUrl: string): Promise<ClassComponent>;
   /** 執行 class 的 IF_OO_ADT_CLASSRUN~MAIN,回傳 out->write 的輸出 */
   runClass(className: string): Promise<string>;
+  /** 讀取單一表/view 的前 rows 筆(Data Preview);呼叫端負責白名單檢查 */
+  tableContents(table: string, rows: number): Promise<QueryResult>;
+  /** 執行自由 SELECT(Data Preview);呼叫端負責 SQL 與白名單檢查 */
+  runQuery(sql: string, rows: number): Promise<QueryResult>;
   /** 建立 workbench transport request,回傳 TR 編號;refUrl 為相關物件(或 package)的 URI */
   createTransport(refUrl: string, description: string, packageName: string): Promise<string>;
   /** 取得目前登入的使用者帳號 */
@@ -483,6 +488,14 @@ export class RealAdtService implements AdtService {
 
   async runClass(className: string) {
     return this.guard(() => this.client.runClass(className.toUpperCase()));
+  }
+
+  async tableContents(table: string, rows: number) {
+    return this.guard(() => this.client.tableContents(table, rows));
+  }
+
+  async runQuery(sql: string, rows: number) {
+    return this.guard(() => this.client.runQuery(sql, rows));
   }
 
   async createTransport(refUrl: string, description: string, packageName: string) {
