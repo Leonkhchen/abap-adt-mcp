@@ -1,6 +1,6 @@
 {
   "name": "abap-adt-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Standalone MCP server connecting Claude Code / Codex directly to SAP ABAP ADT REST API",
   "main": "index.js",
   "scripts": {

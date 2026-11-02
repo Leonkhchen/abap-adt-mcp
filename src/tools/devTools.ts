@@ -2,8 +2,8 @@
  * tools/devTools.ts — v0.3 開發循環工具
  *
  * 讓 AI 在 $TMP 從零完成「建立 → 寫 → 啟用 → ABAP Unit → ATC」:
- *  - 分析類(唯讀模式也註冊):run_unit_tests、run_atc、where_used、find_definition、class_components
- *  - 寫入/執行類(唯讀模式不註冊):create_object、run_class、create_transport
+ *  - 分析類(唯讀模式也註冊):run_atc、where_used、find_definition、class_components
+ *  - 寫入/執行類(唯讀模式不註冊):create_object、run_unit_tests、run_class、create_transport
  * 寫入類一律經 SerialQueue 依序執行,並通過名稱前綴與 package 兩道白名單。
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -26,35 +26,6 @@ import { fail, ok, truncate } from "./result.js";
 
 /** 分析類工具(唯讀模式也註冊) */
 export function registerAnalysisTools(server: McpServer, adt: AdtService): void {
-  // ───────────────────────────── G2 run_unit_tests ─────────────────────────────
-  server.registerTool(
-    "run_unit_tests",
-    {
-      title: "執行 ABAP Unit 測試",
-      description:
-        "執行物件(class / program)或整個 package 的 ABAP Unit 測試,回傳每個測試方法的結果、" +
-        "失敗訊息與位置。只執行 RISK LEVEL HARMLESS、DURATION SHORT/MEDIUM 的測試(不會跑會改資料的測試)。" +
-        "object_url 與 package_name 擇一提供。",
-      inputSchema: {
-        object_url: z.string().optional().describe("物件 URI,例如 /sap/bc/adt/oo/classes/zcl_demo"),
-        package_name: z.string().optional().describe("package 名稱,例如 $TMP(執行其中所有物件的測試)"),
-      },
-    },
-    async ({ object_url, package_name }) => {
-      try {
-        if (!!object_url === !!package_name) {
-          return fail(new GuardViolationError("object_url 與 package_name 必須擇一提供。"));
-        }
-        const url = object_url
-          ? baseObjectUrl(object_url)
-          : packageUrl(package_name!);
-        return ok(formatUnitTestResults(await adt.runUnitTests(url)));
-      } catch (e) {
-        return fail(e);
-      }
-    }
-  );
-
   // ───────────────────────────── G3 run_atc ─────────────────────────────
   server.registerTool(
     "run_atc",
@@ -257,6 +228,37 @@ export function registerWriteDevTools(
           return fail(e);
         }
       })
+  );
+
+  // ───────────────────────────── G2 run_unit_tests ─────────────────────────────
+  // 測試會在 SAP 上執行程式碼;RISK LEVEL 只是測試類別的宣告,不保證不寫資料,
+  // 因此與 run_class 一樣在唯讀模式(含 prod)不註冊(v0.3 審查 #2)
+  server.registerTool(
+    "run_unit_tests",
+    {
+      title: "執行 ABAP Unit 測試",
+      description:
+        "會在 SAP 系統上執行測試程式碼:執行物件(class / program)或整個 package 的 ABAP Unit 測試," +
+        "回傳每個測試方法的結果、失敗訊息與位置。只執行宣告為 RISK LEVEL HARMLESS、DURATION SHORT/MEDIUM 的測試類別。" +
+        "唯讀模式不提供。object_url 與 package_name 擇一提供。",
+      inputSchema: {
+        object_url: z.string().optional().describe("物件 URI,例如 /sap/bc/adt/oo/classes/zcl_demo"),
+        package_name: z.string().optional().describe("package 名稱,例如 $TMP(執行其中所有物件的測試)"),
+      },
+    },
+    async ({ object_url, package_name }) => {
+      try {
+        if (!!object_url === !!package_name) {
+          return fail(new GuardViolationError("object_url 與 package_name 必須擇一提供。"));
+        }
+        const url = object_url
+          ? baseObjectUrl(object_url)
+          : packageUrl(package_name!);
+        return ok(formatUnitTestResults(await adt.runUnitTests(url)));
+      } catch (e) {
+        return fail(e);
+      }
+    }
   );
 
   // ───────────────────────────── G6 run_class ─────────────────────────────

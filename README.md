@@ -29,7 +29,6 @@ AI 可以在 `$TMP` 從零完成「建立 → 寫 → 啟用 → ABAP Unit → A
 | `read_source` | 讀取原始碼(含行號、分段讀取、截斷保護;含 class 的測試 include) |
 | `syntax_check` | 語法檢查(免鎖定) |
 | `list_transports` | 查詢可用 transport requests |
-| `run_unit_tests` | 執行 ABAP Unit(物件或 package;只跑 RISK LEVEL HARMLESS) |
 | `run_atc` | 執行 ATC 靜態檢查(依優先級分組,上限 100 筆) |
 | `where_used` | 查詢物件或元件的使用處(含程式碼行,上限 50 筆) |
 | `find_definition` | 跳到定義 / 實作 |
@@ -37,6 +36,7 @@ AI 可以在 `$TMP` 從零完成「建立 → 寫 → 啟用 → ABAP Unit → A
 | `write_source` | ✏️ 寫入原始碼(自動鎖定編排 + 並行保護 + 語法檢查 + 可選啟用;可寫測試 include) |
 | `activate_object` | ✏️ 啟用物件 |
 | `create_object` | ✏️ 建立 CLAS/OC、INTF/OI、PROG/P、DDLS/DF、BDEF/BDO |
+| `run_unit_tests` | ⚠️ **會執行測試程式碼**:ABAP Unit(物件或 package;只跑宣告為 RISK LEVEL HARMLESS 的測試) |
 | `run_class` | ⚠️ **會在 SAP 系統上執行程式**:執行 IF_OO_ADT_CLASSRUN(輸出上限 20,000 字元) |
 | `create_transport` | ✏️ 建立 workbench transport request(只在 `SYSTEM_ROLE=dev`) |
 

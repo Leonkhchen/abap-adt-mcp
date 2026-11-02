@@ -161,7 +161,7 @@ describe("ping", () => {
   it("ping_system 顯示版本,且版本取自 package.json(E2;v0.3 起為 0.3.0)", async () => {
     const pkg = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8"));
     expect(VERSION).toBe(pkg.version);
-    expect(VERSION).toBe("0.3.0");
+    expect(VERSION).toBe("0.3.1");
     const call = await connectTools(mockAdt());
     const r = await call("ping_system");
     expect(r.text).toContain(`版本:${VERSION}`);
@@ -491,13 +491,29 @@ describe("run_unit_tests", () => {
     );
 
     const adt = mockAdt();
-    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" })); // 唯讀模式也可用
+    const call = await connectTools(adt);
     await call("run_unit_tests", { package_name: "$TMP" });
     expect(adt.runUnitTests).toHaveBeenCalledWith("/sap/bc/adt/packages/%24tmp");
     await call("run_unit_tests", { object_url: "/sap/bc/adt/oo/classes/zcl_x/source/main" });
     expect(adt.runUnitTests).toHaveBeenLastCalledWith("/sap/bc/adt/oo/classes/zcl_x");
     const r = await call("run_unit_tests", {});
     expect(r.isError).toBe(true);
+  });
+
+  it("會執行程式碼:唯讀模式與 prod 都不註冊,說明寫明會執行測試程式碼(v0.3 審查 #2)", async () => {
+    const list = async (cfg: ReturnType<typeof makeConfig>) => {
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerTools(server, mockAdt(), cfg, new AuditLogger(""));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(clientT);
+      return (await client.listTools()).tools;
+    };
+    expect((await list(makeConfig({ ABAP_MCP_READONLY: "true" }))).map((t) => t.name)).not.toContain("run_unit_tests");
+    expect((await list(makeConfig({ ABAP_MCP_SYSTEM_ROLE: "prod" }))).map((t) => t.name)).not.toContain("run_unit_tests");
+    const tool = (await list(makeConfig())).find((t) => t.name === "run_unit_tests");
+    expect(tool?.description).toContain("會在 SAP 系統上執行測試程式碼");
   });
 });
 
@@ -708,6 +724,42 @@ describe("source URI 與語法檢查", () => {
     expect(adt.setObjectSource).not.toHaveBeenCalled();
   });
 
+  it("建立空測試 include 時寫 audit;給了非空 expected_current_source 卻不存在 → 不建立、回並行衝突(v0.3 審查 #3)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "abap-mcp-inc-"));
+    const auditPath = path.join(dir, "audit.jsonl");
+    try {
+      let exists = false;
+      const missing = () => { if (!exists) throw new Error("ZCL_X=====CCAU does not have any inactive version"); return "* empty"; };
+      const adt = mockAdt({
+        getObjectSource: vi.fn(async () => missing()),
+        createTestInclude: vi.fn(async () => { exists = true; }),
+      });
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerTools(server, adt, makeConfig(), new AuditLogger(auditPath));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(clientT);
+      const inc = "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses";
+      const callTool = async (args: Record<string, unknown>) =>
+        ((await client.callTool({ name: "write_source", arguments: args })) as { content: { text: string }[] }).content[0].text;
+
+      // 1) 並行衝突:不建立 include
+      const conflict = await callTool({ object_url: inc, new_source: "tests", expected_current_source: "CLASS ltc …" });
+      expect(conflict).toContain("不一致");
+      expect(adt.createTestInclude).not.toHaveBeenCalled();
+
+      // 2) 正常建立:audit 有 create_test_include
+      await callTool({ object_url: inc, new_source: "tests" });
+      expect(adt.createTestInclude).toHaveBeenCalledTimes(1);
+      const entries = fs.readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(entries.some((e) => e.action === "create_test_include" && e.objectName === "ZCL_X" && e.success)).toBe(true);
+      expect(entries.some((e) => e.action === "write_source" && e.success)).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("解鎖或鎖定失敗回到 stateless 時丟掉 sap-contextid cookie(A4H 實測會導致之後全部 400)", async () => {
     const cookie = new Map([["SAP_SESSIONID_A4H_001", "s"], ["sap-contextid", "c"]]);
     const fake = fakeAdtClient();
@@ -818,6 +870,53 @@ describe("create_transport", () => {
     expect((await call("create_transport", { package_name: "$TMP", description: "d" })).text).toContain("不需要 transport");
     expect((await call("create_transport", { package_name: "SAPPKG", description: "d" })).text).toContain("package 白名單");
     expect(adt.createTransport).not.toHaveBeenCalled();
+  });
+});
+
+// ───────────────────────── 鎖定用獨立 session(v0.3.1 #1)─────────────────────────
+
+describe("鎖定/寫入使用獨立的 ADTClient", () => {
+  it("lock、setObjectSource、createTestInclude、unLock 走鎖定 client;其他呼叫走一般 client", async () => {
+    const read = fakeAdtClient({ getObjectSource: vi.fn(async () => "src"), activate: vi.fn(async () => ({ success: true })) });
+    const lock = fakeAdtClient({ setObjectSource: vi.fn(async () => {}), createTestInclude: vi.fn(async () => {}) });
+    const adt = new RealAdtService(makeConfig(), read as unknown as ADTClient, lock as unknown as ADTClient);
+    await adt.getObjectSource("/u/source/main");
+    const l = await adt.lock("/u");
+    await adt.createTestInclude("ZCL_U", l.LOCK_HANDLE);
+    await adt.setObjectSource("/u/source/main", "new", l.LOCK_HANDLE);
+    await adt.unLock("/u", l.LOCK_HANDLE);
+    await adt.activate("ZCL_U", "/u");
+    expect(read.getObjectSource).toHaveBeenCalled();
+    expect(read.activate).toHaveBeenCalled();
+    expect(read.lock).not.toHaveBeenCalled();
+    expect(lock.lock).toHaveBeenCalledWith("/u");
+    expect(lock.createTestInclude).toHaveBeenCalled();
+    expect(lock.setObjectSource).toHaveBeenCalled();
+    expect(lock.unLock).toHaveBeenCalled();
+  });
+
+  it("鎖定期間一般 client 出錯,不影響持有鎖定的 session(stateful 與 context cookie 都保留)", async () => {
+    const read = fakeAdtClient({
+      getObjectSource: vi.fn(async () => { throw new Error("CCAU does not have any inactive version"); }),
+    });
+    const lock = fakeAdtClient();
+    const jar = new Map([["sap-contextid", "ctx"]]);
+    (lock.httpClient as unknown as { cookie: Map<string, string> }).cookie = jar;
+    const adt = new RealAdtService(makeConfig(), read as unknown as ADTClient, lock as unknown as ADTClient);
+    await adt.lock("/u");
+    await expect(adt.getObjectSource("/u/includes/testclasses")).rejects.toThrow("inactive version");
+    expect(lock.stateful).toBe(session_types.stateful);
+    expect(jar.get("sap-contextid")).toBe("ctx");
+    expect(read.stateful).toBe(session_types.stateless);
+    await adt.unLock("/u", "LH-1");
+    expect(jar.has("sap-contextid")).toBe(false);
+  });
+
+  it("只注入一個 client 時兩者共用(相容既有測試)", async () => {
+    const one = fakeAdtClient();
+    const adt = realAdt(one);
+    await adt.lock("/u");
+    expect(one.lock).toHaveBeenCalled();
   });
 });
 
@@ -1173,5 +1272,11 @@ describe("diffSummary", () => {
   it("計算行數變化摘要", () => {
     const s = diffSummary("a\nb\nc", "a\nb\nc\nd");
     expect(s).toContain("3 → 4");
+  });
+
+  it("CRLF 與 LF 混用時只計實際變更的行(v0.3 審查 #4;A4H 實測曾顯示 +8 / -9)", () => {
+    const sapSource = "CLASS x.\r\n  METHOD m.\r\n    out->write( 'R3-INITIAL' ).\r\n  ENDMETHOD.\r\nENDCLASS.";
+    const aiSource = "CLASS x.\n  METHOD m.\n    out->write( 'R3-AFTER-RESTART' ).\n  ENDMETHOD.\nENDCLASS.";
+    expect(diffSummary(sapSource, aiSource)).toBe("行數 5 → 5(約 +1 / -1)");
   });
 });
