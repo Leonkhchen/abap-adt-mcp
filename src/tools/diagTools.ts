@@ -15,6 +15,8 @@ import type { SerialQueue } from "../safety/serialQueue.js";
 import { assertTableName, assertTablesAllowed, validateSelectSql } from "../safety/sql.js";
 import { formatDataElement, formatDdicFields, formatDomain, formatQueryResult } from "./formatters.js";
 import { fail, ok, truncate } from "./result.js";
+import { unifiedDiff } from "./diff.js";
+import type { Revision } from "abap-adt-api";
 
 /** data_preview 筆數:預設與上限 */
 export const DATA_PREVIEW_DEFAULT_ROWS = 100;
@@ -247,6 +249,53 @@ export function registerDiagnosticTools(
     );
   }
 
+  // ───────────────────────────── D6 get_revisions ─────────────────────────────
+  server.registerTool(
+    "get_revisions",
+    {
+      title: "版本歷史與比較",
+      description:
+        "列出物件(或 class 的 include)的版本歷史,新的在前,編號 1 為最新。給 compare_from 與 compare_to(版本編號)" +
+        "時回傳兩個版本的 unified diff(上限 500 行)。注意:$TMP 等不記錄 transport 的物件沒有歷史版本," +
+        "只會有 active(目前啟用)與 inactive(已寫入尚未啟用)兩個版本。唯讀。",
+      inputSchema: {
+        object_url: z.string().min(1).describe("物件、source/main 或 include URI,例如 /sap/bc/adt/oo/classes/zcl_demo"),
+        compare_from: z.number().int().positive().optional().describe("選填:比較的舊版本編號(get_revisions 列出的編號)"),
+        compare_to: z.number().int().positive().optional().describe("選填:比較的新版本編號,例如 1(最新)"),
+      },
+    },
+    async ({ object_url, compare_from, compare_to }) => {
+      try {
+        if ((compare_from === undefined) !== (compare_to === undefined)) {
+          return fail(new GuardViolationError("compare_from 與 compare_to 需同時提供。"));
+        }
+        const revs = await adt.revisions(object_url);
+        if (revs.length === 0) return ok(`${object_url} 沒有任何版本紀錄。`);
+        const lines = revs.map((r, i) => `#${i + 1} ${r.date} ${r.author}  ${revisionLabel(r)}`);
+        let text = `🕘 ${object_url} 共 ${revs.length} 個版本(新的在前):\n${lines.join("\n")}`;
+        if (compare_from !== undefined && compare_to !== undefined) {
+          const from = revs[compare_from - 1];
+          const to = revs[compare_to - 1];
+          if (!from || !to) return fail(new GuardViolationError(`版本編號需在 1–${revs.length} 之間。`));
+          const sourceUrl = isSourceUrl(object_url) ? object_url : `${object_url.replace(/\/$/, "")}/source/main`;
+          const [a, b] = await Promise.all([
+            adt.revisionContent(from.uri, sourceUrl),
+            adt.revisionContent(to.uri, sourceUrl),
+          ]);
+          const d = unifiedDiff(a, b, `#${compare_from} ${revisionLabel(from)}`, `#${compare_to} ${revisionLabel(to)}`, {
+            maxLines: REVISION_DIFF_MAX_LINES,
+          });
+          text += d.text
+            ? `\n\n比較 #${compare_from} → #${compare_to}(+${d.added} / -${d.removed} 行):\n${d.text}`
+            : `\n\n#${compare_from} 與 #${compare_to} 內容相同。`;
+        }
+        return ok(truncate(text, DIAG_MAX_OUTPUT));
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
+
   // ───────────────────────────── D4 pretty_print ─────────────────────────────
   server.registerTool(
     "pretty_print",
@@ -347,6 +396,20 @@ export function registerDiagnosticTools(
       }
     }
   );
+}
+
+/** get_revisions 的 diff 上限行數 */
+const REVISION_DIFF_MAX_LINES = 500;
+
+/**
+ * 版本說明。A4H 實測:版本 URI 的編號 00000 = 目前 active、99999 = 已寫入尚未啟用(inactive);
+ * 有 transport 紀錄的物件才會有其他編號與 versionTitle
+ */
+export function revisionLabel(r: Revision): string {
+  const num = r.uri.match(/\/versions\/[^/]+\/([^/]+)\/content$/)?.[1] ?? "";
+  if (num === "99999") return "inactive(已寫入、尚未啟用)";
+  if (num === "00000") return "active(目前啟用的版本)";
+  return [r.version, r.versionTitle].filter(Boolean).join(" ") || `版本 ${num}`;
 }
 
 /** activate_objects 一次最多物件數 */

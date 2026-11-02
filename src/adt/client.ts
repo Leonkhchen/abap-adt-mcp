@@ -22,6 +22,7 @@ import {
   type ClassComponent,
   type QueryResult,
   type DdicElement,
+  type Revision,
 } from "abap-adt-api";
 import * as https from "node:https";
 import type { AppConfig } from "../config.js";
@@ -44,6 +45,7 @@ import {
   type UsageSnippet,
 } from "./whereUsed.js";
 import {
+  baseObjectUrl,
   bdefCreateBody,
   packageUrl,
   parseValidation,
@@ -174,6 +176,10 @@ export interface AdtService {
   classComponents(objectUrl: string): Promise<ClassComponent>;
   /** 執行 class 的 IF_OO_ADT_CLASSRUN~MAIN,回傳 out->write 的輸出 */
   runClass(className: string): Promise<string>;
+  /** 版本歷史(新的在前);url 可為物件、source/main 或 class include */
+  revisions(url: string): Promise<Revision[]>;
+  /** 取得某個版本的內容;sourceUrl 是該物件(或 include)的 source URI */
+  revisionContent(revisionUri: string, sourceUrl: string): Promise<string>;
   /** 目前 inactive 的物件(含子項目,例如 class 的 include);已過濾掉空紀錄 */
   inactiveObjects(): Promise<InactiveEntry[]>;
   /** 批次啟用(一次送出;呼叫端負責白名單檢查) */
@@ -531,6 +537,25 @@ export class RealAdtService implements AdtService {
 
   async runClass(className: string) {
     return this.guard(() => this.client.runClass(className.toUpperCase()));
+  }
+
+  async revisions(url: string) {
+    // class include(…/includes/testclasses)要以 class + include 名稱查詢
+    const inc = url.match(/^(.*\/oo\/classes\/[^/]+)\/includes\/([^/]+)$/);
+    const list = inc
+      ? await this.guard(() => this.client.revisions(inc[1], inc[2] as never))
+      : await this.guard(() => this.client.revisions(baseObjectUrl(url)));
+    return [...list].sort((a, b) => b.date.localeCompare(a.date));
+  }
+
+  async revisionContent(revisionUri: string, sourceUrl: string) {
+    const m = revisionUri.match(/^\/sap\/bc\/adt\/.+\/versions\/[^/]+\/([^/]+)\/content$/);
+    if (!m) throw new Error("版本 URI 格式不正確:必須是 get_revisions 回傳的 …/versions/…/content。");
+    // A4H 實測:class 的版本內容(includes/main/versions/…)排版與 source/main 不同,且剛寫入後偶爾讀到舊內容;
+    // active(00000)/ inactive(99999)直接以 source URI + version 讀取,與 read_source 看到的一致
+    if (m[1] === "00000") return this.guard(() => this.client.getObjectSource(sourceUrl, { version: "active" }));
+    if (m[1] === "99999") return this.guard(() => this.client.getObjectSource(sourceUrl, { version: "inactive" }));
+    return this.guard(() => this.client.getObjectSource(revisionUri));
   }
 
   async inactiveObjects() {

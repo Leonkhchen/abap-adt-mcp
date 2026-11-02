@@ -58,7 +58,8 @@ import {
 import { assertTablesAllowed, validateSelectSql } from "../../src/safety/sql.js";
 import { extractDumpChapters, normalizeDumpId, parseDumpMeta, summarizeDump } from "../../src/adt/dumps.js";
 import { activationBody, parseActivationResponse } from "../../src/adt/activation.js";
-import { groupInactive } from "../../src/tools/diagTools.js";
+import { groupInactive, revisionLabel } from "../../src/tools/diagTools.js";
+import { unifiedDiff } from "../../src/tools/diff.js";
 import { parseUsageReferences, parseUsageSnippets, usageSnippetsBody } from "../../src/adt/whereUsed.js";
 import type { UnitTestClass } from "abap-adt-api";
 
@@ -108,6 +109,8 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     listDumps: vi.fn(async () => []),
     prettyPrint: vi.fn(async (s: string) => ({ source: s, style: "", indentation: false })),
     inactiveObjects: vi.fn(async () => []),
+    revisions: vi.fn(async () => []),
+    revisionContent: vi.fn(async () => ""),
     activateObjects: vi.fn(async () => ({ success: true, messages: [], inactive: [] })),
     dumpDetail: vi.fn(async () => ({ meta: { title: "", error: "", exception: "", program: "", datetime: "", author: "", contentsUri: "", chapters: [] }, text: "" })),
     runQuery: vi.fn(async () => ({ columns: [], values: [] }) as never),
@@ -1299,6 +1302,59 @@ describe("inactive 物件與批次啟用", () => {
     expect(adt.activateObjects).toHaveBeenCalledWith([entry("ZCL_A"), entry("ZCL_A", A)]);
     expect(r.text).toContain("已啟用 1 個物件:ZCL_A");
     expect(r.text).toContain("略過(不是 inactive):ZCL_B");
+  });
+});
+
+// ───────────────────────── get_revisions(v0.4 D6)─────────────────────────
+
+describe("版本歷史與 diff", () => {
+  const rev = (num: string, date: string) =>
+    ({ uri: `/sap/bc/adt/oo/classes/zcl_x/includes/main/versions/19700101101123/${num}/content`, date, author: "DEVELOPER", version: "", versionTitle: "" }) as never;
+
+  it("unifiedDiff:區塊標頭、前後 3 行、CRLF 不算差異、超過上限截斷", () => {
+    const a = "a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh";
+    const b = "a\nb\nc\nd\nE\nf\ng\nh";
+    const d = unifiedDiff(a, b, "old", "new");
+    expect(d.text).toBe("--- old\n+++ new\n@@ -2,7 +2,7 @@\n b\n c\n d\n-e\n+E\n f\n g\n h");
+    expect(d).toMatchObject({ added: 1, removed: 1, truncated: false });
+    expect(unifiedDiff(a, a.replace(/\r\n/g, "\n"), "o", "n").text).toBe("");
+    const many = unifiedDiff("", Array.from({ length: 800 }, (_, i) => `l${i}`).join("\n"), "o", "n", { maxLines: 500 });
+    expect(many.truncated).toBe(true);
+    expect(many.text.split("\n").length).toBe(501);
+  });
+
+  it("版本說明:00000 = active、99999 = inactive(A4H 實測)", () => {
+    expect(revisionLabel(rev("00000", ""))).toContain("active");
+    expect(revisionLabel(rev("99999", ""))).toContain("inactive");
+    expect(revisionLabel({ ...(rev("00012", "") as object), version: "A4HK900001", versionTitle: "fix" } as never)).toBe("A4HK900001 fix");
+  });
+
+  it("active / inactive 版本以 source URI + version 讀取;其他版本讀版本 URI;拒絕不合格式的 URI", async () => {
+    const fake = fakeAdtClient({ getObjectSource: vi.fn(async () => "src") });
+    const adt = realAdt(fake);
+    const src = "/sap/bc/adt/oo/classes/zcl_x/source/main";
+    await adt.revisionContent((rev("00000", "") as { uri: string }).uri, src);
+    expect(fake.getObjectSource).toHaveBeenLastCalledWith(src, { version: "active" });
+    await adt.revisionContent((rev("99999", "") as { uri: string }).uri, src);
+    expect(fake.getObjectSource).toHaveBeenLastCalledWith(src, { version: "inactive" });
+    const old = (rev("00012", "") as { uri: string }).uri;
+    await adt.revisionContent(old, src);
+    expect(fake.getObjectSource).toHaveBeenLastCalledWith(old);
+    await expect(adt.revisionContent("/sap/bc/adt/oo/classes/zcl_x", src)).rejects.toThrow("版本 URI");
+  });
+
+  it("工具:列出版本並比較;compare 參數要成對、編號要在範圍內", async () => {
+    const adt = mockAdt({
+      revisions: vi.fn(async () => [rev("99999", "2026-11-02T14:36:53Z"), rev("00000", "2026-11-02T14:36:52Z")]),
+      revisionContent: vi.fn(async (uri: string) => (uri.includes("/99999/") ? "r = 'V2'." : "r = 'V1'.")),
+    });
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" }));
+    const r = await call("get_revisions", { object_url: "/sap/bc/adt/oo/classes/zcl_x", compare_from: 2, compare_to: 1 });
+    expect(r.text).toContain("#1 2026-11-02T14:36:53Z DEVELOPER  inactive");
+    expect(r.text).toContain("-r = 'V1'.\n+r = 'V2'.");
+    expect(adt.revisionContent).toHaveBeenCalledWith(expect.stringContaining("/00000/"), "/sap/bc/adt/oo/classes/zcl_x/source/main");
+    expect((await call("get_revisions", { object_url: "/u", compare_from: 1 })).isError).toBe(true);
+    expect((await call("get_revisions", { object_url: "/u", compare_from: 1, compare_to: 5 })).text).toContain("1–2");
   });
 });
 
