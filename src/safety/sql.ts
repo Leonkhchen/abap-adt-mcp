@@ -3,7 +3,8 @@
  *
  * data_preview 讓 AI 讀資料庫內容,是外洩風險最高的工具。這裡在送到 SAP 之前做三件事:
  *  1. 只接受單一 SELECT:去掉字串常值與註解後,不得含 ; 或任何變更/控制類關鍵字
- *  2. 解析 FROM / JOIN 後面的表或 view 名稱;無法可靠解析(子查詢當來源、表函式參數、逗號 join)一律拒絕
+ *  2. 解析 FROM / JOIN 後面的表或 view 名稱;無法可靠解析(子查詢當來源、表函式參數、逗號 join、
+ *     CDS 關聯路徑 \_assoc)一律拒絕
  *  3. 每張表都必須在 ABAP_MCP_DATA_PREVIEW_TABLES 白名單內(避免讀 USR02 等敏感表)
  * SAP 端本身也只接受 SELECT,這裡是第二道、且可在本機先擋下的防線。
  */
@@ -92,6 +93,13 @@ export function validateSelectSql(sql: string): { tables: string[] } {
 
   if (code.includes(";")) {
     throw new GuardViolationError("只接受單一 SELECT 敘述,SQL 中不可有 ;(多語句)。");
+  }
+  // CDS 關聯路徑(\_assoc,例如 FROM /dmo/i_travel_u\_agency 或 SELECT \_agency-name)會讀到關聯目標的 view,
+  // 但目標名稱不出現在 SQL 裡,白名單無從檢查。ABAP SQL 中反斜線只用於路徑,字串常值外出現一律拒絕
+  if (code.includes("\\")) {
+    throw new GuardViolationError(
+      "不支援 CDS 關聯路徑(\\_關聯名稱):關聯可能讀到白名單外的 view。請改用 JOIN 明確寫出要讀的表或 view。"
+    );
   }
   if (!/^\s*SELECT\b/i.test(code)) {
     throw new GuardViolationError("只接受以 SELECT 開頭的查詢(不支援 WITH 等其他形式)。");

@@ -984,6 +984,16 @@ describe("data_preview 的 SQL 護欄", () => {
     expect(() => validateSelectSql("SELECT 1 AS x")).toThrow(/FROM/);
   });
 
+  it("CDS 關聯路徑(\\_)一律拒絕:關聯目標不出現在 SQL 裡,白名單無從檢查", () => {
+    // FROM 後面接關聯:原本會被解析成 /DMO/I_TRAVEL_U 而通過白名單,實際讀的是關聯目標
+    expect(() => validateSelectSql("SELECT * FROM /dmo/i_travel_u\\_agency")).toThrow(/關聯路徑/);
+    expect(() => validateSelectSql("SELECT travelid, \\_agency-name AS agency FROM /dmo/i_travel_u")).toThrow(/關聯路徑/);
+    expect(() => validateSelectSql("SELECT * FROM /dmo/i_travel_u WHERE \\_agency-countrycode = 'DE'")).toThrow(/關聯路徑/);
+    expect(() => validateSelectSql("SELECT * FROM /dmo/i_travel_u AS t INNER JOIN t\\_agency AS a ON a~agencyid = t~agencyid")).toThrow(/關聯路徑/);
+    // 字串常值裡的 \_ 不算
+    expect(validateSelectSql("SELECT * FROM /dmo/travel WHERE description = 'a\\_b'").tables).toEqual(["/DMO/TRAVEL"]);
+  });
+
   it("每張表都要在白名單內:WHERE 子查詢裡的 USR02 也擋", () => {
     const cfg = makeConfig(dp);
     // 預設只有 /DMO/*:Z* / Y* 會讓 AI 能以自建 CDS view 包住任意表
