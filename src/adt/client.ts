@@ -21,6 +21,7 @@ import {
   type UnitTestClass,
   type ClassComponent,
   type QueryResult,
+  type DdicElement,
 } from "abap-adt-api";
 import * as https from "node:https";
 import type { AppConfig } from "../config.js";
@@ -57,6 +58,12 @@ export interface AtcResult {
   /** ATC 執行資訊,例如 TOOL_FAILURE(部分檢查無法執行)、FINDING_STATS */
   infos: { type: string; description: string }[];
   findings: AtcFinding[];
+}
+
+/** 資料元素 / domain 的屬性(abap-adt-api 回傳的 metaData + properties,保留原形狀) */
+export interface DdicTypeProperties {
+  metaData: { name: string; description?: string; packageName?: string };
+  properties: object;
 }
 
 /** find_definition 結果 */
@@ -147,6 +154,12 @@ export interface AdtService {
   classComponents(objectUrl: string): Promise<ClassComponent>;
   /** 執行 class 的 IF_OO_ADT_CLASSRUN~MAIN,回傳 out->write 的輸出 */
   runClass(className: string): Promise<string>;
+  /** DDIC 元素(表、CDS view 的欄位);結構與資料元素在 A4H 會回空 */
+  ddicElement(name: string): Promise<DdicElement>;
+  /** 資料元素屬性(型別、長度、欄位標籤) */
+  dataElementProperties(url: string): Promise<DdicTypeProperties>;
+  /** domain 屬性(型別、長度、固定值) */
+  domainProperties(url: string): Promise<DdicTypeProperties>;
   /** 讀取單一表/view 的前 rows 筆(Data Preview);呼叫端負責白名單檢查 */
   tableContents(table: string, rows: number): Promise<QueryResult>;
   /** 執行自由 SELECT(Data Preview);呼叫端負責 SQL 與白名單檢查 */
@@ -488,6 +501,18 @@ export class RealAdtService implements AdtService {
 
   async runClass(className: string) {
     return this.guard(() => this.client.runClass(className.toUpperCase()));
+  }
+
+  async ddicElement(name: string) {
+    return this.guard(() => this.client.ddicElement(name));
+  }
+
+  async dataElementProperties(url: string) {
+    return this.guard(() => this.client.getDataElementProperties(url)) as Promise<DdicTypeProperties>;
+  }
+
+  async domainProperties(url: string) {
+    return this.guard(() => this.client.getDomainProperties(url)) as Promise<DdicTypeProperties>;
   }
 
   async tableContents(table: string, rows: number) {

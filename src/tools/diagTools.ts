@@ -12,8 +12,8 @@ import type { AuditLogger } from "../safety/audit.js";
 import { GuardViolationError } from "../safety/guards.js";
 import type { SerialQueue } from "../safety/serialQueue.js";
 import { assertTableName, assertTablesAllowed, validateSelectSql } from "../safety/sql.js";
-import { formatQueryResult } from "./formatters.js";
-import { fail, ok } from "./result.js";
+import { formatDataElement, formatDdicFields, formatDomain, formatQueryResult } from "./formatters.js";
+import { fail, ok, truncate } from "./result.js";
 
 /** data_preview 筆數:預設與上限 */
 export const DATA_PREVIEW_DEFAULT_ROWS = 100;
@@ -97,4 +97,77 @@ export function registerDiagnosticTools(
       }
     );
   }
+
+  // ───────────────────────────── D2 ddic_info ─────────────────────────────
+  server.registerTool(
+    "ddic_info",
+    {
+      title: "讀取 DDIC 定義",
+      description:
+        "讀取 ABAP Dictionary 定義:資料表與 CDS view 的欄位(key、資料元素、型別、長度)、結構定義、" +
+        "資料元素(型別與欄位標籤)、domain(型別與固定值)。同名物件(例如同名的資料元素與 domain)會一併列出," +
+        "可用 object_type 限定。唯讀。",
+      inputSchema: {
+        name: z.string().min(1).describe("名稱,例如 /DMO/TRAVEL、/DMO/STATUS、BAPIRET2"),
+        object_type: z
+          .enum(DDIC_TYPES)
+          .optional()
+          .describe("選填:TABL/DT 資料表、TABL/DS 結構、DDLS/DF CDS、DTEL/DE 資料元素、DOMA/DD domain"),
+      },
+    },
+    async ({ name, object_type }) => {
+      try {
+        const n = name.trim().toUpperCase();
+        const hits = (await adt.searchObject(n, object_type, 20)).filter(
+          (h) =>
+            h["adtcore:name"].toUpperCase() === n &&
+            (DDIC_TYPES as readonly string[]).includes(h["adtcore:type"])
+        );
+        if (hits.length === 0) {
+          return ok(`找不到名為 ${n} 的 DDIC 物件${object_type ? `(類型 ${object_type})` : ""}。可先用 search_objects 確認名稱。`);
+        }
+        const sections: string[] = [];
+        for (const h of hits) {
+          const type = h["adtcore:type"] as (typeof DDIC_TYPES)[number];
+          const uri = h["adtcore:uri"];
+          const head = `## ${n} [${type}${DDIC_LABEL[type] ? ` ${DDIC_LABEL[type]}` : ""}]` +
+            (h["adtcore:description"] ? ` ${h["adtcore:description"]}` : "");
+          if (type === "DTEL/DE") sections.push(`${head}\n${formatDataElement(await adt.dataElementProperties(uri))}`);
+          else if (type === "DOMA/DD") sections.push(`${head}\n${formatDomain(await adt.domainProperties(uri))}`);
+          else {
+            const el = await adt.ddicElement(n);
+            if (el.children?.length) {
+              sections.push(`${head}\n${formatDdicFields(el)}`);
+            } else {
+              // A4H 實測:結構(TABL/DS)的 ddicElement 回空,改讀 define structure 原始碼
+              const src = await adt.getObjectSource(`${uri}/source/main`);
+              const lines = src.split(/\r?\n/);
+              sections.push(
+                `${head}\n定義原始碼(${lines.length} 行):\n` +
+                  lines.slice(0, DDIC_SOURCE_MAX_LINES).join("\n") +
+                  (lines.length > DDIC_SOURCE_MAX_LINES ? `\n…(已截斷,僅顯示前 ${DDIC_SOURCE_MAX_LINES} 行)` : "")
+              );
+            }
+          }
+        }
+        return ok(truncate(sections.join("\n\n"), DIAG_MAX_OUTPUT));
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
 }
+
+/** ddic_info 支援的類型 */
+const DDIC_TYPES = ["TABL/DT", "TABL/DS", "DDLS/DF", "DTEL/DE", "DOMA/DD"] as const;
+const DDIC_LABEL: Record<string, string> = {
+  "TABL/DT": "資料表",
+  "TABL/DS": "結構",
+  "DDLS/DF": "CDS",
+  "DTEL/DE": "資料元素",
+  "DOMA/DD": "domain",
+};
+/** 結構定義原始碼最多顯示行數 */
+const DDIC_SOURCE_MAX_LINES = 200;
+/** 診斷類工具的輸出上限(字元) */
+export const DIAG_MAX_OUTPUT = 20_000;

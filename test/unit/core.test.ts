@@ -48,6 +48,9 @@ import {
 import {
   formatAtcResult,
   formatClassComponents,
+  formatDataElement,
+  formatDdicFields,
+  formatDomain,
   formatQueryResult,
   formatUnitTestResults,
   formatWhereUsed,
@@ -96,6 +99,9 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     runClass: vi.fn(async () => ""),
     createTransport: vi.fn(async () => ""),
     tableContents: vi.fn(async () => ({ columns: [], values: [] }) as never),
+    ddicElement: vi.fn(async () => ({ type: "", name: "", properties: { elementProps: false, annotations: [] }, children: [] }) as never),
+    dataElementProperties: vi.fn(async () => ({ metaData: { name: "" }, properties: {} })),
+    domainProperties: vi.fn(async () => ({ metaData: { name: "" }, properties: {} })),
     runQuery: vi.fn(async () => ({ columns: [], values: [] }) as never),
     classComponents: vi.fn(async () => ({ "adtcore:name": "ZCL_X", "adtcore:type": "CLAS/OC", visibility: "public", links: [], components: [] }) as never),
     username: () => "DEVELOPER",
@@ -1045,6 +1051,61 @@ describe("data_preview 的 SQL 護欄", () => {
     const f2 = formatQueryResult(many, { maxTotal: 5_000 });
     expect(f2.truncatedRows).toBe(true);
     expect(f2.text.length).toBeLessThanOrEqual(5_000);
+  });
+});
+
+// ───────────────────────── ddic_info(v0.4 D2)─────────────────────────
+
+describe("ddic_info", () => {
+  const hit = (name: string, type: string, uri: string) => ({ "adtcore:name": name, "adtcore:type": type, "adtcore:uri": uri }) as never;
+
+  it("表欄位:只列真正的欄位(排除 .include 與 package 節點,A4H 實際回應)", () => {
+    const el = JSON.parse(fs.readFileSync(path.resolve("test/unit/fixtures/ddic-travel.a4h.json"), "utf8"));
+    const text = formatDdicFields(el);
+    expect(text).toContain("欄位(15 個)");
+    expect(text).toContain("travel_id | key | /dmo/travel_id | numc | 8");
+    expect(text).toContain("booking_fee |  | /dmo/booking_fee | curr | 16,2");
+    expect(text).not.toContain(".include");
+    expect(text).not.toContain("/DMO/FLIGHT_LEGACY");
+  });
+
+  it("domain 固定值、資料元素標籤", () => {
+    const dom = formatDomain({
+      metaData: { name: "/DMO/STATUS", description: "Status" },
+      properties: { typeInformation: { datatype: "CHAR", length: 1, decimals: 0 }, valueInformation: { fixValues: [{ low: "B", text: "Booked" }, { low: "N", text: "New" }] } },
+    });
+    expect(dom).toContain("型別:CHAR 長度 1");
+    expect(dom).toContain("固定值(2 個)");
+    expect(dom).toContain("- B:Booked");
+    const de = formatDataElement({
+      metaData: { name: "/DMO/TRAVEL_ID", description: "Travel ID" },
+      properties: { typeName: "/DMO/TRAVEL_ID", dataType: "NUMC", dataTypeLength: 8, fieldLabels: { shortFieldLabel: "Travel ID", longFieldLabel: "Travel Number" } },
+    });
+    expect(de).toContain("型別:NUMC 長度 8");
+    expect(de).toContain("長「Travel Number」");
+  });
+
+  it("同名的資料元素與 domain 一併列出;結構改讀定義原始碼;找不到時說明", async () => {
+    const adt = mockAdt({
+      searchObject: vi.fn(async (q: string) =>
+        q === "/DMO/TRAVEL_ID"
+          ? [hit("/DMO/TRAVEL_ID", "DTEL/DE", "/u/de"), hit("/DMO/TRAVEL_ID", "DOMA/DD", "/u/dom"), hit("/DMO/TRAVEL_ID_X", "DTEL/DE", "/u/x")]
+          : q === "BAPIRET2" ? [hit("BAPIRET2", "TABL/DS", "/sap/bc/adt/ddic/structures/bapiret2")] : []
+      ),
+      dataElementProperties: vi.fn(async () => ({ metaData: { name: "/DMO/TRAVEL_ID" }, properties: { dataType: "NUMC", dataTypeLength: 8 } })),
+      domainProperties: vi.fn(async () => ({ metaData: { name: "/DMO/TRAVEL_ID" }, properties: { typeInformation: { datatype: "NUMC", length: 8 } } })),
+      ddicElement: vi.fn(async () => ({ type: "", name: "", properties: { elementProps: false, annotations: [] }, children: [] }) as never),
+      getObjectSource: vi.fn(async () => "define structure bapiret2 {\n  type : bapi_mtype;\n}"),
+    });
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" }));
+    const r = await call("ddic_info", { name: "/dmo/travel_id" });
+    expect(r.text).toContain("[DTEL/DE 資料元素]");
+    expect(r.text).toContain("[DOMA/DD domain]");
+    expect(r.text).not.toContain("TRAVEL_ID_X");
+    const s = await call("ddic_info", { name: "bapiret2" });
+    expect(adt.getObjectSource).toHaveBeenCalledWith("/sap/bc/adt/ddic/structures/bapiret2/source/main");
+    expect(s.text).toContain("define structure bapiret2");
+    expect((await call("ddic_info", { name: "ZNOPE" })).text).toContain("找不到名為 ZNOPE");
   });
 });
 

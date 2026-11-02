@@ -1,0 +1,250 @@
+{
+ "type": "TABL/DT",
+ "name": "/dmo/travel",
+ "properties": {
+  "elementProps": false,
+  "annotations": []
+ },
+ "children": [
+  {
+   "type": "TABL/DTF",
+   "name": "client",
+   "properties": {
+    "elementProps": {
+     "ddicIsKey": true,
+     "ddicDataType": "clnt",
+     "ddicLength": 3
+    },
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DTF",
+   "name": "travel_id",
+   "properties": {
+    "elementProps": {
+     "ddicIsKey": true,
+     "ddicDataElement": "/dmo/travel_id",
+     "ddicDataType": "numc",
+     "ddicLength": 8
+    },
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DS",
+   "name": ".include",
+   "properties": {
+    "elementProps": false,
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DTF",
+   "name": "agency_id",
+   "properties": {
+    "elementProps": {
+     "ddicIsKey": false,
+     "ddicDataElement": "/dmo/agency_id",
+     "ddicDataType": "numc",
+     "ddicLength": 6
+    },
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DTF",
+   "name": "customer_id",
+   "properties": {
+    "elementProps": {
+     "ddicIsKey": false,
+     "ddicDataElement": "/dmo/customer_id",
+     "ddicDataType": "numc",
+     "ddicLength": 6
+    },
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DTF",
+   "name": "begin_date",
+   "properties": {
+    "elementProps": {
+     "ddicIsKey": false,
+     "ddicDataElement": "/dmo/begin_date",
+     "ddicDataType": "dats",
+     "ddicLength": 8
+    },
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DTF",
+   "name": "end_date",
+   "properties": {
+    "elementProps": {
+     "ddicIsKey": false,
+     "ddicDataElement": "/dmo/end_date",
+     "ddicDataType": "dats",
+     "ddicLength": 8
+    },
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DTF",
+   "name": "booking_fee",
+   "properties": {
+    "elementProps": {
+     "ddicIsKey": false,
+     "ddicDataElement": "/dmo/booking_fee",
+     "ddicDataType": "curr",
+     "ddicLength": 16,
+     "ddicDecimals": 2
+    },
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DTF",
+   "name": "total_price",
+   "properties": {
+    "elementProps": {
+     "ddicIsKey": false,
+     "ddicDataElement": "/dmo/total_price",
+     "ddicDataType": "curr",
+     "ddicLength": 16,
+     "ddicDecimals": 2
+    },
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DTF",
+   "name": "currency_code",
+   "properties": {
+    "elementProps": {
+     "ddicIsKey": false,
+     "ddicDataElement": "/dmo/currency_code",
+     "ddicDataType": "cuky",
+     "ddicLength": 5
+    },
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DTF",
+   "name": "description",
+   "properties": {
+    "elementProps": {
+     "ddicIsKey": false,
+     "ddicDataElement": "/dmo/description",
+     "ddicDataType": "sstring",
+     "ddicLength": 1024
+    },
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DTF",
+   "name": "status",
+   "properties": {
+    "elementProps": {
+     "ddicIsKey": false,
+     "ddicDataElement": "/dmo/travel_status",
+     "ddicDataType": "char",
+     "ddicLength": 1
+    },
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DS",
+   "name": ".include",
+   "properties": {
+    "elementProps": false,
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DTF",
+   "name": "createdby",
+   "properties": {
+    "elementProps": {
+     "ddicIsKey": false,
+     "ddicDataElement": "syuname",
+     "ddicDataType": "char",
+     "ddicLength": 12
+    },
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DTF",
+   "name": "createdat",
+   "properties": {
+    "elementProps": {
+     "ddicIsKey": false,
+     "ddicDataElement": "timestampl",
+     "ddicDataType": "dec",
+     "ddicLength": 21,
+     "ddicDecimals": 7
+    },
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DTF",
+   "name": "lastchangedby",
+   "properties": {
+    "elementProps": {
+     "ddicIsKey": false,
+     "ddicDataElement": "syuname",
+     "ddicDataType": "char",
+     "ddicLength": 12
+    },
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "TABL/DTF",
+   "name": "lastchangedat",
+   "properties": {
+    "elementProps": {
+     "ddicIsKey": false,
+     "ddicDataElement": "timestampl",
+     "ddicDataType": "dec",
+     "ddicLength": 21,
+     "ddicDecimals": 7
+    },
+    "annotations": []
+   },
+   "children": []
+  },
+  {
+   "type": "DEVC/K",
+   "name": "/DMO/FLIGHT_LEGACY",
+   "properties": {
+    "elementProps": false,
+    "annotations": []
+   },
+   "children": []
+  }
+ ]
+}

@@ -1,8 +1,8 @@
 /**
  * tools/formatters.ts — 把 ADT 回傳的結構整理成 AI 好讀的文字
  */
-import type { ClassComponent, QueryResult, UnitTestAlert, UnitTestClass } from "abap-adt-api";
-import type { AtcResult } from "../adt/client.js";
+import type { ClassComponent, DdicElement, QueryResult, UnitTestAlert, UnitTestClass } from "abap-adt-api";
+import type { AtcResult, DdicTypeProperties } from "../adt/client.js";
 import type { UsageObject, UsageSnippet } from "../adt/whereUsed.js";
 import { objectNameFromUrl } from "../safety/guards.js";
 
@@ -166,6 +166,54 @@ export function formatQueryResult(
     shown++;
   }
   return { text: lines.join("\n"), rows: shown, truncatedRows: shown < r.values.length };
+}
+
+/** 表 / CDS view 的欄位 → 文字表格(欄位、key、資料元素、型別、長度) */
+export function formatDdicFields(el: DdicElement): string {
+  // A4H 實測:children 也含 .include 節點與 package 節點,它們沒有 elementProps,不是欄位
+  const fields = el.children.filter((c) => !!c.properties.elementProps);
+  const rows = fields.map((c) => {
+    const p = c.properties.elementProps || undefined;
+    const len = p ? `${p.ddicLength ?? ""}${p.ddicDecimals ? `,${p.ddicDecimals}` : ""}` : "";
+    return [c.name, p?.ddicIsKey ? "key" : "", p?.ddicDataElement ?? "", p?.ddicDataType ?? "", len, p?.ddicLabelMedium ?? ""].join(" | ");
+  });
+  return [`欄位(${fields.length} 個):`, "欄位 | key | 資料元素 | 型別 | 長度 | 標籤", ...rows].join("\n");
+}
+
+/** 資料元素:型別、長度與各長度的欄位標籤 */
+export function formatDataElement(p: DdicTypeProperties): string {
+  const x = p.properties as {
+    typeName?: string; dataType?: string; dataTypeLength?: number; dataTypeDecimals?: number;
+    fieldLabels?: Record<string, string | number>;
+  };
+  const labels = x.fieldLabels ?? {};
+  return [
+    `資料元素 ${p.metaData.name}:${p.metaData.description ?? ""}`,
+    `型別:${x.typeName && x.typeName !== p.metaData.name ? `${x.typeName}(` : ""}${x.dataType ?? "?"} 長度 ${x.dataTypeLength ?? "?"}` +
+      `${x.dataTypeDecimals ? ` 小數 ${x.dataTypeDecimals}` : ""}${x.typeName && x.typeName !== p.metaData.name ? ")" : ""}`,
+    `欄位標籤:短「${labels.shortFieldLabel ?? ""}」、中「${labels.mediumFieldLabel ?? ""}」、長「${labels.longFieldLabel ?? ""}」、標題「${labels.headingFieldLabel ?? ""}」`,
+    p.metaData.packageName ? `package:${p.metaData.packageName}` : "",
+  ].filter(Boolean).join("\n");
+}
+
+/** domain:型別、長度、固定值(value table) */
+export function formatDomain(p: DdicTypeProperties): string {
+  const x = p.properties as {
+    typeInformation?: { datatype?: string; length?: number; decimals?: number };
+    outputInformation?: { lowercase?: boolean };
+    valueInformation?: { valueTableRef?: string; fixValues?: { low: string; high?: string; text?: string }[] };
+  };
+  const t = x.typeInformation ?? {};
+  const fix = x.valueInformation?.fixValues ?? [];
+  return [
+    `domain ${p.metaData.name}:${p.metaData.description ?? ""}`,
+    `型別:${t.datatype ?? "?"} 長度 ${t.length ?? "?"}${t.decimals ? ` 小數 ${t.decimals}` : ""}${x.outputInformation?.lowercase ? "(可小寫)" : ""}`,
+    x.valueInformation?.valueTableRef ? `value table:${x.valueInformation.valueTableRef}` : "",
+    fix.length
+      ? `固定值(${fix.length} 個):\n${fix.map((f) => `- ${f.low}${f.high ? `–${f.high}` : ""}:${f.text ?? ""}`).join("\n")}`
+      : "沒有固定值。",
+    p.metaData.packageName ? `package:${p.metaData.packageName}` : "",
+  ].filter(Boolean).join("\n");
 }
 
 /** ATC 優先級說明(1 最嚴重) */
