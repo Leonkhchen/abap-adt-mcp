@@ -190,7 +190,8 @@ export function registerWriteDevTools(
       description:
         "建立新的 ABAP 物件(只建立空殼與 SAP 產生的範本,原始碼請之後用 write_source 寫入並啟用)。" +
         "支援 CLAS/OC(class)、INTF/OI(interface)、PROG/P(program)、DDLS/DF(CDS data definition)、" +
-        "BDEF/BDO(behavior definition,名稱須與已存在的 root view entity 相同)。" +
+        "BDEF/BDO(behavior definition,名稱須與已存在的 root view entity 相同)、" +
+        "TABL/DT(資料表,名稱最多 16 字元;建立後用 write_source 寫入 define table 原始碼並啟用)。" +
         "會先檢查名稱是否可用;package 不是 $TMP 等本機 package 時必須提供 transport(可用 list_transports 查詢)。",
       inputSchema: {
         object_type: z.enum(CREATABLE_TYPES).describe("物件類型"),

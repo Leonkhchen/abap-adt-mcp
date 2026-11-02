@@ -458,6 +458,18 @@ describe("create_object", () => {
     expect(names).not.toContain("create_object");
   });
 
+  it("TABL/DT:建立資料表(v0.5 E1),URI 為 ddic/tables,同樣經兩道白名單", async () => {
+    expect(newObjectUrl("TABL/DT", "ZMCP_TAB")).toBe("/sap/bc/adt/ddic/tables/zmcp_tab");
+    const adt = mockAdt();
+    const call = await connectTools(adt);
+    const r = await call("create_object", { object_type: "TABL/DT", name: "zmcp_tab", package_name: "$TMP", description: "t" });
+    expect(r.text).toContain("已建立 TABL/DT ZMCP_TAB");
+    expect(r.text).toContain("/sap/bc/adt/ddic/tables/zmcp_tab");
+    expect(adt.createObject).toHaveBeenCalledWith(expect.objectContaining({ type: "TABL/DT", name: "ZMCP_TAB" }));
+    const denied = await call("create_object", { object_type: "TABL/DT", name: "T000X", package_name: "$TMP", description: "t" });
+    expect(denied.text).toContain("前綴白名單");
+  });
+
   it("BDEF 建立 XML 與 validation 解析", () => {
     const xml = bdefCreateBody({ name: "zi_demo", packageName: "$tmp", description: 'a "b" <c>', responsible: "dev", language: "EN" });
     expect(xml).toContain('adtcore:name="ZI_DEMO"');

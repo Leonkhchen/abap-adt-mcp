@@ -1,12 +1,13 @@
 /**
  * adt/objectTypes.ts — create_object 支援的物件類型
  *
- * CLAS/OC、INTF/OI、PROG/P、DDLS/DF 由 abap-adt-api 的 createObject 建立;
+ * CLAS/OC、INTF/OI、PROG/P、DDLS/DF、TABL/DT 由 abap-adt-api 的 createObject 建立;
  * BDEF/BDO 不在 abap-adt-api 支援範圍內,改由本專案直接呼叫 ADT
  * (/sap/bc/adt/bo/behaviordefinitions,格式已在 A4H 實測)。
+ * TABL/DT(資料表)建立後是 SAP 的範本,欄位以 write_source 寫入 define table 原始碼並啟用。
  */
 
-export const CREATABLE_TYPES = ["CLAS/OC", "INTF/OI", "PROG/P", "DDLS/DF", "BDEF/BDO"] as const;
+export const CREATABLE_TYPES = ["CLAS/OC", "INTF/OI", "PROG/P", "DDLS/DF", "BDEF/BDO", "TABL/DT"] as const;
 export type CreatableType = (typeof CREATABLE_TYPES)[number];
 
 interface TypeInfo {
@@ -23,6 +24,7 @@ export const TYPE_INFO: Record<CreatableType, TypeInfo> = {
   "PROG/P": { collection: "/sap/bc/adt/programs/programs", label: "Program", maxLength: 30 },
   "DDLS/DF": { collection: "/sap/bc/adt/ddic/ddl/sources", label: "CDS Data Definition", maxLength: 30 },
   "BDEF/BDO": { collection: "/sap/bc/adt/bo/behaviordefinitions", label: "Behavior Definition", maxLength: 30 },
+  "TABL/DT": { collection: "/sap/bc/adt/ddic/tables", label: "Database Table", maxLength: 16 },
 };
 
 /** source URI 的尾端:/source/main 或 class 的 include(例如 /includes/testclasses) */
