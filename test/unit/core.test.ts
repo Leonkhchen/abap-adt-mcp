@@ -58,6 +58,14 @@ import {
 import { assertTablesAllowed, validateSelectSql } from "../../src/safety/sql.js";
 import { extractDumpChapters, normalizeDumpId, parseDumpMeta, summarizeDump } from "../../src/adt/dumps.js";
 import { activationBody, parseActivationResponse } from "../../src/adt/activation.js";
+import {
+  applyNamePrefix,
+  findGeneratorLinks,
+  parseObjectRefs,
+  parseODataV4Service,
+  parseValidationMessages,
+  serviceBindingName,
+} from "../../src/adt/rapGenerator.js";
 import { groupInactive, revisionLabel } from "../../src/tools/diagTools.js";
 import { unifiedDiff } from "../../src/tools/diff.js";
 import { parseUsageReferences, parseUsageSnippets, usageSnippetsBody } from "../../src/adt/whereUsed.js";
@@ -110,6 +118,11 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     prettyPrint: vi.fn(async (s: string) => ({ source: s, style: "", indentation: false })),
     inactiveObjects: vi.fn(async () => []),
     revisions: vi.fn(async () => []),
+    rapGeneratorLinks: vi.fn(async () => undefined),
+    rapPreview: vi.fn(async () => ({ content: {}, validation: { ok: true, messages: [] }, objects: [] })),
+    rapGenerate: vi.fn(async () => []),
+    rapPublish: vi.fn(async () => ({ ok: true, message: "" })),
+    odataV4Service: vi.fn(async () => ({ serviceUrl: "", leadingEntity: "" })),
     revisionContent: vi.fn(async () => ""),
     activateObjects: vi.fn(async () => ({ success: true, messages: [], inactive: [] })),
     dumpDetail: vi.fn(async () => ({ meta: { title: "", error: "", exception: "", program: "", datetime: "", author: "", contentsUri: "", chapters: [] }, text: "" })),
@@ -1385,6 +1398,146 @@ describe("版本歷史與 diff", () => {
     expect(adt.revisionContent).toHaveBeenCalledWith(expect.stringContaining("/00000/"), "/sap/bc/adt/oo/classes/zcl_x/source/main");
     expect((await call("get_revisions", { object_url: "/u", compare_from: 1 })).isError).toBe(true);
     expect((await call("get_revisions", { object_url: "/u", compare_from: 1, compare_to: 5 })).text).toContain("1–2");
+  });
+});
+
+// ───────────────────────── rap_generate(v0.5 E2)─────────────────────────
+
+describe("RAP 產生器", () => {
+  const fixture = (n: string) => fs.readFileSync(path.resolve("test/unit/fixtures", n), "utf8");
+  const content = () => JSON.parse(fixture("rap-content.a4h.json"));
+  const links = {
+    content: "/sap/bc/adt/rap/generators/ui/ui-service/content",
+    validation: "/sap/bc/adt/rap/generators/ui/ui-service/validation",
+    preview: "/sap/bc/adt/rap/generators/ui/ui-service/preview",
+    generator: "/sap/bc/adt/rap/generators/ui/ui-service",
+  };
+
+  it("從 A4H 的產生器列表找出 ui-service 的連結(新版框架路徑,去掉 query)", () => {
+    expect(findGeneratorLinks(fixture("rap-generators.a4h.xml"), "ui-service")).toEqual(links);
+    expect(findGeneratorLinks(fixture("rap-generators.a4h.xml"), "uiservice")).toBeUndefined();
+  });
+
+  it("preview 解析出 14 個物件(A4H 實際回應)", () => {
+    const objs = parseObjectRefs(fixture("rap-preview.a4h.xml"));
+    expect(objs).toHaveLength(14);
+    expect(objs).toContainEqual({ uri: "/sap/bc/adt/businessservices/bindings/zui_mcp_rap_src_o4", type: "SRVB/SVB", name: "ZUI_MCP_RAP_SRC_O4" });
+    expect(objs).toContainEqual({ uri: "/sap/bc/adt/ddic/tables/zmcp_rap_src_d", type: "TABL/DT", name: "ZMCP_RAP_SRC_D" });
+  });
+
+  it("名稱前綴取代開頭的 Z;草稿表、來源表與原始名稱欄位不變;不修改輸入", () => {
+    const c = content();
+    const p = applyNamePrefix(c, "ZLEON_") as typeof c;
+    expect(p.businessObject.dataModelEntity.entityName).toBe("ZLEON_R_MCP_RAP_SRC");
+    expect(p.businessObject.behavior.implementationClassName).toBe("ZLEON_BP_R_MCP_RAP_SRC");
+    expect(p.serviceProjection.projectionEntity.entityName).toBe("ZLEON_C_MCP_RAP_SRC");
+    expect(p.businessService.serviceBinding.serviceBindingName).toBe("ZLEON_UI_MCP_RAP_SRC_O4");
+    expect(p.businessObject.behavior.draftTable).toBe("ZMCP_RAP_SRC_D");
+    expect(p.general.referencedObjectName).toBe("ZMCP_RAP_SRC");
+    expect(p.businessObject.dataModelEntity.entityNameOrgn).toBe("ZR_MCP_RAP_SRC");
+    expect(c.businessObject.dataModelEntity.entityName).toBe("ZR_MCP_RAP_SRC");
+    expect(serviceBindingName(p)).toBe("ZLEON_UI_MCP_RAP_SRC_O4");
+  });
+
+  it("validation 與 OData V4 服務資訊解析", () => {
+    const okXml = `<validationMessages:validationMessages xmlns:validationMessages="x"><validationMessages:validationMessage><validationMessages:severity>OK</validationMessages:severity></validationMessages:validationMessage></validationMessages:validationMessages>`;
+    expect(parseValidationMessages(okXml)).toEqual({ ok: true, messages: [] });
+    const errXml = `<v:validationMessages xmlns:v="x"><v:validationMessage><v:severity>ERROR</v:severity><v:shortText>Object ZR_X already exists</v:shortText></v:validationMessage></v:validationMessages>`;
+    expect(parseValidationMessages(errXml)).toEqual({ ok: false, messages: ["Object ZR_X already exists"] });
+    expect(parseODataV4Service(fixture("rap-odatav4.a4h.xml"))).toEqual({
+      serviceUrl: "/sap/opu/odata4/sap/zmcp1_ui_mcp_rap_src_o4/srvd/sap/zmcp1_ui_mcp_rap_src_o4/0001/",
+      leadingEntity: "ZMCP1_C_MCP_RAP_SRC",
+    });
+  });
+
+  const rapAdt = (overrides: Partial<AdtService> = {}) =>
+    mockAdt({
+      rapGeneratorLinks: vi.fn(async () => links),
+      rapPreview: vi.fn(async () => ({ content: content(), validation: { ok: true, messages: [] }, objects: parseObjectRefs(fixture("rap-preview.a4h.xml")) })),
+      rapGenerate: vi.fn(async () => []),
+      rapPublish: vi.fn(async () => ({ ok: true, message: "ZUI_MCP_RAP_SRC_O4 published locally" })),
+      odataV4Service: vi.fn(async () => ({ serviceUrl: "/sap/opu/odata4/sap/x/srvd/sap/x/0001/", leadingEntity: "ZC_MCP_RAP_SRC" })),
+      ...overrides,
+    });
+
+  it("預設只預覽、不產生;回傳物件清單與確認方式", async () => {
+    const adt = rapAdt();
+    const call = await connectTools(adt);
+    const r = await call("rap_generate", { source_table: "zmcp_rap_src", package_name: "$tmp", name_prefix: "ZLEON_" });
+    expect(r.isError).toBe(false);
+    expect(r.text).toContain("預覽(尚未建立任何物件)");
+    expect(r.text).toContain("14 個物件");
+    expect(r.text).toContain("confirm=true");
+    expect(adt.rapPreview).toHaveBeenCalledWith(links, "/sap/bc/adt/ddic/tables/zmcp_rap_src", "$TMP", "ZLEON_");
+    expect(adt.rapGenerate).not.toHaveBeenCalled();
+  });
+
+  it("confirm 後產生、每個物件寫 audit、發佈並回傳服務資訊", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "abap-mcp-rap-"));
+    const auditPath = path.join(dir, "audit.jsonl");
+    try {
+      const adt = rapAdt();
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerTools(server, adt, makeConfig(), new AuditLogger(auditPath));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(clientT);
+      const r = (await client.callTool({ name: "rap_generate", arguments: { source_table: "ZMCP_RAP_SRC", package_name: "$TMP", confirm: true } })) as { content: { text: string }[] };
+      const text = r.content[0].text;
+      expect(text).toContain("已在 package $TMP 由 ZMCP_RAP_SRC 產生 14 個物件");
+      expect(text).toContain("已發佈");
+      expect(text).toContain("OData V4 服務:https://sap.example.com:44300/sap/opu/odata4/sap/x/srvd/sap/x/0001/");
+      expect(text).toContain("Fiori Elements preview");
+      expect(adt.rapGenerate).toHaveBeenCalledWith(links, "/sap/bc/adt/ddic/tables/zmcp_rap_src", expect.any(Object), "");
+      const entries = fs.readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(entries.filter((e) => e.action === "rap_generate")).toHaveLength(14);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("preview 有任一物件不在名稱白名單 → 預覽提示、confirm 時整批拒絕", async () => {
+    const objs = [...parseObjectRefs(fixture("rap-preview.a4h.xml")), { uri: "/sap/bc/adt/ddic/ddl/sources/cl_bad", type: "DDLS/DF", name: "CL_BAD" }];
+    const adt = rapAdt({ rapPreview: vi.fn(async () => ({ content: content(), validation: { ok: true, messages: [] }, objects: objs })) });
+    const call = await connectTools(adt);
+    const pre = await call("rap_generate", { source_table: "ZMCP_RAP_SRC", package_name: "$TMP" });
+    expect(pre.text).toContain("確認時會整批拒絕");
+    const r = await call("rap_generate", { source_table: "ZMCP_RAP_SRC", package_name: "$TMP", confirm: true });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("整批拒絕");
+    expect(r.text).toContain("CL_BAD");
+    expect(adt.rapGenerate).not.toHaveBeenCalled();
+  });
+
+  it("package 白名單、非本機 package 要 transport、產生器不存在、檢查未通過", async () => {
+    const adt = rapAdt();
+    const call = await connectTools(adt);
+    expect((await call("rap_generate", { source_table: "ZT", package_name: "SAP_PKG" })).text).toContain("package 白名單");
+    expect((await call("rap_generate", { source_table: "ZT", package_name: "ZPKG" })).text).toContain("transport");
+    const none = await connectTools(rapAdt({ rapGeneratorLinks: vi.fn(async () => undefined) }));
+    expect((await none("rap_generate", { source_table: "ZT", package_name: "$TMP" })).text).toContain("沒有可用的 RAP 產生器");
+    const bad = await connectTools(rapAdt({ rapPreview: vi.fn(async () => ({ content: content(), validation: { ok: false, messages: ["Table ZT has no key"] }, objects: [] })) }));
+    expect((await bad("rap_generate", { source_table: "ZT", package_name: "$TMP", confirm: true })).text).toContain("Table ZT has no key");
+  });
+
+  it("產生逾時(5xx)時回報已存在與缺少的物件", async () => {
+    const http500 = Object.assign(new Error("Request failed with status code 500"), { status: 500 });
+    const objs = parseObjectRefs(fixture("rap-preview.a4h.xml"));
+    const adt = rapAdt({
+      rapGenerate: vi.fn(async () => { throw http500; }),
+      searchObject: vi.fn(async (q: string, t?: string) => (q === "ZUI_MCP_RAP_SRC_O4" && t === "SRVB/SVB" ? [] : [{ "adtcore:name": q, "adtcore:type": t }]) as never),
+    });
+    const call = await connectTools(adt);
+    const r = await call("rap_generate", { source_table: "ZMCP_RAP_SRC", package_name: "$TMP", confirm: true });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain(`已存在 ${objs.length - 1}/${objs.length}`);
+    expect(r.text).toContain("SRVB/SVB  ZUI_MCP_RAP_SRC_O4");
+  });
+
+  it("唯讀模式不註冊", async () => {
+    const call = await connectTools(rapAdt(), makeConfig({ ABAP_MCP_READONLY: "true" }));
+    expect((await call("rap_generate", { source_table: "ZT", package_name: "$TMP" })).isError).toBe(true);
   });
 });
 

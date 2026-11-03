@@ -16,6 +16,7 @@ import { ensureTestInclude, lockedWrite } from "../workflows/lockedWrite.js";
 import { SerialQueue } from "../safety/serialQueue.js";
 import { registerAnalysisTools, registerWriteDevTools } from "./devTools.js";
 import { registerDiagnosticTools } from "./diagTools.js";
+import { registerRapTools } from "./rapTools.js";
 import { baseObjectUrl as baseOf, isSourceUrl } from "../adt/objectTypes.js";
 import { VERSION } from "../version.js";
 
@@ -458,4 +459,7 @@ export function registerTools(
 
   // v0.3 開發循環的寫入/執行類工具(見 tools/devTools.ts)
   registerWriteDevTools(server, adt, cfg, audit, writes);
+
+  // v0.5 RAP 產生器(見 tools/rapTools.ts)
+  registerRapTools(server, adt, cfg, audit, writes);
 }
