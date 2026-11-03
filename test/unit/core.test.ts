@@ -1584,6 +1584,58 @@ describe("abapgit_repos", () => {
   });
 });
 
+// ───────────────────────── MCP prompts / resources(v0.5 E4)─────────────────────────
+
+describe("MCP prompts 與 resources", () => {
+  const connect = async (cfg: ReturnType<typeof makeConfig>) => {
+    const server = new McpServer({ name: "unit", version: "0" });
+    registerTools(server, mockAdt(), cfg, new AuditLogger(""));
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverT);
+    const client = new Client({ name: "c", version: "0" });
+    await client.connect(clientT);
+    return client;
+  };
+
+  it("列出 3 個 prompts 與 3 個 resources(唯讀模式也有)", async () => {
+    const client = await connect(makeConfig({ ABAP_MCP_READONLY: "true" }));
+    expect((await client.listPrompts()).prompts.map((p) => p.name).sort()).toEqual(["clean-abap-review", "fix-dump", "rap-bo-from-table"]);
+    expect((await client.listResources()).resources.map((r) => r.uri).sort()).toEqual([
+      "abap-mcp://guides/clean-abap",
+      "abap-mcp://guides/naming",
+      "abap-mcp://guides/safety",
+    ]);
+  });
+
+  it("prompts 帶入參數並引導正確的工具流程", async () => {
+    const client = await connect(makeConfig());
+    const text = async (name: string, args: Record<string, string>) =>
+      ((await client.getPrompt({ name, arguments: args })).messages[0].content as { text: string }).text;
+    const review = await text("clean-abap-review", { object_url: "/sap/bc/adt/oo/classes/zcl_x" });
+    expect(review).toContain("/sap/bc/adt/oo/classes/zcl_x");
+    expect(review).toContain("run_atc");
+    expect(review).toContain("abap-mcp://guides/clean-abap");
+    const rap = await text("rap-bo-from-table", { table_name: "ZLEON_ORDERS", name_prefix: "ZLEON_" });
+    expect(rap).toContain("package $TMP");
+    expect(rap).toContain("rap_generate");
+    expect(rap).toContain("confirm=true");
+    expect(rap).toContain("name_prefix=ZLEON_");
+    const dump = await text("fix-dump", { class_name: "zcl_bad" });
+    expect(dump).toContain("ZCL_BAD=");
+    expect(dump).toMatch(/list_dumps[\s\S]*dump_detail[\s\S]*write_source[\s\S]*run_class/);
+  });
+
+  it("resources 依目前設定產生;Clean ABAP 附官方連結", async () => {
+    const client = await connect(makeConfig({ ABAP_MCP_ALLOWED_PACKAGES: "$TMP,$LEON_PRACTICE,Z*", ABAP_MCP_READONLY: "true" }));
+    const read = async (uri: string) => ((await client.readResource({ uri })).contents[0] as { text: string }).text;
+    expect(await read("abap-mcp://guides/naming")).toContain("$TMP、$LEON_PRACTICE、Z*");
+    const safety = await read("abap-mcp://guides/safety");
+    expect(safety).toContain("唯讀");
+    expect(safety).toContain("data_preview 未開啟");
+    expect(await read("abap-mcp://guides/clean-abap")).toContain("https://github.com/SAP/styleguides/blob/main/clean-abap/CleanABAP.md");
+  });
+});
+
 // ───────────────────────── 寫入互斥(F1)─────────────────────────
 
 describe("寫入類操作依序執行", () => {

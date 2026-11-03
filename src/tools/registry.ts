@@ -17,6 +17,7 @@ import { SerialQueue } from "../safety/serialQueue.js";
 import { registerAnalysisTools, registerWriteDevTools } from "./devTools.js";
 import { registerDiagnosticTools } from "./diagTools.js";
 import { registerRapTools } from "./rapTools.js";
+import { registerGuidance } from "./guidance.js";
 import { baseObjectUrl as baseOf, isSourceUrl } from "../adt/objectTypes.js";
 import { VERSION } from "../version.js";
 
@@ -277,6 +278,9 @@ export function registerTools(
 
   // v0.4 診斷與資料工具(各工具自行判斷唯讀 / 開關,見 tools/diagTools.ts)
   registerDiagnosticTools(server, adt, cfg, audit, writes);
+
+  // v0.5 MCP prompts 與 resources(唯讀模式也提供,見 tools/guidance.ts)
+  registerGuidance(server, cfg);
 
   // ───────────────────────────── 寫入(唯讀模式下不註冊)─────────────────────────────
   if (cfg.safety.readonly) {
