@@ -106,7 +106,7 @@ ST22 短傾印的完整內容常超過 1 MB,其中 **Selected Variables** 章節
 - **唯讀模式不註冊**;非本機 package 必須提供 transport。
 - **發佈 = 對外開放 OData 服務**:預設 `publish=true` 會發佈 service binding,系統上任何有權限的使用者都能透過 `/sap/opu/odata4/…` 讀寫這張表的資料。連共用的開發系統時,請考慮 `publish=false`,確認後再在 Eclipse 手動發佈。
 - **逾時**:系統剛啟動時產生可能超過 5 分鐘而回 5xx,但 SAP 端多半已建立大部分物件。工具會逐一查證並回報「已存在 X/N、缺少哪些」,不會假裝成功。
-- **刪除順序**(由外而內):service binding → service definition → metadata extension → access control → behavior definition(projection 先)→ behavior 實作 class → CDS(projection 先)→ SAP object type / node type → 草稿表 → 來源表。已發佈的 binding 可能要先取消發佈。
+- **刪除順序**(由外而內):service binding → service definition → metadata extension → access control → behavior definition(projection 先)→ behavior 實作 class → CDS(projection 先)→ SAP object type / node type → 草稿表 → 來源表。已發佈的 binding 必須先取消發佈(A4H 實測直接刪除會回「Service endpoint … is published」),service definition 也要等 binding 刪除後才能刪。
 
 ### 3-8. abapGit 只讀、不提供 pull / push
 

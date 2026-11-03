@@ -483,6 +483,14 @@ describe("create_object", () => {
     expect(adt.createObject).toHaveBeenCalledWith(expect.objectContaining({ type: "TABL/DT", name: "ZMCP_TAB" }));
     const denied = await call("create_object", { object_type: "TABL/DT", name: "T000X", package_name: "$TMP", description: "t" });
     expect(denied.text).toContain("前綴白名單");
+    // 名稱長度在連 SAP 前就檢查(TABL 16、其他 30),不呼叫 validate / create
+    adt.validateNewObject.mockClear();
+    const tooLong = await call("create_object", { object_type: "TABL/DT", name: "ZMCP_NAME_TOO_LONG_X", package_name: "$TMP", description: "t" });
+    expect(tooLong.isError).toBe(true);
+    expect(tooLong.text).toContain("名稱最長 16 個字元");
+    const clsLong = await call("create_object", { object_type: "CLAS/OC", name: "ZCL_" + "X".repeat(27), package_name: "$TMP", description: "t" });
+    expect(clsLong.text).toContain("名稱最長 30 個字元");
+    expect(adt.validateNewObject).not.toHaveBeenCalled();
   });
 
   it("BDEF 建立 XML 與 validation 解析", () => {

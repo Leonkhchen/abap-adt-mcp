@@ -16,6 +16,7 @@ import {
   isSourceUrl,
   newObjectUrl,
   packageUrl,
+  TYPE_INFO,
 } from "../adt/objectTypes.js";
 import { formatAtcResult, formatClassComponents, formatUnitTestResults, formatWhereUsed } from "./formatters.js";
 import type { AppConfig } from "../config.js";
@@ -213,6 +214,12 @@ export function registerWriteDevTools(
           if (!isLocalPackage(packageName) && !transport) {
             throw new GuardViolationError(
               `package ${packageName} 不是本機 package,必須提供 transport(可用 list_transports 查詢,或用 create_transport 建立)。`
+            );
+          }
+          const maxLength = TYPE_INFO[object_type].maxLength;
+          if (objectName.length > maxLength) {
+            throw new GuardViolationError(
+              `${TYPE_INFO[object_type].label} 名稱最長 ${maxLength} 個字元,${objectName} 有 ${objectName.length} 個字元。`
             );
           }
 

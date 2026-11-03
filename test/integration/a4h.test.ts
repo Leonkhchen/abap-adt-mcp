@@ -665,15 +665,27 @@ describe.skipIf(!RUN_WRITE)("v0.5 TABL 與 RAP 產生器(A4H,$TMP 暫存物件)"
   const exists = async (name: string, type: string) =>
     (await raw.searchObject(name, type, 5)).some((h) => h["adtcore:name"].toUpperCase() === name.toUpperCase() && h["adtcore:type"] === type);
 
-  async function deleteUri(u: string): Promise<void> {
-    raw.stateful = session_types.stateful;
+  /** 鎖定 → 刪除;finally 一定解鎖並回到 stateless(與實測可行的手動清除相同) */
+  async function deleteUri(c: ADTClient, u: string): Promise<void> {
+    c.stateful = session_types.stateful;
     try {
-      const lock = await raw.lock(u);
-      await raw.deleteObject(u, lock.LOCK_HANDLE);
+      const lock = await c.lock(u);
+      try {
+        await c.deleteObject(u, lock.LOCK_HANDLE);
+      } finally {
+        await c.unLock(u, lock.LOCK_HANDLE).catch(() => undefined);
+      }
     } finally {
-      raw.stateful = session_types.stateless;
+      c.stateful = session_types.stateless;
     }
   }
+
+  /** SAP 錯誤訊息(含回應內文的 message),方便判斷清除失敗原因 */
+  const sapError = (e: unknown) => {
+    const x = e as { message?: string; response?: { body?: unknown } };
+    const body = String(x.response?.body ?? "");
+    return `${x.message ?? String(e)} ${body.match(/<message[^>]*>([^<]*)</)?.[1] ?? ""}`.trim();
+  };
 
   beforeAll(async () => {
     s = await startServer({ ...process.env, ABAP_MCP_READONLY: "false", ABAP_MCP_SYSTEM_ROLE: "dev" });
@@ -682,32 +694,37 @@ describe.skipIf(!RUN_WRITE)("v0.5 TABL 與 RAP 產生器(A4H,$TMP 暫存物件)"
   }, 120_000);
 
   afterAll(async () => {
+    // 產生 RAP 要數分鐘,原本的連線可能已失效(A4H 上沿用舊連線刪除曾一律回 400):清除改用新的連線
+    const c = new ADTClient(s.cfg.sap.url, s.cfg.sap.user, s.cfg.sap.password, s.cfg.sap.client, s.cfg.sap.language);
+    await c.login();
     // 預覽清單沒拿到時,至少試刪來源表
-    const uris = [...deleteOrder(planned).map((o) => o.uri).filter((u) => u !== tableUri), tableUri];
-    for (const u of uris) {
+    const targets = [
+      ...deleteOrder(planned).filter((o) => o.uri !== tableUri),
+      { uri: tableUri, type: "TABL/DT", name: TAB },
+    ];
+    // 直接 GET URI 判斷是否還在(搜尋索引會落後,不可靠)
+    const stillThere = (u: string) =>
+      c.httpClient.request(u, { headers: { Accept: "*/*" } }).then(
+        () => true,
+        (e: { response?: { status?: number }; status?: number }) => (e.response?.status ?? e.status) !== 404
+      );
+    for (const o of targets) {
+      if (o.type === "SRVB/SVB") {
+        // A4H 實測:已發佈的 binding 刪除會被拒(Service endpoint … is published),要先取消發佈
+        await c.httpClient
+          .request("/sap/bc/adt/businessservices/odatav4/unpublishjobs", {
+            method: "POST",
+            headers: { "Content-Type": "application/xml", Accept: "application/xml" },
+            body:
+              `<?xml version="1.0" encoding="UTF-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">` +
+              `<adtcore:objectReference adtcore:type="SCGR" adtcore:name="${o.name.toUpperCase()}"/></adtcore:objectReferences>`,
+          })
+          .catch(() => undefined);
+      }
       try {
-        await deleteUri(u);
+        await deleteUri(c, o.uri);
       } catch (e) {
-        if (/does not exist|not found|404/i.test(String(e))) continue;
-        let err: unknown = e;
-        if (u.includes("/businessservices/bindings/")) {
-          // 已發佈的 binding 可能要先取消發佈
-          try {
-            const name = u.split("/").pop()!.toUpperCase();
-            await raw.httpClient.request("/sap/bc/adt/businessservices/odatav4/unpublishjobs", {
-              method: "POST",
-              headers: { "Content-Type": "application/xml", Accept: "application/xml" },
-              body:
-                `<?xml version="1.0" encoding="UTF-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">` +
-                `<adtcore:objectReference adtcore:type="SCGR" adtcore:name="${name}"/></adtcore:objectReferences>`,
-            });
-            await deleteUri(u);
-            continue;
-          } catch (e2) {
-            err = e2;
-          }
-        }
-        console.error(`清除暫存物件 ${u} 失敗,請在 Eclipse 的 $TMP 手動刪除:${String(err)}`);
+        if (await stillThere(o.uri)) console.error(`清除暫存物件 ${o.uri} 失敗,請在 Eclipse 的 $TMP 手動刪除:${sapError(e)}`);
       }
     }
     await s?.close();
@@ -724,6 +741,7 @@ describe.skipIf(!RUN_WRITE)("v0.5 TABL 與 RAP 產生器(A4H,$TMP 暫存物件)"
     expect(d.text).toContain("local_last_changed_at");
     const tooLong = await s.call("create_object", { object_type: "TABL/DT", name: "ZMCP_NAME_TOO_LONG_X", package_name: "$TMP", description: "x" });
     expect(tooLong.isError).toBe(true);
+    expect(tooLong.text).toContain("名稱最長 16 個字元");
   }, 300_000);
 
   it("T32 rap_generate 預設只預覽:列出物件與 binding,系統裡沒有建立任何物件", async () => {
@@ -762,7 +780,7 @@ describe.skipIf(!RUN_WRITE)("v0.5 TABL 與 RAP 產生器(A4H,$TMP 暫存物件)"
     } finally {
       await narrow.close();
     }
-    const pkg = await s.call("rap_generate", { source_table: TAB, package_name: "ZNOT_ALLOWED_PKG", confirm: true, transport: "A4HK900001" });
+    const pkg = await s.call("rap_generate", { source_table: TAB, package_name: "NOT_ALLOWED_PKG", confirm: true, transport: "A4HK900001" });
     expect(pkg.isError).toBe(true);
     expect(pkg.text).toContain("不在允許的 package 白名單內");
     for (const o of planned.filter((x) => x.type === "SRVB/SVB" || x.type === "DDLS/DF")) {
