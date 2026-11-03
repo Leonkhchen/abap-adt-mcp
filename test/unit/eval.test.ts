@@ -7,6 +7,9 @@ import * as fs from "node:fs";
 import { fillPlaceholders, loadTasks, parseTask } from "../../eval/lib/tasks.js";
 import { parseStreamJson, writeMcpConfig } from "../../eval/lib/claude.js";
 import { parseArgs } from "../../eval/lib/args.js";
+import { ADAPTERS, parseModelSpecs } from "../../eval/lib/adapters.js";
+import { CSV_HEADER, renderCsv, renderMarkdown, writeReports, type TaskResult } from "../../eval/lib/report.js";
+import * as os from "node:os";
 
 const TASK_DIR = path.resolve("eval/tasks");
 
@@ -57,6 +60,92 @@ describe("評測執行器(F2)", () => {
       expect(cfg.mcpServers["abap-a4h"].args[0]).toBe("C:/repo/dist/index.js");
     } finally {
       fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+});
+
+describe("轉接器(F3)", () => {
+  it("--model 逗號清單:預設 claude;未實作的 codex/gemini、未知 agent、重複都在連 SAP 前報錯", () => {
+    expect(parseModelSpecs("opus, sonnet,haiku").map((s) => [s.adapter, s.model, s.label])).toEqual([
+      ["claude", "opus", "opus"],
+      ["claude", "sonnet", "sonnet"],
+      ["claude", "haiku", "haiku"],
+    ]);
+    expect(parseModelSpecs("claude:claude-sonnet-5-5")[0]).toEqual({ adapter: "claude", model: "claude-sonnet-5-5", label: "claude-sonnet-5-5" });
+    expect(() => parseModelSpecs("codex:gpt-5")).toThrow(/本版不實作/);
+    expect(() => parseModelSpecs("gemini:pro")).toThrow(/本版不實作/);
+    expect(() => parseModelSpecs("llama:x")).toThrow(/未知的 agent/);
+    expect(() => parseModelSpecs("sonnet,sonnet")).toThrow(/重複/);
+    expect(() => parseModelSpecs(" , ")).toThrow(/至少/);
+    expect(() => parseModelSpecs("rm -rf")).toThrow(/格式錯誤/);
+  });
+
+  it("介面:claude 已實作,codex/gemini 只有介面、呼叫即拒絕", async () => {
+    expect(ADAPTERS.claude.implemented).toBe(true);
+    for (const id of ["codex", "gemini"] as const) {
+      expect(ADAPTERS[id].implemented).toBe(false);
+      await expect(ADAPTERS[id].run({} as never)).rejects.toThrow(/本版不實作/);
+    }
+  });
+
+  it("--matrix 是旗標", () => {
+    expect(parseArgs(["--model", "opus,haiku", "--matrix"]).flags.has("matrix")).toBe(true);
+  });
+});
+
+describe("報表(F4)", () => {
+  const mk = (task: string, model: string, passed: boolean, cost: number, extra: Partial<TaskResult> = {}): TaskResult => ({
+    task,
+    title: `題目${task}`,
+    model,
+    passed,
+    details: passed ? [] : ["找不到 X"],
+    cleanup: [],
+    suffix: "AB12CD",
+    run: { status: "success", turns: 4, durationMs: 30_400, costUsd: cost, toolCalls: 3, toolCallsByName: {}, timedOut: false, logFile: "x", answerPreview: "" },
+    ...extra,
+  });
+  const input = {
+    startedAt: new Date("2026-11-03T12:00:00Z"),
+    stamp: "2026-11-03T12-00-00",
+    dryRun: false,
+    models: ["sonnet", "haiku"],
+    results: [mk("01", "sonnet", true, 0.1), mk("02", "sonnet", false, 0.2), mk("01", "haiku", true, 0.01), mk("02", "haiku", true, 0.02, { cleanup: ["❌ 刪除失敗 /x"] })],
+  };
+
+  it("Markdown:題目 × 模型格子、總計列、失敗與清除問題區", () => {
+    const md = renderMarkdown(input);
+    expect(md).toContain("| 題目 | sonnet | haiku |");
+    expect(md).toContain("| 01 題目01 | ✅ 4 回合 · 30s · $0.1000 · 3 工具 | ✅ 4 回合 · 30s · $0.0100 · 3 工具 |");
+    expect(md).toContain("| **總計** | **1/2** · 8 回合 · 60s · **$0.3000** · 6 工具 | **2/2** · 8 回合 · 60s · **$0.0300** · 6 工具 |");
+    expect(md).toContain("總費用 $0.3300");
+    expect(md).toContain("### 02 × sonnet");
+    expect(md).toContain("- 找不到 X");
+    expect(md).toContain("### 02 × haiku");
+    expect(md).toContain("❌ 刪除失敗 /x");
+    expect(md).not.toContain("### 01 ×");
+  });
+
+  it("CSV:BOM、每題一列、每個模型一列 TOTAL;含逗號的欄位加引號", () => {
+    const csv = renderCsv({ ...input, results: [...input.results, mk("03", "haiku", false, 0, { title: "a,b", run: undefined, setupError: "建立失敗" })] });
+    expect(csv.startsWith("﻿" + CSV_HEADER.join(","))).toBe(true);
+    const rows = csv.trim().split("\r\n");
+    expect(rows).toHaveLength(1 + 5 + 2);
+    expect(rows).toContain('03,"a,b",haiku,false,,0,,,,,建立失敗');
+    expect(rows.at(-2)).toBe("TOTAL,1/2 passed,sonnet,false,8,60,0.3000,6,,,");
+    expect(rows.at(-1)).toBe("TOTAL,2/3 passed,haiku,false,8,60,0.0300,6,,,");
+  });
+
+  it("同一天重跑不覆蓋:檔名依序加 -2", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "eval-report-"));
+    try {
+      const a = writeReports(dir, input);
+      const b = writeReports(dir, { ...input, stamp: "2026-11-03T13-00-00" });
+      expect(path.basename(a[0])).toMatch(/^2026-11-0[34]\.md$/);
+      expect(path.basename(b[0])).toMatch(/^2026-11-0[34]-2\.md$/);
+      expect(fs.readFileSync(a[2], "utf8")).toContain('"model": "sonnet"');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 });
