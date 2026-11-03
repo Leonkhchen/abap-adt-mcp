@@ -3,9 +3,63 @@
  */
 import { describe, it, expect } from "vitest";
 import * as path from "node:path";
+import * as fs from "node:fs";
 import { fillPlaceholders, loadTasks, parseTask } from "../../eval/lib/tasks.js";
+import { parseStreamJson, writeMcpConfig } from "../../eval/lib/claude.js";
+import { parseArgs } from "../../eval/lib/args.js";
 
 const TASK_DIR = path.resolve("eval/tasks");
+
+describe("評測執行器(F2)", () => {
+  it("參數解析嚴格:--help / -h 只顯示說明;未知選項、缺值、非正數都報錯", () => {
+    expect(parseArgs(["--help"]).flags.has("help")).toBe(true);
+    expect(parseArgs(["-h"]).flags.has("help")).toBe(true);
+    const p = parseArgs(["--model", "haiku", "--tasks", "01,07", "--dry-run", "--budget", "1.5"]);
+    expect(p.values.get("model")).toBe("haiku");
+    expect(p.values.get("tasks")).toBe("01,07");
+    expect(p.flags.has("dry-run")).toBe(true);
+    expect(() => parseArgs(["--modle", "haiku"])).toThrow(/未知的參數/);
+    expect(() => parseArgs(["sonnet"])).toThrow(/未知的參數/);
+    expect(() => parseArgs(["--model"])).toThrow(/需要一個值/);
+    expect(() => parseArgs(["--model", "--dry-run"])).toThrow(/需要一個值/);
+    expect(() => parseArgs(["--budget", "0"])).toThrow(/正數/);
+  });
+
+  it("解析 stream-json:回答、回合、耗時、費用;工具呼叫依名稱計數且不算 ToolSearch", () => {
+    const lines = [
+      JSON.stringify({ type: "system", subtype: "init" }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "ToolSearch" }] } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "x" }, { type: "tool_use", name: "mcp__abap-a4h__read_source" }] } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "mcp__abap-a4h__read_source" }, { type: "tool_use", name: "mcp__abap-a4h__run_class" }] } }),
+      "not json",
+      JSON.stringify({ type: "result", subtype: "success", result: "答案 42", num_turns: 5, duration_ms: 12345, total_cost_usd: 0.1234 }),
+    ];
+    expect(parseStreamJson("\uFEFF" + lines.join("\n"))).toEqual({
+      status: "success",
+      answer: "答案 42",
+      turns: 5,
+      durationMs: 12345,
+      costUsd: 0.1234,
+      toolCalls: 3,
+      toolCallsByName: { read_source: 2, run_class: 1 },
+    });
+    expect(parseStreamJson("").status).toBe("no_result");
+  });
+
+  it("臨時 MCP 設定檔:只有 abap-a4h,密碼以 ${SAP_PASSWORD} 展開、不寫入檔案", () => {
+    const file = writeMcpConfig("C:\\repo", { SAP_URL: "http://localhost:50000", SAP_PASSWORD: "TOP-SECRET" });
+    try {
+      const text = fs.readFileSync(file, "utf8");
+      expect(text).not.toContain("TOP-SECRET");
+      const cfg = JSON.parse(text);
+      expect(Object.keys(cfg.mcpServers)).toEqual(["abap-a4h"]);
+      expect(cfg.mcpServers["abap-a4h"].env.SAP_PASSWORD).toBe("${SAP_PASSWORD}");
+      expect(cfg.mcpServers["abap-a4h"].args[0]).toBe("C:/repo/dist/index.js");
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+});
 
 describe("評測任務集(F1)", () => {
   it("8 題都能解析,id 01–08 不重複,每題都有判定條件", () => {

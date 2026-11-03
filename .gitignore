@@ -4,3 +4,7 @@ dist/
 .env.*
 !.env.example
 *.log
+audit.jsonl
+# 評測:原始 stream-json 記錄與逐題 JSON 不入版控(報表 .md/.csv 入版控)
+eval/results/logs/
+eval/results/*.json
