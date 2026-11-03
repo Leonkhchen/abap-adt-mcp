@@ -118,6 +118,8 @@ function mockAdt(overrides: Partial<AdtService> = {}): AdtService {
     prettyPrint: vi.fn(async (s: string) => ({ source: s, style: "", indentation: false })),
     inactiveObjects: vi.fn(async () => []),
     revisions: vi.fn(async () => []),
+    hasAdtCollection: vi.fn(async () => false),
+    gitRepos: vi.fn(async () => []),
     rapGeneratorLinks: vi.fn(async () => undefined),
     rapPreview: vi.fn(async () => ({ content: {}, validation: { ok: true, messages: [] }, objects: [] })),
     rapGenerate: vi.fn(async () => []),
@@ -1538,6 +1540,47 @@ describe("RAP 產生器", () => {
   it("唯讀模式不註冊", async () => {
     const call = await connectTools(rapAdt(), makeConfig({ ABAP_MCP_READONLY: "true" }));
     expect((await call("rap_generate", { source_table: "ZT", package_name: "$TMP" })).isError).toBe(true);
+  });
+});
+
+// ───────────────────────── abapgit_repos(v0.5 E3)─────────────────────────
+
+describe("abapgit_repos", () => {
+  it("沒有 abapGit ADT 後端時說明替代方式(A4H 的情況),不呼叫 gitRepos", async () => {
+    const adt = mockAdt({ hasAdtCollection: vi.fn(async () => false) });
+    const call = await connectTools(adt, makeConfig({ ABAP_MCP_READONLY: "true" }));
+    const r = await call("abapgit_repos");
+    expect(r.isError).toBe(false);
+    expect(r.text).toContain("此系統沒有 abapGit ADT 後端");
+    expect(r.text).toContain("ZABAPGIT_STANDALONE");
+    expect(adt.hasAdtCollection).toHaveBeenCalledWith("/sap/bc/adt/abapgit/repos");
+    expect(adt.gitRepos).not.toHaveBeenCalled();
+  });
+
+  it("有後端時列出 repo;不提供 pull / push / stage 工具", async () => {
+    const adt = mockAdt({
+      hasAdtCollection: vi.fn(async () => true),
+      gitRepos: vi.fn(async () => [{ name: "abap-a4h-practice", packageName: "$LEON_PRACTICE", url: "https://github.com/x/abap-a4h-practice.git", branch: "refs/heads/main", status: "" }]),
+    });
+    const server = new McpServer({ name: "unit", version: "0" });
+    registerTools(server, adt, makeConfig(), new AuditLogger(""));
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverT);
+    const client = new Client({ name: "c", version: "0" });
+    await client.connect(clientT);
+    const r = (await client.callTool({ name: "abapgit_repos", arguments: {} })) as { content: { text: string }[] };
+    expect(r.content[0].text).toContain("abap-a4h-practice(package $LEON_PRACTICE");
+    const names = (await client.listTools()).tools.map((t) => t.name);
+    expect(names.filter((n) => /git/.test(n))).toEqual(["abapgit_repos"]);
+  });
+
+  it("discovery 讀取結果快取:只讀一次", async () => {
+    const fake = fakeAdtClient();
+    fake.httpClient.request.mockResolvedValue({ status: 200, body: '<app:collection href="/sap/bc/adt/oo/classes"><x/></app:collection>' } as never);
+    const adt = realAdt(fake);
+    expect(await adt.hasAdtCollection("/sap/bc/adt/abapgit/repos")).toBe(false);
+    expect(await adt.hasAdtCollection("/sap/bc/adt/oo/classes")).toBe(true);
+    expect(fake.httpClient.request).toHaveBeenCalledTimes(1);
   });
 });
 

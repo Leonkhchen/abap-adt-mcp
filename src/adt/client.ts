@@ -188,6 +188,10 @@ export interface AdtService {
   classComponents(objectUrl: string): Promise<ClassComponent>;
   /** 執行 class 的 IF_OO_ADT_CLASSRUN~MAIN,回傳 out->write 的輸出 */
   runClass(className: string): Promise<string>;
+  /** ADT discovery 是否有以 href 開頭的 collection(結果在 process 內快取) */
+  hasAdtCollection(href: string): Promise<boolean>;
+  /** abapGit ADT 後端的 repo 清單(呼叫前先用 hasAdtCollection 確認端點存在) */
+  gitRepos(): Promise<{ name: string; packageName: string; url: string; branch: string; status: string }[]>;
   /** RAP ui-service 產生器的連結;系統沒有此產生器時回 undefined */
   rapGeneratorLinks(tableUri: string): Promise<RapGeneratorLinks | undefined>;
   /** 取得產生器預設內容(可套用名稱前綴)、檢查並預覽會建立的物件(不建立任何東西) */
@@ -564,6 +568,32 @@ export class RealAdtService implements AdtService {
 
   async runClass(className: string) {
     return this.guard(() => this.client.runClass(className.toUpperCase()));
+  }
+
+  /** ADT discovery 的 collection href 清單(第一次讀取後快取;約 400 KB) */
+  private discoveryHrefs?: Promise<string[]>;
+
+  async hasAdtCollection(href: string) {
+    this.discoveryHrefs ??= this.guard(() =>
+      this.client.httpClient.request("/sap/bc/adt/discovery", { headers: { Accept: "application/atomsvc+xml" } })
+    )
+      .then((r) => [...String(r.body ?? "").matchAll(/<app:collection\s+href="([^"]+)"/g)].map((m) => m[1]))
+      .catch((e) => {
+        this.discoveryHrefs = undefined; // 失敗不快取,下次重試
+        throw e;
+      });
+    return (await this.discoveryHrefs).some((h) => h === href || h.startsWith(`${href}/`));
+  }
+
+  async gitRepos() {
+    const repos = await this.guard(() => this.client.gitRepos());
+    return repos.map((r) => ({
+      name: (r.url ?? "").replace(/\/$/, "").split("/").pop()?.replace(/\.git$/, "") ?? "",
+      packageName: r.sapPackage ?? "",
+      url: r.url ?? "",
+      branch: r.branch_name ?? "",
+      status: r.status_text ?? r.status ?? "",
+    }));
   }
 
   async rapGeneratorLinks(tableUri: string) {
