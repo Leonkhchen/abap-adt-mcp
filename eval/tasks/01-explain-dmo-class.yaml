@@ -1,0 +1,12 @@
+# 讀懂並解釋一個 /DMO/ class(唯讀,不需事前準備)
+id: "01"
+title: 讀懂並解釋 /DMO/ class
+prompt: |
+  請讀懂 /DMO/CL_FLIGHT_DATA_GENERATOR 這個 class,用繁體中文說明它的用途,
+  並列出它的公開方法(含它實作的介面方法)各自做什麼。只讀,不要修改任何東西。
+setup: []
+checks:
+  # 判定:回答提到它實作的介面方法(此 class 以 IF_OO_ADT_CLASSRUN 執行)
+  - kind: answer_contains
+    all: ["IF_OO_ADT_CLASSRUN"]
+cleanup: []
