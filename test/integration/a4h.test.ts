@@ -5,7 +5,7 @@
  * 預設全部略過；需設定環境變數才會執行：
  *
  *   ABAP_MCP_IT=1          執行唯讀組（T01–T07、T14、T35–T36）
- *   ABAP_MCP_IT_WRITE=1    另外執行寫入組（T08–T13、T15–T16）、v0.3 開發循環組（T17–T22）、v0.4 診斷組（T23–T30）與 v0.5 RAP 組（T31–T34），
+ *   ABAP_MCP_IT_WRITE=1    另外執行寫入組（T08–T13、T15–T16）、v0.3 開發循環組（T17–T22）、v0.4 診斷組（T23–T30）、v0.5 RAP 組（T31–T34）與 v0.5.1 組（T37–T40），
  *                          只在 $TMP 建立暫存物件，測完全部刪除
  *
  * 一般用 npm 指令即可（PowerShell / bash 皆可）：
@@ -800,4 +800,149 @@ describe.skipIf(!RUN_WRITE)("v0.5 TABL 與 RAP 產生器(A4H,$TMP 暫存物件)"
       expect(await exists(o.name, o.type), o.name).toBe(true);
     }
   }, 900_000);
+});
+
+// ───────────────────────────── v0.5.1 組（$TMP）：T37–T40 ─────────────────────────────
+describe.skipIf(!RUN_WRITE)("v0.5.1 安全與一致性修正（A4H，$TMP 暫存物件）", () => {
+  const sfx = Date.now().toString(36).toUpperCase().slice(-6);
+  const C38 = `ZCL_MCP_IT51A_${sfx}`; // T38 run_unit_tests 正向
+  const C39 = `ZCL_MCP_IT51B_${sfx}`; // T39 新 include + expected ""
+  const C40 = `ZCL_MCP_IT51C_${sfx}`; // T40 鎖定後比對
+  const url = (n: string) => `/sap/bc/adt/oo/classes/${n.toLowerCase()}`;
+  const mainSrc = (n: string, marker = "V1") =>
+    [
+      `CLASS ${n.toLowerCase()} DEFINITION PUBLIC FINAL CREATE PUBLIC.`,
+      `  PUBLIC SECTION.`,
+      `    METHODS m RETURNING VALUE(r) TYPE string.`,
+      `ENDCLASS.`,
+      ``,
+      `CLASS ${n.toLowerCase()} IMPLEMENTATION.`,
+      `  METHOD m.`,
+      `    r = '${marker}'.`,
+      `  ENDMETHOD.`,
+      `ENDCLASS.`,
+    ].join("\n");
+  const testSrc = (n: string) =>
+    [
+      `CLASS ltc_it51 DEFINITION FINAL FOR TESTING DURATION SHORT RISK LEVEL HARMLESS.`,
+      `  PRIVATE SECTION.`,
+      `    METHODS green FOR TESTING.`,
+      `ENDCLASS.`,
+      ``,
+      `CLASS ltc_it51 IMPLEMENTATION.`,
+      `  METHOD green.`,
+      `    cl_abap_unit_assert=>assert_equals( act = NEW ${n.toLowerCase()}( )->m( ) exp = 'V1' ).`,
+      `  ENDMETHOD.`,
+      `ENDCLASS.`,
+    ].join("\n");
+
+  let s: Awaited<ReturnType<typeof startServer>>;
+  let raw: ADTClient;
+
+  beforeAll(async () => {
+    s = await startServer({ ...process.env, ABAP_MCP_READONLY: "false", ABAP_MCP_SYSTEM_ROLE: "dev" });
+    raw = new ADTClient(s.cfg.sap.url, s.cfg.sap.user, s.cfg.sap.password, s.cfg.sap.client, s.cfg.sap.language);
+    await raw.login();
+    for (const n of [C38, C39, C40]) {
+      const r = await s.call("create_object", { object_type: "CLAS/OC", name: n, package_name: "$TMP", description: "abap-adt-mcp IT51" });
+      if (r.isError) throw new Error(r.text);
+    }
+  }, 300_000);
+
+  afterAll(async () => {
+    for (const u of [C38, C39, C40].map(url)) {
+      try {
+        raw.stateful = session_types.stateful;
+        const lock = await raw.lock(u);
+        await raw.deleteObject(u, lock.LOCK_HANDLE);
+      } catch (e) {
+        if (!/does not exist|not found|404/i.test(String(e))) {
+          console.error(`清除暫存物件 ${u} 失敗,請在 Eclipse 的 $TMP 手動刪除:${String(e)}`);
+        }
+      } finally {
+        raw.stateful = session_types.stateless;
+      }
+    }
+    await s?.close();
+  }, 300_000);
+
+  it("T37 activate_object 帶外部 URL 被拒(不需要網路),錯誤訊息說明只接受相對 ADT URI", async () => {
+    const r = await s.call("activate_object", { object_url: "https://example.invalid/zcl_x" });
+    expect(r.isError, r.text).toBe(true);
+    expect(r.text).toContain("只接受 /sap/bc/adt/ 開頭的相對 URI");
+    const r2 = await s.call("activate_object", { object_url: "//example.invalid/zcl_x" });
+    expect(r2.isError, r2.text).toBe(true);
+  }, 120_000);
+
+  it("T38 run_unit_tests:/DMO/ 物件與 package 被拒;$TMP 的 Z class 正常執行", async () => {
+    const deniedObj = await s.call("run_unit_tests", { object_url: "/sap/bc/adt/oo/classes/%2fdmo%2fcl_flight_amdp" });
+    expect(deniedObj.isError, deniedObj.text).toBe(true);
+    expect(deniedObj.text).toContain("白名單");
+    const deniedPkg = await s.call("run_unit_tests", { package_name: "/DMO/FLIGHT" });
+    expect(deniedPkg.isError, deniedPkg.text).toBe(true);
+    expect(deniedPkg.text).toContain("白名單");
+
+    expect((await s.call("write_source", { object_url: url(C38), new_source: mainSrc(C38) })).isError).toBe(false);
+    const t = await s.call("write_source", { object_url: `${url(C38)}/includes/testclasses`, new_source: testSrc(C38), activate: true });
+    expect(t.isError, t.text).toBe(false);
+    const r = await s.call("run_unit_tests", { object_url: url(C38) });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("1 個測試方法,1 通過,0 失敗");
+  }, 600_000);
+
+  it("T39 新 class 的測試 include 不存在:expected_current_source 為空字串也能寫入並跑出 ABAP Unit 結果(R4)", async () => {
+    expect((await s.call("write_source", { object_url: url(C39), new_source: mainSrc(C39) })).isError).toBe(false);
+    const t = await s.call("write_source", {
+      object_url: `${url(C39)}/includes/testclasses`,
+      new_source: testSrc(C39),
+      expected_current_source: "",
+      activate: true,
+    });
+    expect(t.isError, t.text).toBe(false);
+    expect(t.text).toContain("已啟用");
+    const r = await s.call("run_unit_tests", { object_url: url(C39) });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("1 個測試方法,1 通過,0 失敗");
+  }, 600_000);
+
+  it("T40 鎖定後再比對(R3):讀取之後、鎖定之前由第二個 ADT session 改動 → 被擋下,且鎖已釋放", async () => {
+    const real = new RealAdtService(s.cfg);
+    const objectUrl = url(C40);
+    const sourceUrl = `${objectUrl}/source/main`;
+    const v1 = mainSrc(C40, "V1");
+    const w = await s.call("write_source", { object_url: objectUrl, new_source: v1 });
+    expect(w.isError, w.text).toBe(false);
+    const expected = await real.getObjectSource(sourceUrl);
+
+    // 在 lock() 之前插入外部修改:第二個 session（raw）鎖定 → 寫入 → 解鎖
+    const racing = Object.create(real) as RealAdtService;
+    racing.lock = async (u: string) => {
+      raw.stateful = session_types.stateful;
+      try {
+        const l = await raw.lock(u);
+        await raw.setObjectSource(sourceUrl, mainSrc(C40, "OTHER_SESSION"), l.LOCK_HANDLE);
+        await raw.unLock(u, l.LOCK_HANDLE);
+      } finally {
+        raw.stateful = session_types.stateless;
+      }
+      return real.lock(u);
+    };
+    const { lockedWrite, ConcurrentModificationError } = await import("../../src/workflows/lockedWrite.js");
+    await expect(
+      lockedWrite(racing, { objectUrl, sourceUrl, newSource: mainSrc(C40, "MINE"), expectedCurrentSource: expected })
+    ).rejects.toBeInstanceOf(ConcurrentModificationError);
+
+    // 別人的修改還在、我們的沒寫進去
+    const now = await real.getObjectSource(sourceUrl);
+    expect(now).toContain("OTHER_SESSION");
+    expect(now).not.toContain("MINE");
+    // 鎖已釋放:第二個 session 可以重新鎖定
+    raw.stateful = session_types.stateful;
+    try {
+      const l = await raw.lock(objectUrl);
+      await raw.unLock(objectUrl, l.LOCK_HANDLE);
+    } finally {
+      raw.stateful = session_types.stateless;
+    }
+  }, 600_000);
 });
