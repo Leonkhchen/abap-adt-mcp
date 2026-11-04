@@ -1,0 +1,12 @@
+# 用 data_preview 回答 /DMO/TRAVEL 的統計問題;正確數字在判定時即時查出(不寫死)
+id: "07"
+title: data_preview 統計問題
+prompt: |
+  /DMO/TRAVEL 裡依狀態(status)分組,各有幾筆?總共幾筆?請列出每個狀態的筆數。
+setup: []
+checks:
+  # 判定:回答要包含每個狀態的筆數(由同一個查詢即時取得)
+  - kind: answer_contains_query
+    sql: SELECT status, COUNT(*) AS cnt FROM /dmo/travel GROUP BY status
+    column: CNT
+cleanup: []

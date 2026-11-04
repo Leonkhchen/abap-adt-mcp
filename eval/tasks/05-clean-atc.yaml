@@ -1,0 +1,41 @@
+# 讓有 ATC 問題的 class 變乾淨:使用未釋出的 API(RFC_PING),且要維持原本的輸出
+id: "05"
+title: ATC 變乾淨
+prompt: |
+  $TMP 裡的 class ZCL_EVAL05_{{SFX}} 有 ATC 問題。請修正到 ATC 沒有優先級 1 或 2 的 finding,
+  而且執行它(run_class)時的輸出要維持不變(EVAL-05-OK)。
+setup:
+  - tool: create_object
+    args: { object_type: CLAS/OC, name: ZCL_EVAL05_{{SFX}}, package_name: $TMP, description: eval 05 atc }
+  - tool: write_source
+    args:
+      object_url: /sap/bc/adt/oo/classes/zcl_eval05_{{sfx}}
+      activate: true
+      new_source: |
+        CLASS zcl_eval05_{{sfx}} DEFINITION PUBLIC FINAL CREATE PUBLIC.
+          PUBLIC SECTION.
+            INTERFACES if_oo_adt_classrun.
+            METHODS check_connection RETURNING VALUE(ok) TYPE abap_bool.
+        ENDCLASS.
+
+        CLASS zcl_eval05_{{sfx}} IMPLEMENTATION.
+          METHOD if_oo_adt_classrun~main.
+            out->write( `EVAL-05-OK` ).
+          ENDMETHOD.
+
+          METHOD check_connection.
+            CALL FUNCTION 'RFC_PING'.
+            ok = abap_true.
+          ENDMETHOD.
+        ENDCLASS.
+checks:
+  - kind: tool
+    tool: run_atc
+    args: { object_url: /sap/bc/adt/oo/classes/zcl_eval05_{{sfx}} }
+    not_contains: ["優先級 1(", "優先級 2("]
+  - kind: tool
+    tool: run_class
+    args: { class_name: ZCL_EVAL05_{{SFX}} }
+    contains: ["EVAL-05-OK"]
+cleanup:
+  - /sap/bc/adt/oo/classes/zcl_eval05_{{sfx}}

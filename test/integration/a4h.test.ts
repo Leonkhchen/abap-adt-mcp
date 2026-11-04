@@ -4,8 +4,8 @@
  * 透過 MCP Client + InMemoryTransport 呼叫真正註冊的工具，連到真實 SAP 系統。
  * 預設全部略過；需設定環境變數才會執行：
  *
- *   ABAP_MCP_IT=1          執行唯讀組（T01–T07、T14）
- *   ABAP_MCP_IT_WRITE=1    另外執行寫入組（T08–T13、T15–T16）、v0.3 開發循環組（T17–T22）與 v0.4 診斷組（T23–T30），
+ *   ABAP_MCP_IT=1          執行唯讀組（T01–T07、T14、T35–T36）
+ *   ABAP_MCP_IT_WRITE=1    另外執行寫入組（T08–T13、T15–T16）、v0.3 開發循環組（T17–T22）、v0.4 診斷組（T23–T30）與 v0.5 RAP 組（T31–T34），
  *                          只在 $TMP 建立暫存物件，測完全部刪除
  *
  * 一般用 npm 指令即可（PowerShell / bash 皆可）：
@@ -27,6 +27,7 @@ import { RealAdtService } from "../../src/adt/client.js";
 import { AuditLogger } from "../../src/safety/audit.js";
 import { registerTools } from "../../src/tools/registry.js";
 import { VERSION } from "../../src/version.js";
+import type { RapObjectRef } from "../../src/adt/rapGenerator.js";
 
 const RUN = process.env.ABAP_MCP_IT === "1";
 const RUN_WRITE = RUN && process.env.ABAP_MCP_IT_WRITE === "1";
@@ -585,4 +586,218 @@ describe.skipIf(!RUN_WRITE)("v0.4 診斷與資料工具（A4H，$TMP 暫存物�
       raw.stateful = session_types.stateless;
     }
   }, 300_000);
+});
+
+// ───────────────────────────── v0.5 唯讀:abapGit、prompts / resources ─────────────────────────────
+describe.skipIf(!RUN)("v0.5 abapGit 與引導(A4H,唯讀)", () => {
+  let s: Awaited<ReturnType<typeof startServer>>;
+  beforeAll(async () => {
+    // 唯讀模式也要有 abapgit_repos、prompts 與 resources
+    s = await startServer({ ...process.env, ABAP_MCP_READONLY: "true" });
+  }, 120_000);
+  afterAll(async () => s?.close());
+
+  it("T35 abapgit_repos:A4H 沒有 abapGit ADT 後端時回報說明並指向 ZABAPGIT_STANDALONE", async () => {
+    const r = await s.call("abapgit_repos");
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("ℹ️ 此系統沒有 abapGit ADT 後端");
+    expect(r.text).toContain("ZABAPGIT_STANDALONE");
+    // 只讀:不提供 pull / push / stage 工具
+    const tools = (await s.client.listTools()).tools.map((t) => t.name);
+    expect(tools).toContain("abapgit_repos");
+    expect(tools.filter((t) => /abapgit_(pull|push|stage)/.test(t))).toEqual([]);
+  }, 120_000);
+
+  it("T36 prompts / resources 列得出來且內容可讀", async () => {
+    const prompts = (await s.client.listPrompts()).prompts.map((p) => p.name).sort();
+    expect(prompts).toEqual(["clean-abap-review", "fix-dump", "rap-bo-from-table"]);
+    const resources = (await s.client.listResources()).resources.map((r) => r.uri).sort();
+    expect(resources).toEqual(["abap-mcp://guides/clean-abap", "abap-mcp://guides/naming", "abap-mcp://guides/safety"]);
+    const safety = ((await s.client.readResource({ uri: "abap-mcp://guides/safety" })).contents[0] as { text: string }).text;
+    expect(safety).not.toContain(s.cfg.sap.password);
+    const clean = ((await s.client.readResource({ uri: "abap-mcp://guides/clean-abap" })).contents[0] as { text: string }).text;
+    expect(clean).toContain("https://github.com/SAP/styleguides");
+    const p = await s.client.getPrompt({ name: "rap-bo-from-table", arguments: { table_name: "ZDEMO_TAB" } });
+    expect((p.messages[0].content as { text: string }).text).toContain("ZDEMO_TAB");
+  }, 120_000);
+});
+
+// ───────────────────────────── v0.5 寫入:TABL 與 RAP 產生器 ─────────────────────────────
+describe.skipIf(!RUN_WRITE)("v0.5 TABL 與 RAP 產生器(A4H,$TMP 暫存物件)", () => {
+  const sfx = Date.now().toString(36).toUpperCase().slice(-6);
+  const TAB = `ZMI5${sfx}`; // 10 字元;產生器預設名稱 ZR_MI5…、ZUI_MI5…_O4、草稿表 ZMI5…_D
+  const tableUri = `/sap/bc/adt/ddic/tables/${TAB.toLowerCase()}`;
+  const tableSource = [
+    `@EndUserText.label : 'abap-adt-mcp IT5 RAP source'`,
+    `@AbapCatalog.enhancement.category : #NOT_EXTENSIBLE`,
+    `@AbapCatalog.tableCategory : #TRANSPARENT`,
+    `@AbapCatalog.deliveryClass : #A`,
+    `@AbapCatalog.dataMaintenance : #RESTRICTED`,
+    `define table ${TAB.toLowerCase()} {`,
+    `  key client            : abap.clnt not null;`,
+    `  key uuid              : sysuuid_x16 not null;`,
+    `  name                  : abap.char(40);`,
+    `  amount                : abap.dec(15,2);`,
+    `  local_created_by      : abp_creation_user;`,
+    `  local_created_at      : abp_creation_tstmpl;`,
+    `  local_last_changed_by : abp_locinst_lastchange_user;`,
+    `  local_last_changed_at : abp_locinst_lastchange_tstmpl;`,
+    `  last_changed_at       : abp_lastchange_tstmpl;`,
+    `}`,
+  ].join("\n");
+
+  let s: Awaited<ReturnType<typeof startServer>>;
+  let raw: ADTClient;
+  /** 產生器預覽列出的物件(含 URI),清除時依相依關係由外而內刪除 */
+  let planned: RapObjectRef[] = [];
+
+  /** 刪除順序:binding → definition → metadata ext. → access control → behavior → BP class → CDS → SAP object type → 草稿表(projection 先於 base);來源表最後 */
+  const RANK = ["SRVB", "SRVD", "DDLX", "DCLS", "BDEF", "CLAS", "DDLS", "RONT", "NONT", "TABL"];
+  const deleteOrder = (objs: RapObjectRef[]) =>
+    [...objs].sort((a, b) => {
+      const ra = RANK.indexOf(a.type.split("/")[0]);
+      const rb = RANK.indexOf(b.type.split("/")[0]);
+      if (ra !== rb) return (ra < 0 ? 99 : ra) - (rb < 0 ? 99 : rb);
+      const proj = (o: RapObjectRef) => (/^[ZY]C_|_C_/.test(o.name.toUpperCase()) ? 0 : 1);
+      return proj(a) - proj(b);
+    });
+
+  const exists = async (name: string, type: string) =>
+    (await raw.searchObject(name, type, 5)).some((h) => h["adtcore:name"].toUpperCase() === name.toUpperCase() && h["adtcore:type"] === type);
+
+  /** 鎖定 → 刪除;finally 一定解鎖並回到 stateless(與實測可行的手動清除相同) */
+  async function deleteUri(c: ADTClient, u: string): Promise<void> {
+    c.stateful = session_types.stateful;
+    try {
+      const lock = await c.lock(u);
+      try {
+        await c.deleteObject(u, lock.LOCK_HANDLE);
+      } finally {
+        await c.unLock(u, lock.LOCK_HANDLE).catch(() => undefined);
+      }
+    } finally {
+      c.stateful = session_types.stateless;
+    }
+  }
+
+  /** SAP 錯誤訊息(含回應內文的 message),方便判斷清除失敗原因 */
+  const sapError = (e: unknown) => {
+    const x = e as { message?: string; response?: { body?: unknown } };
+    const body = String(x.response?.body ?? "");
+    return `${x.message ?? String(e)} ${body.match(/<message[^>]*>([^<]*)</)?.[1] ?? ""}`.trim();
+  };
+
+  beforeAll(async () => {
+    s = await startServer({ ...process.env, ABAP_MCP_READONLY: "false", ABAP_MCP_SYSTEM_ROLE: "dev" });
+    raw = new ADTClient(s.cfg.sap.url, s.cfg.sap.user, s.cfg.sap.password, s.cfg.sap.client, s.cfg.sap.language);
+    await raw.login();
+  }, 120_000);
+
+  afterAll(async () => {
+    // 產生 RAP 要數分鐘,原本的連線可能已失效(A4H 上沿用舊連線刪除曾一律回 400):清除改用新的連線
+    const c = new ADTClient(s.cfg.sap.url, s.cfg.sap.user, s.cfg.sap.password, s.cfg.sap.client, s.cfg.sap.language);
+    await c.login();
+    // 預覽清單沒拿到時,至少試刪來源表
+    const targets = [
+      ...deleteOrder(planned).filter((o) => o.uri !== tableUri),
+      { uri: tableUri, type: "TABL/DT", name: TAB },
+    ];
+    // 直接 GET URI 判斷是否還在(搜尋索引會落後,不可靠)
+    const stillThere = (u: string) =>
+      c.httpClient.request(u, { headers: { Accept: "*/*" } }).then(
+        () => true,
+        (e: { response?: { status?: number }; status?: number }) => (e.response?.status ?? e.status) !== 404
+      );
+    for (const o of targets) {
+      if (o.type === "SRVB/SVB") {
+        // A4H 實測:已發佈的 binding 刪除會被拒(Service endpoint … is published),要先取消發佈
+        await c.httpClient
+          .request("/sap/bc/adt/businessservices/odatav4/unpublishjobs", {
+            method: "POST",
+            headers: { "Content-Type": "application/xml", Accept: "application/xml" },
+            body:
+              `<?xml version="1.0" encoding="UTF-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">` +
+              `<adtcore:objectReference adtcore:type="SCGR" adtcore:name="${o.name.toUpperCase()}"/></adtcore:objectReferences>`,
+          })
+          .catch(() => undefined);
+      }
+      try {
+        await deleteUri(c, o.uri);
+      } catch (e) {
+        if (await stillThere(o.uri)) console.error(`清除暫存物件 ${o.uri} 失敗,請在 Eclipse 的 $TMP 手動刪除:${sapError(e)}`);
+      }
+    }
+    await s?.close();
+  }, 600_000);
+
+  it("T31 create_object TABL/DT → write_source 定義欄位並啟用 → ddic_info 讀得到", async () => {
+    const c = await s.call("create_object", { object_type: "TABL/DT", name: TAB, package_name: "$TMP", description: "abap-adt-mcp IT5" });
+    expect(c.isError, c.text).toBe(false);
+    const w = await s.call("write_source", { object_url: tableUri, new_source: tableSource, activate: true });
+    expect(w.isError, w.text).toBe(false);
+    expect(w.text).toContain("已啟用");
+    const d = await s.call("ddic_info", { name: TAB, object_type: "TABL/DT" });
+    expect(d.isError, d.text).toBe(false);
+    expect(d.text).toContain("local_last_changed_at");
+    const tooLong = await s.call("create_object", { object_type: "TABL/DT", name: "ZMCP_NAME_TOO_LONG_X", package_name: "$TMP", description: "x" });
+    expect(tooLong.isError).toBe(true);
+    expect(tooLong.text).toContain("名稱最長 16 個字元");
+  }, 300_000);
+
+  it("T32 rap_generate 預設只預覽:列出物件與 binding,系統裡沒有建立任何物件", async () => {
+    const svc = new RealAdtService(s.cfg);
+    const links = await svc.rapGeneratorLinks(tableUri);
+    expect(links, "A4H 應有 ui-service 產生器").toBeDefined();
+    planned = (await svc.rapPreview(links!, tableUri, "$TMP")).objects;
+    expect(planned.length).toBeGreaterThanOrEqual(10);
+
+    const r = await s.call("rap_generate", { source_table: TAB, package_name: "$TMP" });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("🔍 預覽(尚未建立任何物件)");
+    expect(r.text).toContain(`service binding:ZUI_${TAB.slice(1)}_O4`);
+    expect(r.text).toContain("confirm=true");
+    const binding = planned.find((o) => o.type === "SRVB/SVB");
+    const rootView = planned.find((o) => o.type === "DDLS/DF" && /^ZR_/.test(o.name));
+    expect(binding && rootView).toBeTruthy();
+    expect(await exists(binding!.name, binding!.type)).toBe(false);
+    expect(await exists(rootView!.name, rootView!.type)).toBe(false);
+  }, 600_000);
+
+  it("T33 白名單:名稱前綴或 package 不符時 confirm 也整批拒絕,不建立任何物件", async () => {
+    const narrow = await startServer({
+      ...process.env,
+      ABAP_MCP_READONLY: "false",
+      ABAP_MCP_SYSTEM_ROLE: "dev",
+      // 只允許來源表自己的前綴 → 產生器預設的 ZR_ / ZC_ / ZBP_ / ZUI_ 名稱都不在白名單內
+      ABAP_MCP_ALLOWED_PREFIXES: TAB,
+    });
+    try {
+      const pv = await narrow.call("rap_generate", { source_table: TAB, package_name: "$TMP" });
+      expect(pv.text).toContain("⚠️ 以下物件不在可寫入的名稱白名單內");
+      const r = await narrow.call("rap_generate", { source_table: TAB, package_name: "$TMP", confirm: true });
+      expect(r.isError).toBe(true);
+      expect(r.text).toContain("整批拒絕,沒有產生任何物件");
+    } finally {
+      await narrow.close();
+    }
+    const pkg = await s.call("rap_generate", { source_table: TAB, package_name: "NOT_ALLOWED_PKG", confirm: true, transport: "A4HK900001" });
+    expect(pkg.isError).toBe(true);
+    expect(pkg.text).toContain("不在允許的 package 白名單內");
+    for (const o of planned.filter((x) => x.type === "SRVB/SVB" || x.type === "DDLS/DF")) {
+      expect(await exists(o.name, o.type), o.name).toBe(false);
+    }
+  }, 600_000);
+
+  it("T34 confirm=true 實際產生並發佈:物件都存在、回傳 OData V4 服務網址與 Fiori preview 說明", async () => {
+    // A4H 熱機約 3–4 分鐘;剛啟動時可能超過 5 分鐘而回 5xx(工具會回報已存在/缺少的物件)
+    const r = await s.call("rap_generate", { source_table: TAB, package_name: "$TMP", confirm: true });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain(`✅ 已在 package $TMP 由 ${TAB} 產生 ${planned.length} 個物件`);
+    expect(r.text).toContain("✅ 已發佈");
+    expect(r.text).toMatch(/OData V4 服務:http\S+\/sap\/opu\/odata4\//);
+    expect(r.text).toContain("Fiori Elements preview");
+    for (const o of planned.filter((x) => ["SRVB/SVB", "SRVD/SRV", "BDEF/BDO", "DDLS/DF"].includes(x.type))) {
+      expect(await exists(o.name, o.type), o.name).toBe(true);
+    }
+  }, 900_000);
 });

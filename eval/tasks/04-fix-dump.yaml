@@ -1,0 +1,39 @@
+# 修一個會短傾印的 class:3 筆的表配 DO 4 TIMES,第 4 次讀表 ITAB_LINE_NOT_FOUND
+id: "04"
+title: 修短傾印
+prompt: |
+  $TMP 裡的 class ZCL_EVAL04_{{SFX}} 執行時會短傾印。請找出原因並修好,
+  修好後用 run_class 驗證不再短傾印。
+setup:
+  - tool: create_object
+    args: { object_type: CLAS/OC, name: ZCL_EVAL04_{{SFX}}, package_name: $TMP, description: eval 04 dump }
+  - tool: write_source
+    args:
+      object_url: /sap/bc/adt/oo/classes/zcl_eval04_{{sfx}}
+      activate: true
+      new_source: |
+        CLASS zcl_eval04_{{sfx}} DEFINITION PUBLIC FINAL CREATE PUBLIC.
+          PUBLIC SECTION.
+            INTERFACES if_oo_adt_classrun.
+        ENDCLASS.
+
+        CLASS zcl_eval04_{{sfx}} IMPLEMENTATION.
+          METHOD if_oo_adt_classrun~main.
+            DATA(carriers) = VALUE string_table( ( `LH` ) ( `AA` ) ( `UA` ) ).
+            DO 4 TIMES.
+              DATA(carrier) = carriers[ sy-index ].
+              out->write( |Carrier { sy-index }: { carrier }| ).
+            ENDDO.
+          ENDMETHOD.
+        ENDCLASS.
+  # 先執行一次,讓 ST22 有這筆短傾印
+  - tool: run_class
+    args: { class_name: ZCL_EVAL04_{{SFX}} }
+    allow_error: true
+checks:
+  - kind: tool
+    tool: run_class
+    args: { class_name: ZCL_EVAL04_{{SFX}} }
+    contains: ["Carrier 3: UA"]
+cleanup:
+  - /sap/bc/adt/oo/classes/zcl_eval04_{{sfx}}

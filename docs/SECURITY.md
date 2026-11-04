@@ -96,9 +96,29 @@ SAP 預設連續登入失敗 5 次即鎖住帳號。密碼錯誤時,AI 或使用
 
 ST22 短傾印的完整內容常超過 1 MB,其中 **Selected Variables** 章節會列出當下的變數內容,可能包含業務資料。`dump_detail` 只擷取除錯需要的章節(Short Text、Error analysis、How to correct、where terminated、Source Code Extract、Active Calls/Events 等),不含變數內容、系統環境、記憶體與核心資訊;輸出上限 20,000 字元。即使如此,原始碼片段與錯誤說明仍可能出現常數或訊息文字,連正式系統時請評估。`dump_detail` 的 dump_id 只接受 `/sap/bc/adt/runtime/dump/…` 路徑,不能被拿來讀其他 ADT 資源。
 
+### 3-7. RAP 產生器(`rap_generate`)一次建立很多物件
+
+`rap_generate` 呼叫 SAP 的 RAP 產生器(ui-service),由一張表產生整套 RAP BO 與 OData V4 UI 服務。A4H 實測一次約 **14 個物件**:base / projection CDS、behavior definition 與兩個 behavior 實作 class、metadata extension、兩個 access control、service definition、service binding、SAP object type / node type,以及一張**草稿表**(新的資料庫表)。一次呼叫影響的範圍遠大於其他寫入工具,而且產生後要一個個依相依關係刪除才能還原。因此:
+
+- **兩段式**:預設只預覽(不建立任何物件),回傳完整物件清單與 service binding 名稱;必須以相同參數再加 `confirm=true` 才會產生。AI 應把清單給使用者看過再確認。
+- **整批白名單**:預覽清單的**每一個**物件都要通過名稱前綴白名單,目標 package 要通過 package 白名單;任一不過,`confirm=true` 也**整批拒絕**、一個都不建。注意 SAP object type / node type 與草稿表沿用**來源表名稱**,不受 `name_prefix` 影響。
+- **寫入佇列 + 每物件一筆 audit**:產生在寫入佇列內執行,不與其他寫入交錯;audit 對每個物件各記一筆 `rap_generate`。
+- **唯讀模式不註冊**;非本機 package 必須提供 transport。
+- **發佈 = 對外開放 OData 服務**:預設 `publish=true` 會發佈 service binding,系統上任何有權限的使用者都能透過 `/sap/opu/odata4/…` 讀寫這張表的資料。連共用的開發系統時,請考慮 `publish=false`,確認後再在 Eclipse 手動發佈。
+- **逾時**:系統剛啟動時產生可能超過 5 分鐘而回 5xx,但 SAP 端多半已建立大部分物件。工具會逐一查證並回報「已存在 X/N、缺少哪些」,不會假裝成功。
+- **刪除順序**(由外而內):service binding → service definition → metadata extension → access control → behavior definition(projection 先)→ behavior 實作 class → CDS(projection 先)→ SAP object type / node type → 草稿表 → 來源表。已發佈的 binding 必須先取消發佈(A4H 實測直接刪除會回「Service endpoint … is published」),service definition 也要等 binding 刪除後才能刪。
+
+### 3-8. abapGit 只讀、不提供 pull / push
+
+`abapgit_repos` 只列出系統上已連結的 abapGit repo(需要 abapGit 的 ADT 後端;A4H 預設沒有,此時回報說明並建議用 SAP GUI 執行 `ZABAPGIT_STANDALONE`)。**刻意不提供 pull / push / stage**:
+
+- **pull 會覆寫系統上的物件**,可能一次改動整個 package,且不經過本專案的名稱白名單、語法檢查與並行保護;內容也來自外部 repo,等於讓 AI 把任意程式碼放進 SAP。
+- **push 會把 SAP 上的程式碼送到外部 Git 服務**,屬於資料外洩路徑,而且需要 Git 帳號憑證,本專案不應持有。
+- 兩者都難以還原,也不適合在 AI 沒有人監看時執行。請在 abapGit 介面由人確認差異後操作。
+
 ### 4. Audit log
 
-設定 `ABAP_MCP_AUDIT_LOG=/path/audit.jsonl` 後,每筆寫入、啟用(含 `activate_objects` 批次啟用的每個物件)、建立物件(`create_object`)、為語法檢查先建立空的測試 include(`create_test_include`)、執行(`run_class`)、建立 transport(`create_transport`)、資料查詢(`data_preview`,只記 SQL 與筆數)操作記錄一行 JSON:
+設定 `ABAP_MCP_AUDIT_LOG=/path/audit.jsonl` 後,每筆寫入、啟用(含 `activate_objects` 批次啟用的每個物件)、建立物件(`create_object`)、為語法檢查先建立空的測試 include(`create_test_include`)、執行(`run_class`)、建立 transport(`create_transport`)、資料查詢(`data_preview`,只記 SQL 與筆數)、RAP 產生(`rap_generate`,每個物件一筆)操作記錄一行 JSON:
 
 ```json
 {"timestamp":"2026-06-12T08:00:00.000Z","action":"write_source","objectUrl":"/sap/bc/adt/oo/classes/zcl_demo","objectName":"ZCL_DEMO","transport":"DEVK900123","summary":"行數 120 → 135(約 +18 / -3)","success":true}
@@ -136,6 +156,8 @@ export NODE_EXTRA_CA_CERTS=/path/to/corp-root-ca.pem
 - [ ] 白名單收斂到實際需要的命名空間與 package(`ABAP_MCP_ALLOWED_PREFIXES`、`ABAP_MCP_ALLOWED_PACKAGES`)
 - [ ] 不希望 AI 在 SAP 上執行程式(`run_class`)時,使用唯讀模式
 - [ ] 只在確實需要時開啟 `ABAP_MCP_ALLOW_DATA_PREVIEW`,並把 `ABAP_MCP_DATA_PREVIEW_TABLES` 收斂到最小範圍
+- [ ] 使用 `rap_generate` 前先看過預覽清單;共用系統上考慮 `publish=false`
+- [ ] 跑評測(`npm run eval`)只對 Trial / 沙箱系統;評測會在 `$TMP` 建立並刪除暫存物件,且依模型收費
 - [ ] 密碼不出現在任何進版控的檔案中
 
 ## 回報安全問題

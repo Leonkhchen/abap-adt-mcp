@@ -296,6 +296,38 @@ export function registerDiagnosticTools(
     }
   );
 
+  // ───────────────────────────── E3 abapgit_repos(只讀)─────────────────────────────
+  server.registerTool(
+    "abapgit_repos",
+    {
+      title: "列出 abapGit repo(只讀)",
+      description:
+        "列出系統上以 abapGit ADT 後端連結的 repo(package、Git URL、branch、狀態)。只讀:" +
+        "pull / push / stage 刻意不提供(需要把 GitHub 帳密或 token 交給工具,會經過 AI),請在 SAP GUI 的 abapGit 操作。" +
+        "系統沒有 abapGit ADT 後端時會說明替代方式。",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        if (!(await adt.hasAdtCollection(ABAPGIT_REPOS_PATH))) {
+          return ok(
+            `ℹ️ 此系統沒有 abapGit ADT 後端(ADT discovery 沒有 ${ABAPGIT_REPOS_PATH}),無法從這裡讀取 repo。` +
+              `請用 SAP GUI 執行 ZABAPGIT_STANDALONE(交易碼 SE38)查看與操作 repo;pull / push 也請在那裡由人操作。`
+          );
+        }
+        const repos = await adt.gitRepos();
+        if (repos.length === 0) return ok("abapGit 沒有任何已連結的 repo。");
+        return ok(
+          `📦 abapGit 共 ${repos.length} 個 repo:\n` +
+            repos.map((r) => `- ${r.name}(package ${r.packageName},branch ${r.branch || "?"})${r.status ? ` ${r.status}` : ""}\n  ${r.url}`).join("\n") +
+            "\nℹ️ pull / push 請在 SAP GUI 的 abapGit 由人操作。"
+        );
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
+
   // ───────────────────────────── D4 pretty_print ─────────────────────────────
   server.registerTool(
     "pretty_print",
@@ -397,6 +429,9 @@ export function registerDiagnosticTools(
     }
   );
 }
+
+/** abapGit ADT 後端的 repo 集合(A4H 沒有,需另裝 abapGit 的 ADT 後端) */
+const ABAPGIT_REPOS_PATH = "/sap/bc/adt/abapgit/repos";
 
 /** get_revisions 的 diff 上限行數 */
 const REVISION_DIFF_MAX_LINES = 500;

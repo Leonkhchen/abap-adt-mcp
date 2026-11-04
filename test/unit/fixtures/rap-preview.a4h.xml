@@ -1,0 +1,318 @@
+<?xml version="1.0" encoding="utf-8"?><massOperation:group massOperation:name="Service Artifacts" xmlns:massOperation="http://www.sap.com/adt/massoperation"><massOperation:group massOperation:name="Business Service Layer"><massOperation:object><massOperation:property massOperation:key="Operation">CREATE</massOperation:property><massOperation:codeSnippet><adtcore:content adtcore:type="plain/text" xmlns:adtcore="http://www.sap.com/adt/core">@EndUserText.label : 'Service Definition for ZC_MCP_RAP_SRC'
+@ObjectModel.leadingEntity.name : 'ZC_MCP_RAP_SRC'
+define service ZUI_MCP_RAP_SRC_O4 provider contracts odata_v4_ui  { 
+  expose ZC_MCP_RAP_SRC ;
+}</adtcore:content></massOperation:codeSnippet><massOperation:objectReference adtcore:uri="/sap/bc/adt/ddic/srvd/sources/zui_mcp_rap_src_o4" adtcore:type="SRVD/SRV" adtcore:name="ZUI_MCP_RAP_SRC_O4" xmlns:adtcore="http://www.sap.com/adt/core"/></massOperation:object><massOperation:object><massOperation:property massOperation:key="Operation">CREATE</massOperation:property><massOperation:codeSnippet><adtcore:content adtcore:type="plain/text" xmlns:adtcore="http://www.sap.com/adt/core"/></massOperation:codeSnippet><massOperation:objectReference adtcore:uri="/sap/bc/adt/businessservices/bindings/zui_mcp_rap_src_o4" adtcore:type="SRVB/SVB" adtcore:name="ZUI_MCP_RAP_SRC_O4" xmlns:adtcore="http://www.sap.com/adt/core"/></massOperation:object></massOperation:group><massOperation:group massOperation:name="SAP Object Type"><massOperation:object><massOperation:property massOperation:key="Operation">CREATE</massOperation:property><massOperation:codeSnippet><adtcore:content adtcore:type="application/json" xmlns:adtcore="http://www.sap.com/adt/core">{
+ "formatVersion":"1",
+ "header":
+ {
+  "description":"SAP Object Node Type ZMCP_RAP_SRC",
+  "originalLanguage":"en"
+ },
+ "name":"ZMCP_RAP_SRC",
+ "sapObjectType":"ZMCP_RAP_SRC",
+ "rootNode":true
+}</adtcore:content></massOperation:codeSnippet><massOperation:objectReference adtcore:uri="/sap/bc/adt/businessobjects/nontnot/zmcp_rap_src" adtcore:type="NONT/NOT" adtcore:name="ZMCP_RAP_SRC" xmlns:adtcore="http://www.sap.com/adt/core"/></massOperation:object><massOperation:object><massOperation:property massOperation:key="Operation">CREATE</massOperation:property><massOperation:codeSnippet><adtcore:content adtcore:type="application/json" xmlns:adtcore="http://www.sap.com/adt/core">{
+ "formatVersion":"1",
+ "header":
+ {
+  "description":"SAP Object Type ZMCP_RAP_SRC",
+  "originalLanguage":"en"
+ },
+ "typeCategory":"businessObject",
+ "name":"ZMCP_RAP_SRC"
+}</adtcore:content></massOperation:codeSnippet><massOperation:objectReference adtcore:uri="/sap/bc/adt/businessobjects/rontrot/zmcp_rap_src" adtcore:type="RONT/ROT" adtcore:name="ZMCP_RAP_SRC" xmlns:adtcore="http://www.sap.com/adt/core"/></massOperation:object></massOperation:group><massOperation:group massOperation:name="Business Object Projection Layer"><massOperation:object><massOperation:property massOperation:key="Operation">CREATE</massOperation:property><massOperation:codeSnippet><adtcore:content adtcore:type="plain/text" xmlns:adtcore="http://www.sap.com/adt/core">@Metadata.allowExtensions: true
+@Metadata.ignorePropagatedAnnotations: true
+@Endusertext: {
+  Label: '###GENERATED Core Data Service Entity'
+}
+@Objectmodel: {
+  Sapobjectnodetype.Name: 'ZMCP_RAP_SRC'
+}
+@AccessControl.authorizationCheck: #MANDATORY
+define root view entity ZC_MCP_RAP_SRC
+  provider contract TRANSACTIONAL_QUERY
+  as projection on ZR_MCP_RAP_SRC
+{
+  key UUID,
+  Name,
+  Amount,
+  @Semantics: {
+    User.Createdby: true
+  }
+  LocalCreatedBy,
+  @Semantics: {
+    Systemdatetime.Createdat: true
+  }
+  LocalCreatedAt,
+  @Semantics: {
+    User.Localinstancelastchangedby: true
+  }
+  LocalLastChangedBy,
+  @Semantics: {
+    Systemdatetime.Localinstancelastchangedat: true
+  }
+  LocalLastChangedAt,
+  @Semantics: {
+    Systemdatetime.Lastchangedat: true
+  }
+  LastChangedAt
+}</adtcore:content></massOperation:codeSnippet><massOperation:objectReference adtcore:uri="/sap/bc/adt/ddic/ddl/sources/zc_mcp_rap_src" adtcore:type="DDLS/DF" adtcore:name="ZC_MCP_RAP_SRC" xmlns:adtcore="http://www.sap.com/adt/core"/></massOperation:object><massOperation:object><massOperation:property massOperation:key="Operation">CREATE</massOperation:property><massOperation:codeSnippet><adtcore:content adtcore:type="plain/text" xmlns:adtcore="http://www.sap.com/adt/core">@Metadata.layer: #CORE
+@UI.headerInfo.title.type: #STANDARD
+@UI.headerInfo.title.value: 'UUID'
+@UI.headerInfo.description.type: #STANDARD
+@UI.headerInfo.description.value: 'UUID'
+annotate view ZC_MCP_RAP_SRC with
+{
+  @EndUserText.label: 'UUID'
+  @UI.facet: [ {
+    label: 'General Information', 
+    id: 'GeneralInfo', 
+    purpose: #STANDARD, 
+    position: 10 , 
+    type: #IDENTIFICATION_REFERENCE
+  } ]
+  @UI.identification: [ {
+    position: 10 , 
+    label: 'UUID'
+  } ]
+  @UI.lineItem: [ {
+    position: 10 , 
+    label: 'UUID'
+  } ]
+  @UI.selectionField: [ {
+    position: 10 
+  } ]
+  UUID;
+  
+  @EndUserText.label: 'Name'
+  @UI.identification: [ {
+    position: 20 , 
+    label: 'Name'
+  } ]
+  @UI.lineItem: [ {
+    position: 20 , 
+    label: 'Name'
+  } ]
+  @UI.selectionField: [ {
+    position: 20 
+  } ]
+  Name;
+  
+  @EndUserText.label: 'Amount'
+  @UI.identification: [ {
+    position: 30 , 
+    label: 'Amount'
+  } ]
+  @UI.lineItem: [ {
+    position: 30 , 
+    label: 'Amount'
+  } ]
+  @UI.selectionField: [ {
+    position: 30 
+  } ]
+  Amount;
+  
+  @UI.identification: [ {
+    position: 40 
+  } ]
+  @UI.lineItem: [ {
+    position: 40 
+  } ]
+  @UI.selectionField: [ {
+    position: 40 
+  } ]
+  LocalCreatedBy;
+  
+  @UI.identification: [ {
+    position: 50 
+  } ]
+  @UI.lineItem: [ {
+    position: 50 
+  } ]
+  @UI.selectionField: [ {
+    position: 50 
+  } ]
+  LocalCreatedAt;
+  
+  @UI.identification: [ {
+    position: 60 
+  } ]
+  @UI.lineItem: [ {
+    position: 60 
+  } ]
+  @UI.selectionField: [ {
+    position: 60 
+  } ]
+  LocalLastChangedBy;
+  
+  @UI.identification: [ {
+    position: 70 
+  } ]
+  @UI.lineItem: [ {
+    position: 70 
+  } ]
+  @UI.selectionField: [ {
+    position: 70 
+  } ]
+  LocalLastChangedAt;
+  
+  @UI.identification: [ {
+    position: 80 
+  } ]
+  @UI.lineItem: [ {
+    position: 80 
+  } ]
+  @UI.selectionField: [ {
+    position: 80 
+  } ]
+  LastChangedAt;
+}</adtcore:content></massOperation:codeSnippet><massOperation:objectReference adtcore:uri="/sap/bc/adt/ddic/ddlx/sources/zc_mcp_rap_src" adtcore:type="DDLX/EX" adtcore:name="ZC_MCP_RAP_SRC" xmlns:adtcore="http://www.sap.com/adt/core"/></massOperation:object><massOperation:object><massOperation:property massOperation:key="Operation">CREATE</massOperation:property><massOperation:codeSnippet><adtcore:content adtcore:type="plain/text" xmlns:adtcore="http://www.sap.com/adt/core">projection implementation in class ZBP_C_MCP_RAP_SRC unique;
+strict ( 2 );
+extensible;
+use draft;
+use side effects;
+define behavior for ZC_MCP_RAP_SRC alias ZcMcpRapSrc
+extensible
+use etag
+{
+  use create;
+  use update;
+  use delete;
+
+  use action Edit;
+  use action Activate;
+  use action Discard;
+  use action Resume;
+  use action Prepare;
+
+}</adtcore:content></massOperation:codeSnippet><massOperation:objectReference adtcore:uri="/sap/bc/adt/bo/behaviordefinitions/zc_mcp_rap_src" adtcore:type="BDEF/BDO" adtcore:name="ZC_MCP_RAP_SRC" xmlns:adtcore="http://www.sap.com/adt/core"/></massOperation:object><massOperation:object><massOperation:property massOperation:key="Operation">CREATE</massOperation:property><massOperation:codeSnippet><adtcore:content adtcore:type="application/json" xmlns:adtcore="http://www.sap.com/adt/core">class ZBP_C_MCP_RAP_SRC definition
+public
+abstract
+final
+for behavior of ZC_MCP_RAP_SRC . 
+
+public section.
+
+protected section.
+
+private section.
+
+endclass.
+
+
+
+class ZBP_C_MCP_RAP_SRC implementation.
+
+endclass.</adtcore:content></massOperation:codeSnippet><massOperation:objectReference adtcore:uri="/sap/bc/adt/oo/classes/zbp_c_mcp_rap_src" adtcore:type="CLAS/OC" adtcore:name="ZBP_C_MCP_RAP_SRC" xmlns:adtcore="http://www.sap.com/adt/core"/></massOperation:object><massOperation:object><massOperation:property massOperation:key="Operation">CREATE</massOperation:property><massOperation:codeSnippet><adtcore:content adtcore:type="plain/text" xmlns:adtcore="http://www.sap.com/adt/core">@EndUserText.label: 'ZC_MCP_RAP_SRC'
+@MappingRole: true
+define role  ZC_MCP_RAP_SRC {
+grant select on ZC_MCP_RAP_SRC 
+where inheriting conditions from entity ZR_MCP_RAP_SRC  default true;
+}</adtcore:content></massOperation:codeSnippet><massOperation:objectReference adtcore:uri="/sap/bc/adt/acm/dcl/sources/zc_mcp_rap_src" adtcore:type="DCLS/DL" adtcore:name="ZC_MCP_RAP_SRC" xmlns:adtcore="http://www.sap.com/adt/core"/></massOperation:object></massOperation:group><massOperation:group massOperation:name="Business Object Layer"><massOperation:object><massOperation:property massOperation:key="Operation">CREATE</massOperation:property><massOperation:codeSnippet><adtcore:content adtcore:type="plain/text" xmlns:adtcore="http://www.sap.com/adt/core">@AccessControl.authorizationCheck: #MANDATORY
+@Metadata.allowExtensions: true
+@ObjectModel.sapObjectNodeType.name: 'ZMCP_RAP_SRC'
+@EndUserText.label: '###GENERATED Core Data Service Entity'
+define root view entity ZR_MCP_RAP_SRC
+  as select from ZMCP_RAP_SRC
+{
+  key uuid as UUID,
+  name as Name,
+  amount as Amount,
+  @Semantics.user.createdBy: true
+  local_created_by as LocalCreatedBy,
+  @Semantics.systemDateTime.createdAt: true
+  local_created_at as LocalCreatedAt,
+  @Semantics.user.localInstanceLastChangedBy: true
+  local_last_changed_by as LocalLastChangedBy,
+  @Semantics.systemDateTime.localInstanceLastChangedAt: true
+  local_last_changed_at as LocalLastChangedAt,
+  @Semantics.systemDateTime.lastChangedAt: true
+  last_changed_at as LastChangedAt
+}</adtcore:content></massOperation:codeSnippet><massOperation:objectReference adtcore:uri="/sap/bc/adt/ddic/ddl/sources/zr_mcp_rap_src" adtcore:type="DDLS/DF" adtcore:name="ZR_MCP_RAP_SRC" xmlns:adtcore="http://www.sap.com/adt/core"/></massOperation:object><massOperation:object><massOperation:property massOperation:key="Operation">CREATE</massOperation:property><massOperation:codeSnippet><adtcore:content adtcore:type="plain/text" xmlns:adtcore="http://www.sap.com/adt/core">managed implementation in class ZBP_R_MCP_RAP_SRC unique;
+strict ( 2 );
+with draft;
+extensible;
+define behavior for ZR_MCP_RAP_SRC alias ZrMcpRapSrc
+persistent table ZMCP_RAP_SRC
+extensible
+draft table ZMCP_RAP_SRC_D
+etag master LocalLastChangedAt
+lock master total etag LastChangedAt
+authorization master( global )
+{
+  field ( readonly )
+   UUID,
+   LocalCreatedBy,
+   LocalCreatedAt,
+   LocalLastChangedBy,
+   LocalLastChangedAt,
+   LastChangedAt;
+  
+  field ( numbering : managed )
+   UUID;
+  
+  
+  create;
+  update;
+  delete;
+
+  draft action Activate optimized;
+  draft action Discard;
+  draft action Edit;
+  draft action Resume;
+  draft determine action Prepare;
+
+  mapping for ZMCP_RAP_SRC corresponding extensible
+  {
+    UUID = uuid;
+    Name = name;
+    Amount = amount;
+    LocalCreatedBy = local_created_by;
+    LocalCreatedAt = local_created_at;
+    LocalLastChangedBy = local_last_changed_by;
+    LocalLastChangedAt = local_last_changed_at;
+    LastChangedAt = last_changed_at;
+  }
+
+}</adtcore:content></massOperation:codeSnippet><massOperation:objectReference adtcore:uri="/sap/bc/adt/bo/behaviordefinitions/zr_mcp_rap_src" adtcore:type="BDEF/BDO" adtcore:name="ZR_MCP_RAP_SRC" xmlns:adtcore="http://www.sap.com/adt/core"/></massOperation:object><massOperation:object><massOperation:property massOperation:key="Operation">CREATE</massOperation:property><massOperation:codeSnippet><adtcore:content adtcore:type="application/json" xmlns:adtcore="http://www.sap.com/adt/core">class ZBP_R_MCP_RAP_SRC definition
+public
+abstract
+final
+for behavior of ZR_MCP_RAP_SRC . 
+
+public section.
+
+protected section.
+
+private section.
+
+endclass.
+
+
+
+class ZBP_R_MCP_RAP_SRC implementation.
+
+endclass.</adtcore:content></massOperation:codeSnippet><massOperation:objectReference adtcore:uri="/sap/bc/adt/oo/classes/zbp_r_mcp_rap_src" adtcore:type="CLAS/OC" adtcore:name="ZBP_R_MCP_RAP_SRC" xmlns:adtcore="http://www.sap.com/adt/core"/></massOperation:object><massOperation:object><massOperation:property massOperation:key="Operation">CREATE</massOperation:property><massOperation:codeSnippet><adtcore:content adtcore:type="plain/text" xmlns:adtcore="http://www.sap.com/adt/core">@EndUserText.label: 'ZR_MCP_RAP_SRC'
+@MappingRole: true
+define role  ZR_MCP_RAP_SRC {
+grant select on ZR_MCP_RAP_SRC 
+ where true;
+}</adtcore:content></massOperation:codeSnippet><massOperation:objectReference adtcore:uri="/sap/bc/adt/acm/dcl/sources/zr_mcp_rap_src" adtcore:type="DCLS/DL" adtcore:name="ZR_MCP_RAP_SRC" xmlns:adtcore="http://www.sap.com/adt/core"/></massOperation:object></massOperation:group><massOperation:group massOperation:name="Data Base Model Layer"><massOperation:object><massOperation:property massOperation:key="Operation">CREATE</massOperation:property><massOperation:codeSnippet><adtcore:content adtcore:type="plain/text" xmlns:adtcore="http://www.sap.com/adt/core">@EndUserText.label : 'Draft Database Table for ZMCP_RAP_SRC_D'
+@AbapCatalog.enhancement.category : #EXTENSIBLE_ANY
+@AbapCatalog.tableCategory : #TRANSPARENT
+@AbapCatalog.deliveryClass : #A
+@AbapCatalog.dataMaintenance : #RESTRICTED
+define table zmcp_rap_src_d {
+
+  key mandt          : mandt not null;
+  key uuid           : sysuuid_x16 not null;
+  name               : abap.char(40);
+  amount             : abap.dec(15,2);
+  localcreatedby     : abp_creation_user;
+  localcreatedat     : abp_creation_tstmpl;
+  locallastchangedby : abp_locinst_lastchange_user;
+  locallastchangedat : abp_locinst_lastchange_tstmpl;
+  lastchangedat      : abp_lastchange_tstmpl;
+  "%admin"           : include sych_bdl_draft_admin_inc;
+}</adtcore:content></massOperation:codeSnippet><massOperation:objectReference adtcore:uri="/sap/bc/adt/ddic/tables/zmcp_rap_src_d" adtcore:type="TABL/DT" adtcore:name="ZMCP_RAP_SRC_D" xmlns:adtcore="http://www.sap.com/adt/core"/></massOperation:object></massOperation:group></massOperation:group>

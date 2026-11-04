@@ -29,6 +29,18 @@ import type { AppConfig } from "../config.js";
 import { AuthCircuitOpenError, hasHttpStatus, isAuthFailure } from "./errors.js";
 import { activationBody, parseActivationResponse } from "./activation.js";
 import {
+  applyNamePrefix,
+  findGeneratorLinks,
+  parseObjectRefs,
+  parseODataV4Service,
+  parseValidationMessages,
+  RAP_CONTENT_TYPE,
+  RAP_PREVIEW_TYPE,
+  RAP_UI_SERVICE_ID,
+  type RapGeneratorLinks,
+  type RapObjectRef,
+} from "./rapGenerator.js";
+import {
   extractDumpChapters,
   normalizeDumpId,
   parseDumpMeta,
@@ -176,6 +188,25 @@ export interface AdtService {
   classComponents(objectUrl: string): Promise<ClassComponent>;
   /** 執行 class 的 IF_OO_ADT_CLASSRUN~MAIN,回傳 out->write 的輸出 */
   runClass(className: string): Promise<string>;
+  /** ADT discovery 是否有以 href 開頭的 collection(結果在 process 內快取) */
+  hasAdtCollection(href: string): Promise<boolean>;
+  /** abapGit ADT 後端的 repo 清單(呼叫前先用 hasAdtCollection 確認端點存在) */
+  gitRepos(): Promise<{ name: string; packageName: string; url: string; branch: string; status: string }[]>;
+  /** RAP ui-service 產生器的連結;系統沒有此產生器時回 undefined */
+  rapGeneratorLinks(tableUri: string): Promise<RapGeneratorLinks | undefined>;
+  /** 取得產生器預設內容(可套用名稱前綴)、檢查並預覽會建立的物件(不建立任何東西) */
+  rapPreview(
+    links: RapGeneratorLinks,
+    tableUri: string,
+    packageName: string,
+    namePrefix?: string
+  ): Promise<{ content: object; validation: { ok: boolean; messages: string[] }; objects: RapObjectRef[] }>;
+  /** 依內容實際產生(transport 空字串 = 本機 package);回傳 SAP 回報的物件 */
+  rapGenerate(links: RapGeneratorLinks, tableUri: string, content: object, transport: string): Promise<RapObjectRef[]>;
+  /** 發佈 OData V4 service binding */
+  rapPublish(bindingName: string): Promise<{ ok: boolean; message: string }>;
+  /** service binding 的 OData V4 服務 URL 與主要 entity set */
+  odataV4Service(bindingName: string): Promise<{ serviceUrl: string; leadingEntity: string }>;
   /** 版本歷史(新的在前);url 可為物件、source/main 或 class include */
   revisions(url: string): Promise<Revision[]>;
   /** 取得某個版本的內容;sourceUrl 是該物件(或 include)的 source URI */
@@ -537,6 +568,114 @@ export class RealAdtService implements AdtService {
 
   async runClass(className: string) {
     return this.guard(() => this.client.runClass(className.toUpperCase()));
+  }
+
+  /** ADT discovery 的 collection href 清單(第一次讀取後快取;約 400 KB) */
+  private discoveryHrefs?: Promise<string[]>;
+
+  async hasAdtCollection(href: string) {
+    this.discoveryHrefs ??= this.guard(() =>
+      this.client.httpClient.request("/sap/bc/adt/discovery", { headers: { Accept: "application/atomsvc+xml" } })
+    )
+      .then((r) => [...String(r.body ?? "").matchAll(/<app:collection\s+href="([^"]+)"/g)].map((m) => m[1]))
+      .catch((e) => {
+        this.discoveryHrefs = undefined; // 失敗不快取,下次重試
+        throw e;
+      });
+    return (await this.discoveryHrefs).some((h) => h === href || h.startsWith(`${href}/`));
+  }
+
+  async gitRepos() {
+    const repos = await this.guard(() => this.client.gitRepos());
+    return repos.map((r) => ({
+      name: (r.url ?? "").replace(/\/$/, "").split("/").pop()?.replace(/\.git$/, "") ?? "",
+      packageName: r.sapPackage ?? "",
+      url: r.url ?? "",
+      branch: r.branch_name ?? "",
+      status: r.status_text ?? r.status ?? "",
+    }));
+  }
+
+  async rapGeneratorLinks(tableUri: string) {
+    const feed = await this.guard(() =>
+      this.client.httpClient.request(
+        `/sap/bc/adt/repository/generators?referencedObject=${encodeURIComponent(tableUri)}&fetchAllGenerators=true`,
+        { headers: { Accept: "application/atom+xml;type=feed" } }
+      )
+    );
+    return findGeneratorLinks(String(feed.body ?? ""), RAP_UI_SERVICE_ID);
+  }
+
+  async rapPreview(links: RapGeneratorLinks, tableUri: string, packageName: string, namePrefix?: string) {
+    const ref = `referencedObject=${encodeURIComponent(tableUri)}`;
+    const raw = await this.guard(() =>
+      this.client.httpClient.request(`${links.content}?${ref}&package=${encodeURIComponent(packageName.toUpperCase())}`, {
+        headers: { Accept: RAP_CONTENT_TYPE },
+      })
+    );
+    let content = JSON.parse(String(raw.body)) as object;
+    if (namePrefix) content = applyNamePrefix(content, namePrefix.toUpperCase());
+    const body = JSON.stringify(content);
+    const v = await this.guard(() =>
+      this.client.httpClient.request(`${links.validation}?${ref}`, {
+        method: "POST",
+        headers: { "Content-Type": RAP_CONTENT_TYPE },
+        body,
+      })
+    );
+    const p = await this.guard(() =>
+      this.client.httpClient.request(`${links.preview}?${ref}`, {
+        method: "POST",
+        headers: { "Content-Type": RAP_CONTENT_TYPE, Accept: RAP_PREVIEW_TYPE },
+        body,
+      })
+    );
+    return {
+      content,
+      validation: parseValidationMessages(String(v.body ?? "")),
+      objects: parseObjectRefs(String(p.body ?? "")),
+    };
+  }
+
+  async rapGenerate(links: RapGeneratorLinks, tableUri: string, content: object, transport: string) {
+    // corrNr 一定要帶(本機 package 為空字串);走寫入用的獨立 session(呼叫端另經寫入佇列)
+    const r = await this.guard(() =>
+      this.lockClient.httpClient.request(
+        `${links.generator}?referencedObject=${encodeURIComponent(tableUri)}&corrNr=${encodeURIComponent(transport)}`,
+        { method: "POST", headers: { "Content-Type": RAP_CONTENT_TYPE, Accept: "*/*" }, body: JSON.stringify(content) }
+      )
+    );
+    return parseObjectRefs(String(r.body ?? ""));
+  }
+
+  async rapPublish(bindingName: string) {
+    const name = bindingName.toUpperCase().replace(/[^A-Z0-9_/]/g, "");
+    const r = await this.guard(() =>
+      this.lockClient.httpClient.request("/sap/bc/adt/businessservices/odatav4/publishjobs", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/xml",
+          Accept: "application/xml, application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.StatusMessage",
+        },
+        body:
+          `<?xml version="1.0" encoding="UTF-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">` +
+          `<adtcore:objectReference adtcore:type="SCGR" adtcore:name="${name}"/></adtcore:objectReferences>`,
+      })
+    );
+    const x = String(r.body ?? "");
+    const severity = (x.match(/<SEVERITY>([^<]*)<\/SEVERITY>/)?.[1] ?? "").toUpperCase();
+    return { ok: severity === "OK" || severity === "", message: x.match(/<SHORT_TEXT>([^<]*)<\/SHORT_TEXT>/)?.[1] ?? "" };
+  }
+
+  async odataV4Service(bindingName: string) {
+    const n = encodeURIComponent(bindingName.toUpperCase());
+    const r = await this.guard(() =>
+      this.client.httpClient.request(
+        `/sap/bc/adt/businessservices/odatav4/${n}?servicename=${n}&serviceversion=0001&srvdname=${n}`,
+        { headers: { Accept: "application/vnd.sap.adt.businessservices.odatav4.v2+xml" } }
+      )
+    );
+    return parseODataV4Service(String(r.body ?? ""));
   }
 
   async revisions(url: string) {

@@ -1,0 +1,63 @@
+# 用 where_used 找出方法的所有呼叫處並改名:ZCL_EVAL08 的 calc_total 被 ZCL_EVAL08C 呼叫兩次
+id: "08"
+title: where_used 找呼叫處並改名
+prompt: |
+  請把 $TMP 裡 class ZCL_EVAL08_{{SFX}} 的方法 calc_total 改名為 compute_total。
+  先用 where_used 找出所有呼叫處,所有呼叫處也一起改,最後全部啟用,
+  並用 run_class 執行 ZCL_EVAL08C_{{SFX}} 確認結果不變(輸出 EVAL-08 total=60)。
+setup:
+  - tool: create_object
+    args: { object_type: CLAS/OC, name: ZCL_EVAL08_{{SFX}}, package_name: $TMP, description: eval 08 callee }
+  - tool: write_source
+    args:
+      object_url: /sap/bc/adt/oo/classes/zcl_eval08_{{sfx}}
+      activate: true
+      new_source: |
+        CLASS zcl_eval08_{{sfx}} DEFINITION PUBLIC FINAL CREATE PUBLIC.
+          PUBLIC SECTION.
+            METHODS calc_total IMPORTING a TYPE i b TYPE i RETURNING VALUE(total) TYPE i.
+        ENDCLASS.
+
+        CLASS zcl_eval08_{{sfx}} IMPLEMENTATION.
+          METHOD calc_total.
+            total = a + b.
+          ENDMETHOD.
+        ENDCLASS.
+  - tool: create_object
+    args: { object_type: CLAS/OC, name: ZCL_EVAL08C_{{SFX}}, package_name: $TMP, description: eval 08 caller }
+  - tool: write_source
+    args:
+      object_url: /sap/bc/adt/oo/classes/zcl_eval08c_{{sfx}}
+      activate: true
+      new_source: |
+        CLASS zcl_eval08c_{{sfx}} DEFINITION PUBLIC FINAL CREATE PUBLIC.
+          PUBLIC SECTION.
+            INTERFACES if_oo_adt_classrun.
+        ENDCLASS.
+
+        CLASS zcl_eval08c_{{sfx}} IMPLEMENTATION.
+          METHOD if_oo_adt_classrun~main.
+            DATA(calc) = NEW zcl_eval08_{{sfx}}( ).
+            DATA(first) = calc->calc_total( a = 10 b = 20 ).
+            DATA(second) = calc->calc_total( a = first b = 30 ).
+            out->write( |EVAL-08 total={ second }| ).
+          ENDMETHOD.
+        ENDCLASS.
+checks:
+  - kind: tool
+    tool: read_source
+    args: { object_url: /sap/bc/adt/oo/classes/zcl_eval08_{{sfx}} }
+    contains: ["compute_total"]
+    not_contains: ["calc_total"]
+  - kind: tool
+    tool: read_source
+    args: { object_url: /sap/bc/adt/oo/classes/zcl_eval08c_{{sfx}} }
+    contains: ["compute_total"]
+    not_contains: ["calc_total"]
+  - kind: tool
+    tool: run_class
+    args: { class_name: ZCL_EVAL08C_{{SFX}} }
+    contains: ["EVAL-08 total=60"]
+cleanup:
+  - /sap/bc/adt/oo/classes/zcl_eval08c_{{sfx}}
+  - /sap/bc/adt/oo/classes/zcl_eval08_{{sfx}}

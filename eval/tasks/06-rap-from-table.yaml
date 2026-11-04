@@ -1,0 +1,54 @@
+# 從 Z 表產生 RAP BO(E1、E2)。產生的名稱由產生器預設(ZEV6_X → ZR_EV6_X、ZUI_EV6_X_O4…),
+# 題目要求不要指定 name_prefix,清除清單才能固定。清除順序:binding → definition → behavior → CDS → table
+id: "06"
+title: 從 Z 表產生 RAP BO
+prompt: |
+  $TMP 裡已有資料表 ZEV6_{{SFX}}。請用它產生 RAP business object 與 OData V4 UI 服務(放在 $TMP,
+  不要指定 name_prefix,用產生器預設名稱),並發佈服務。最後告訴我 service binding 名稱與 OData 服務網址。
+setup:
+  - tool: create_object
+    args: { object_type: TABL/DT, name: ZEV6_{{SFX}}, package_name: $TMP, description: eval 06 rap source }
+  - tool: write_source
+    args:
+      object_url: /sap/bc/adt/ddic/tables/zev6_{{sfx}}
+      activate: true
+      new_source: |
+        @EndUserText.label : 'eval 06 rap source'
+        @AbapCatalog.enhancement.category : #NOT_EXTENSIBLE
+        @AbapCatalog.tableCategory : #TRANSPARENT
+        @AbapCatalog.deliveryClass : #A
+        @AbapCatalog.dataMaintenance : #RESTRICTED
+        define table zev6_{{sfx}} {
+          key client            : abap.clnt not null;
+          key uuid              : sysuuid_x16 not null;
+          name                  : abap.char(40);
+          amount                : abap.dec(15,2);
+          local_created_by      : abp_creation_user;
+          local_created_at      : abp_creation_tstmpl;
+          local_last_changed_by : abp_locinst_lastchange_user;
+          local_last_changed_at : abp_locinst_lastchange_tstmpl;
+          last_changed_at       : abp_lastchange_tstmpl;
+        }
+checks:
+  - kind: tool
+    tool: search_objects
+    args: { query: ZUI_EV6_{{SFX}}_O4, object_type: SRVB/SVB }
+    contains: ["ZUI_EV6_{{SFX}}_O4"]
+  - kind: answer_contains
+    all: ["ZUI_EV6_{{SFX}}_O4", "/sap/opu/odata4/"]
+cleanup:
+  - /sap/bc/adt/businessservices/bindings/zui_ev6_{{sfx}}_o4
+  - /sap/bc/adt/ddic/srvd/sources/zui_ev6_{{sfx}}_o4
+  - /sap/bc/adt/ddic/ddlx/sources/zc_ev6_{{sfx}}
+  - /sap/bc/adt/acm/dcl/sources/zc_ev6_{{sfx}}
+  - /sap/bc/adt/acm/dcl/sources/zr_ev6_{{sfx}}
+  - /sap/bc/adt/bo/behaviordefinitions/zc_ev6_{{sfx}}
+  - /sap/bc/adt/oo/classes/zbp_c_ev6_{{sfx}}
+  - /sap/bc/adt/bo/behaviordefinitions/zr_ev6_{{sfx}}
+  - /sap/bc/adt/oo/classes/zbp_r_ev6_{{sfx}}
+  - /sap/bc/adt/ddic/ddl/sources/zc_ev6_{{sfx}}
+  - /sap/bc/adt/ddic/ddl/sources/zr_ev6_{{sfx}}
+  - /sap/bc/adt/businessobjects/rontrot/zev6_{{sfx}}
+  - /sap/bc/adt/businessobjects/nontnot/zev6_{{sfx}}
+  - /sap/bc/adt/ddic/tables/zev6_{{sfx}}_d
+  - /sap/bc/adt/ddic/tables/zev6_{{sfx}}
