@@ -1,7 +1,7 @@
 /**
  * 評測框架的單元測試(不需要 SAP、不呼叫模型)
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { fillPlaceholders, loadTasks, parseTask } from "../../eval/lib/tasks.js";
@@ -9,7 +9,7 @@ import { parseStreamJson, writeMcpConfig } from "../../eval/lib/claude.js";
 import { parseArgs } from "../../eval/lib/args.js";
 import { ADAPTERS, parseModelSpecs } from "../../eval/lib/adapters.js";
 import { CSV_HEADER, renderCsv, renderMarkdown, writeReports, type TaskResult } from "../../eval/lib/report.js";
-import { bindingNameFromUri, unpublishBody } from "../../eval/lib/harness.js";
+import { bindingNameFromUri, deleteWithLock, unpublishBody } from "../../eval/lib/harness.js";
 import { formatUnitTestResults } from "../../src/tools/formatters.js";
 import * as os from "node:os";
 
@@ -217,5 +217,58 @@ describe("第 03 題判定字串對得上 run_unit_tests 的實際輸出", () =>
     expect(check.contains.every((s) => green.includes(s)), green).toBe(true);
     const red = formatUnitTestResults(cls([{ kind: "failedAssertion", severity: "critical", title: "x", details: [] }]));
     expect(check.contains.every((s) => red.includes(s)), red).toBe(false);
+  });
+});
+
+// ───────────────────────── v0.5.1 E1:刪除失敗也要解鎖(R5)─────────────────────────
+
+describe("E1 deleteWithLock", () => {
+  const URI = "/sap/bc/adt/oo/classes/zsafe_demo";
+  const raw = (o: Partial<Record<"lock" | "unLock" | "deleteObject", () => Promise<unknown>>> = {}) => ({
+    stateful: "stateless" as never,
+    lock: vi.fn(o.lock ?? (async () => ({ LOCK_HANDLE: "LH-1" }))),
+    unLock: vi.fn(o.unLock ?? (async () => undefined)),
+    deleteObject: vi.fn(o.deleteObject ?? (async () => undefined)),
+  });
+
+  it("lock 成功、delete 失敗 → 送出 unLock,並回報刪除錯誤", async () => {
+    const r = raw({ deleteObject: async () => { throw new Error("object has dependencies"); } });
+    const out = await deleteWithLock(r, URI);
+    expect(r.unLock).toHaveBeenCalledWith(URI, "LH-1");
+    expect(out).toContain("刪除失敗");
+    expect(out).toContain("object has dependencies");
+    expect(r.stateful).toBe("stateless");
+  });
+
+  it("lock 本身失敗 → 不呼叫 unLock", async () => {
+    const r = raw({ lock: async () => { throw new Error("locked by OTHER"); } });
+    const out = await deleteWithLock(r, URI);
+    expect(r.unLock).not.toHaveBeenCalled();
+    expect(out).toContain("locked by OTHER");
+    expect(r.stateful).toBe("stateless");
+  });
+
+  it("delete 失敗且解鎖也失敗 → 兩個錯誤都回報", async () => {
+    const r = raw({
+      deleteObject: async () => { throw new Error("object has dependencies"); },
+      unLock: async () => { throw new Error("unlock boom"); },
+    });
+    const out = await deleteWithLock(r, URI);
+    expect(out).toContain("object has dependencies");
+    expect(out).toContain("unlock boom");
+  });
+
+  it("刪除成功後解鎖回 not locked → 忽略;其他解鎖錯誤附註但仍算刪除成功", async () => {
+    const a = raw({ unLock: async () => { throw new Error("Object is not locked"); } });
+    expect(await deleteWithLock(a, URI)).toBe(`已刪除 ${URI}`);
+    const b = raw({ unLock: async () => { throw new Error("unlock boom"); } });
+    const out = await deleteWithLock(b, URI);
+    expect(out).toContain("已刪除");
+    expect(out).toContain("unlock boom");
+  });
+
+  it("物件不存在 → 略過;仍會解鎖(若有 handle)", async () => {
+    const r = raw({ lock: async () => { throw new Error("Resource does not exist"); } });
+    expect(await deleteWithLock(r, URI)).toContain("不存在(略過)");
   });
 });
