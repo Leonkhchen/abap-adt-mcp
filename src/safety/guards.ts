@@ -9,6 +9,7 @@
  *     即使物件名稱是 Z 開頭,放在其他 package 也不可寫入/建立/執行
  */
 import type { AppConfig } from "../config.js";
+import { assertAdtUri } from "./uri.js";
 
 export class GuardViolationError extends Error {
   constructor(message: string) {
@@ -29,7 +30,11 @@ export function objectNameFromUrl(objectUrl: string): string {
     segments.pop();
   }
   const name = segments[segments.length - 1] ?? "";
-  return decodeURIComponent(name).toUpperCase();
+  try {
+    return decodeURIComponent(name).toUpperCase();
+  } catch {
+    return name.toUpperCase();
+  }
 }
 
 /** 檢查是否允許寫入該物件;違反時丟出 GuardViolationError */
@@ -43,8 +48,12 @@ export function assertWriteAllowed(cfg: AppConfig, objectUrl: string): void {
     );
   }
 
+  // URI 必須是 /sap/bc/adt/ 底下的相對路徑(v0.5.1 S1);名稱一律取自驗證後的路徑,
+  // 避免 …/cl_std/../zsafe_x 這類「名稱檢查過了、實際指向別處」的寫法
+  const safeUrl = assertAdtUri(objectUrl, cfg);
+
   // 第二道:物件名稱前綴白名單
-  const name = objectNameFromUrl(objectUrl);
+  const name = objectNameFromUrl(safeUrl);
   const allowed = cfg.safety.allowedPrefixes;
   if (allowed.length > 0 && !allowed.some((p) => name.startsWith(p))) {
     throw new GuardViolationError(

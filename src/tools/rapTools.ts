@@ -28,7 +28,7 @@ export function deniedObjects(cfg: AppConfig, objects: RapObjectRef[]): string[]
   const denied: string[] = [];
   for (const o of objects) {
     try {
-      assertWriteAllowed(cfg, o.uri || `/x/${o.name.toLowerCase()}`);
+      assertWriteAllowed(cfg, o.uri || `/sap/bc/adt/x/${encodeURIComponent(o.name.toLowerCase())}`);
     } catch (e) {
       denied.push(`- ${o.type} ${o.name}:${e instanceof Error ? e.message : String(e)}`);
     }

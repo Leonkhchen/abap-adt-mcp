@@ -26,6 +26,7 @@ import {
 } from "abap-adt-api";
 import * as https from "node:https";
 import type { AppConfig } from "../config.js";
+import { assertAdtUri } from "../safety/uri.js";
 import { AuthCircuitOpenError, hasHttpStatus, isAuthFailure } from "./errors.js";
 import { activationBody, parseActivationResponse } from "./activation.js";
 import {
@@ -147,6 +148,11 @@ export interface AdtService {
   /** 由物件結構推導主要 include 的 source URL */
   mainInclude(structure: AbapObjectStructure): string;
   getObjectSource(sourceUrl: string): Promise<string>;
+  /**
+   * 在鎖定用的 session(lockClient)讀取目前的原始碼(v0.5.1 C1):
+   * 取得鎖定後、寫入前的權威比對用,與持有鎖定的是同一個 SAP session;呼叫前必須已 lock()。
+   */
+  getSourceInLock(sourceUrl: string): Promise<string>;
   setObjectSource(
     sourceUrl: string,
     source: string,
@@ -256,6 +262,33 @@ export function packageFromObjectXml(xml: string): string {
   return m ? m[1].toUpperCase() : "";
 }
 
+/**
+ * 只允許同 origin 的 redirect(v0.5.1 S1):axios 預設最多跟隨 5 次 redirect,
+ * 若 SAP(或中間人)回 302 指向外部主機,帳密可能被帶出。
+ * abap-adt-api 的 ClientOptions 不開放 maxRedirects/beforeRedirect,只能在建立後設到底層 axios。
+ * 回傳是否成功安裝(底層結構變動時為 false,呼叫端記到 stderr)。
+ */
+export function restrictRedirectsToBaseOrigin(client: ADTClient, baseUrl: string): boolean {
+  const axiosInstance = (
+    client.httpClient as unknown as { httpclient?: { axios?: { defaults?: Record<string, unknown> } } }
+  ).httpclient?.axios;
+  if (!axiosInstance?.defaults) return false;
+  const origin = new URL(baseUrl).origin;
+  axiosInstance.defaults.beforeRedirect = (options: { protocol?: string; hostname?: string; host?: string; port?: string | number; href?: string }) => {
+    const href = options.href ?? `${options.protocol ?? ""}//${options.host ?? options.hostname ?? ""}`;
+    let target: string;
+    try {
+      target = new URL(href).origin;
+    } catch {
+      target = "(無法解析)";
+    }
+    if (target !== origin) {
+      throw new Error(`拒絕跨 origin 的 redirect(${target}):為避免 SAP 帳密外送,只跟隨同一個 SAP 主機的 redirect。`);
+    }
+  };
+  return true;
+}
+
 /** 連續認證失敗達此次數後斷路:不再連 SAP,避免重試把帳號鎖住(SAP 預設失敗 5 次即鎖定) */
 export const MAX_AUTH_FAILURES = 2;
 
@@ -280,8 +313,8 @@ export class RealAdtService implements AdtService {
    * @param lockClient 選填:注入鎖定/寫入用的 ADTClient;只注入 client 時兩者共用
    */
   constructor(private cfg: AppConfig, client?: ADTClient, lockClient?: ADTClient) {
-    const create = () =>
-      new ADTClient(
+    const create = () => {
+      const c = new ADTClient(
         cfg.sap.url,
         cfg.sap.user,
         cfg.sap.password,
@@ -289,8 +322,21 @@ export class RealAdtService implements AdtService {
         cfg.sap.language,
         adtClientOptions(cfg)
       );
+      if (!restrictRedirectsToBaseOrigin(c, cfg.sap.url)) {
+        console.error("[abap-adt-mcp] 警告:無法限制 redirect 為同 origin(abap-adt-api 內部結構與預期不同)。");
+      }
+      return c;
+    };
     this.client = client ?? create();
     this.lockClient = lockClient ?? (client ? client : create());
+  }
+
+  /**
+   * 驗證「使用者給的 URI」只指向 /sap/bc/adt/ 底下(v0.5.1 S1,主要防線):
+   * request 會帶 SAP 帳密,絕對 URL 或路徑穿越不可送出。必須在任何 HTTP 呼叫前執行。
+   */
+  private u(uri: string): string {
+    return assertAdtUri(uri, this.cfg);
   }
 
   /**
@@ -352,7 +398,8 @@ export class RealAdtService implements AdtService {
   }
 
   async objectStructure(objectUrl: string) {
-    return this.guard(() => this.client.objectStructure(objectUrl));
+    const url = this.u(objectUrl);
+    return this.guard(() => this.client.objectStructure(url));
   }
 
   mainInclude(structure: AbapObjectStructure): string {
@@ -361,12 +408,19 @@ export class RealAdtService implements AdtService {
 
   /** objectStructure 不解析 package,直接讀物件 XML 的 adtcore:packageRef */
   async objectPackage(objectUrl: string) {
-    const response = await this.guard(() => this.client.httpClient.request(objectUrl));
+    const url = this.u(objectUrl);
+    const response = await this.guard(() => this.client.httpClient.request(url));
     return packageFromObjectXml(String(response.body ?? ""));
   }
 
   async getObjectSource(sourceUrl: string) {
-    return this.guard(() => this.client.getObjectSource(sourceUrl));
+    const url = this.u(sourceUrl);
+    return this.guard(() => this.client.getObjectSource(url));
+  }
+
+  async getSourceInLock(sourceUrl: string) {
+    const url = this.u(sourceUrl);
+    return this.guard(() => this.lockClient.getObjectSource(url));
   }
 
   async setObjectSource(
@@ -375,7 +429,8 @@ export class RealAdtService implements AdtService {
     lockHandle: string,
     transport?: string
   ) {
-    return this.guard(() => this.lockClient.setObjectSource(sourceUrl, source, lockHandle, transport));
+    const url = this.u(sourceUrl);
+    return this.guard(() => this.lockClient.setObjectSource(url, source, lockHandle, transport));
   }
 
   /**
@@ -384,10 +439,11 @@ export class RealAdtService implements AdtService {
    * abap-adt-api 透過 client.stateful 切換,這裡集中處理。
    */
   async lock(objectUrl: string) {
+    const url = this.u(objectUrl);
     return this.guard(async () => {
       this.lockClient.stateful = session_types.stateful;
       try {
-        return await this.lockClient.lock(objectUrl);
+        return await this.lockClient.lock(url);
       } catch (e) {
         // 鎖定失敗必須恢復 stateless:abap-adt-api 在 stateful 模式下不會自動重登,
         // 若停在 stateful,之後 session 失效時所有呼叫都無法恢復
@@ -415,7 +471,8 @@ export class RealAdtService implements AdtService {
 
   async unLock(objectUrl: string, lockHandle: string) {
     try {
-      await this.guard(() => this.lockClient.unLock(objectUrl, lockHandle));
+      const url = this.u(objectUrl);
+      await this.guard(() => this.lockClient.unLock(url, lockHandle));
     } finally {
       // 無論解鎖成敗(含斷路)都恢復 stateless,釋放後端資源並保留自動重登能力
       this.endStatefulSession();
@@ -423,11 +480,14 @@ export class RealAdtService implements AdtService {
   }
 
   async activate(objectName: string, objectUrl: string) {
-    return this.guard(() => this.client.activate(objectName, objectUrl));
+    const url = this.u(objectUrl);
+    return this.guard(() => this.client.activate(objectName, url));
   }
 
   async syntaxCheck(url: string, mainUrl: string, content: string) {
-    return this.guard(() => this.client.syntaxCheck(url, mainUrl, content));
+    const u1 = this.u(url);
+    const u2 = this.u(mainUrl);
+    return this.guard(() => this.client.syntaxCheck(u1, u2, content));
   }
 
   async nodeContents(parentType: "DEVC/K", packageName: string) {
@@ -435,7 +495,8 @@ export class RealAdtService implements AdtService {
   }
 
   async transportInfo(objSourceUrl: string, devClass?: string) {
-    return this.guard(() => this.client.transportInfo(objSourceUrl, devClass));
+    const url = this.u(objSourceUrl);
+    return this.guard(() => this.client.transportInfo(url, devClass));
   }
 
   async userTransports(user: string) {
@@ -476,10 +537,12 @@ export class RealAdtService implements AdtService {
   async runUnitTests(url: string) {
     // 單元測試會執行程式:只跑 harmless(不改資料庫/系統設定);duration 不含 long
     const flags = { harmless: true, dangerous: false, critical: false, short: true, medium: true, long: false };
-    return this.guard(() => this.client.unitTestRun(url, flags));
+    const safe = this.u(url);
+    return this.guard(() => this.client.unitTestRun(safe, flags));
   }
 
-  async runAtc(url: string, checkVariant?: string, maxFindings = 100) {
+  async runAtc(rawUrl: string, checkVariant?: string, maxFindings = 100) {
+    const url = this.u(rawUrl);
     const variant =
       checkVariant ||
       String(
@@ -514,7 +577,8 @@ export class RealAdtService implements AdtService {
     return { checkVariant: variant, infos: run.infos, findings };
   }
 
-  async whereUsed(url: string, line?: number, column0?: number) {
+  async whereUsed(rawUrl: string, line?: number, column0?: number) {
+    const url = this.u(rawUrl);
     const headers = { "Content-Type": "application/*", Accept: "application/*" };
     const uri = line ? `${url}#start=${line},${column0 ?? 0}` : url;
     const refs = await this.guard(() =>
@@ -537,7 +601,8 @@ export class RealAdtService implements AdtService {
     return { objects, snippets: parseUsageSnippets(String(snips.body ?? "")) };
   }
 
-  async findDefinition(sourceUrl: string, line: number, column0: number, implementation: boolean) {
+  async findDefinition(rawSourceUrl: string, line: number, column0: number, implementation: boolean) {
+    const sourceUrl = this.u(rawSourceUrl);
     const source = await this.guard(() => this.client.getObjectSource(sourceUrl));
     const lines = source.split(/\r?\n/);
     const lineText = lines[line - 1];
@@ -554,7 +619,7 @@ export class RealAdtService implements AdtService {
     if (!loc.url) return { identifier: id.text, url: "", line: 0, column: 0, sourceLine: "" };
     let sourceLine = "";
     try {
-      const target = loc.url === sourceUrl ? source : await this.guard(() => this.client.getObjectSource(loc.url));
+      const target = loc.url === sourceUrl ? source : await this.guard(() => this.client.getObjectSource(this.u(loc.url)));
       sourceLine = target.split(/\r?\n/)[loc.line - 1] ?? "";
     } catch {
       // 讀不到目標原始碼(例如權限)時只回位置
@@ -563,7 +628,8 @@ export class RealAdtService implements AdtService {
   }
 
   async classComponents(objectUrl: string) {
-    return this.guard(() => this.client.classComponents(objectUrl));
+    const url = this.u(objectUrl);
+    return this.guard(() => this.client.classComponents(url));
   }
 
   async runClass(className: string) {
@@ -597,6 +663,7 @@ export class RealAdtService implements AdtService {
   }
 
   async rapGeneratorLinks(tableUri: string) {
+    this.u(tableUri);
     const feed = await this.guard(() =>
       this.client.httpClient.request(
         `/sap/bc/adt/repository/generators?referencedObject=${encodeURIComponent(tableUri)}&fetchAllGenerators=true`,
@@ -607,6 +674,10 @@ export class RealAdtService implements AdtService {
   }
 
   async rapPreview(links: RapGeneratorLinks, tableUri: string, packageName: string, namePrefix?: string) {
+    this.u(tableUri);
+    this.u(links.content);
+    this.u(links.validation);
+    this.u(links.preview);
     const ref = `referencedObject=${encodeURIComponent(tableUri)}`;
     const raw = await this.guard(() =>
       this.client.httpClient.request(`${links.content}?${ref}&package=${encodeURIComponent(packageName.toUpperCase())}`, {
@@ -638,6 +709,8 @@ export class RealAdtService implements AdtService {
   }
 
   async rapGenerate(links: RapGeneratorLinks, tableUri: string, content: object, transport: string) {
+    this.u(tableUri);
+    this.u(links.generator);
     // corrNr 一定要帶(本機 package 為空字串);走寫入用的獨立 session(呼叫端另經寫入佇列)
     const r = await this.guard(() =>
       this.lockClient.httpClient.request(
@@ -678,7 +751,8 @@ export class RealAdtService implements AdtService {
     return parseODataV4Service(String(r.body ?? ""));
   }
 
-  async revisions(url: string) {
+  async revisions(rawUrl: string) {
+    const url = this.u(rawUrl);
     // class include(…/includes/testclasses)要以 class + include 名稱查詢
     const inc = url.match(/^(.*\/oo\/classes\/[^/]+)\/includes\/([^/]+)$/);
     const list = inc
@@ -687,7 +761,9 @@ export class RealAdtService implements AdtService {
     return [...list].sort((a, b) => b.date.localeCompare(a.date));
   }
 
-  async revisionContent(revisionUri: string, sourceUrl: string) {
+  async revisionContent(rawRevisionUri: string, rawSourceUrl: string) {
+    const revisionUri = this.u(rawRevisionUri);
+    const sourceUrl = this.u(rawSourceUrl);
     const m = revisionUri.match(/^\/sap\/bc\/adt\/.+\/versions\/[^/]+\/([^/]+)\/content$/);
     if (!m) throw new Error("版本 URI 格式不正確:必須是 get_revisions 回傳的 …/versions/…/content。");
     // A4H 實測:class 的版本內容(includes/main/versions/…)排版與 source/main 不同,且剛寫入後偶爾讀到舊內容;
@@ -716,6 +792,7 @@ export class RealAdtService implements AdtService {
     // 只送主物件(子項目會隨主物件一起啟用);請求形狀見 adt/activation.ts(A4H 實測)
     const mains = new Map<string, string>();
     for (const o of objects) {
+      this.u(o.parentUri || o.uri);
       // 子項目(例如 class include)的 name 與所屬物件相同;主物件的紀錄優先
       const uri = o.parentUri || o.uri;
       if (!o.parentUri || !mains.has(uri)) mains.set(uri, o.name);
@@ -757,8 +834,9 @@ export class RealAdtService implements AdtService {
     );
     const meta = parseDumpMeta(String(xml.body ?? ""));
     if (!meta.contentsUri) return { meta, text: "" };
+    const contentsUri = this.u(meta.contentsUri);
     const body = await this.guard(() =>
-      this.client.httpClient.request(meta.contentsUri, { headers: { Accept: "text/plain" } })
+      this.client.httpClient.request(contentsUri, { headers: { Accept: "text/plain" } })
     );
     return { meta, text: extractDumpChapters(String(body.body ?? ""), meta.chapters) };
   }
@@ -784,7 +862,8 @@ export class RealAdtService implements AdtService {
   }
 
   async createTransport(refUrl: string, description: string, packageName: string) {
-    return this.guard(() => this.client.createTransport(refUrl, description, packageName.toUpperCase()));
+    const ref = this.u(refUrl);
+    return this.guard(() => this.client.createTransport(ref, description, packageName.toUpperCase()));
   }
 
   async createObject(o: NewObjectSpec & { transport?: string }) {

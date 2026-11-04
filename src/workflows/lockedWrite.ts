@@ -8,8 +8,10 @@
  *  3. try/finally 保證:無論寫入成功與否,鎖定一定被釋放
  *
  * 流程:
- *  (0) 樂觀並行檢查:比對呼叫端提供的 base source(若有)
- *  (1) lock(stateful session);寫入 class 測試 include 而它尚未存在時,在鎖定中先建立
+ *  (0) 樂觀並行檢查:比對呼叫端提供的 base source(若有)——鎖定前的快速檢查,避免不必要的鎖定
+ *  (1) lock(stateful session);鎖定後(寫入前)在同一個 session 再讀一次、再比對(v0.5.1 C1,
+ *      權威檢查:擋住「第一次讀取之後、取得鎖定之前」被別人改動的情況);
+ *      寫入 class 測試 include 而它尚未存在時,在鎖定中先建立
  *  (2) setObjectSource(帶 lockHandle + transport)
  *  (3) finally → unLock
  *  (4) 可選:activate
@@ -88,6 +90,27 @@ export async function lockedWrite(
   const lockHandle = lock.LOCK_HANDLE;
 
   try {
+    // (1b) 鎖定後再比對一次(C1):此刻起別人無法再改,這份才是寫入的真正基準
+    if (params.expectedCurrentSource !== undefined || createTestInclude) {
+      let locked: string | undefined;
+      try {
+        locked = await adt.getSourceInLock(params.sourceUrl);
+      } catch (e) {
+        // 測試 include 仍不存在:照原計畫在鎖定中建立;其他錯誤照丟
+        if (!(createTestInclude && isMissingSource(e))) throw e;
+      }
+      if (locked !== undefined) {
+        // 讀得到內容 → 要寫的 include 已經存在(讀取到鎖定之間被別人建立),不能再建立
+        createTestInclude = false;
+        if (
+          params.expectedCurrentSource !== undefined &&
+          normalize(locked) !== normalize(params.expectedCurrentSource)
+        ) {
+          throw new ConcurrentModificationError();
+        }
+        currentSource = locked;
+      }
+    }
     if (createTestInclude) {
       await adt.createTestInclude(objectNameFromUrl(params.objectUrl), lockHandle, params.transport);
     }
@@ -115,7 +138,9 @@ export async function lockedWrite(
 }
 
 /**
- * class 的測試 include 尚未存在時先建立(空的,內容只有 SAP 的註解範本),回傳是否有建立。
+ * class 的測試 include 尚未存在時先建立(空的,內容只有 SAP 的註解範本)。
+ * 有建立時回傳建立後讀到的範本內容(C2:呼叫端以它作為後續並行比對的基準,
+ * 才不會把自己剛建立的範本誤判成他人修改);沒有建立回傳 undefined。
  * A4H 實測:include 不存在時語法檢查只回警告、不會檢查內容;建立後才能在寫入前正確擋下語法錯誤。
  */
 export async function ensureTestInclude(
@@ -124,11 +149,11 @@ export async function ensureTestInclude(
   sourceUrl: string,
   transport?: string,
   expectedCurrentSource?: string
-): Promise<boolean> {
-  if (!isTestClassesInclude(sourceUrl)) return false;
+): Promise<string | undefined> {
+  if (!isTestClassesInclude(sourceUrl)) return undefined;
   try {
     await adt.getObjectSource(sourceUrl);
-    return false;
+    return undefined;
   } catch (e) {
     if (!isMissingSource(e)) throw e;
   }
@@ -142,7 +167,7 @@ export async function ensureTestInclude(
   } finally {
     await adt.unLock(objectUrl, lock.LOCK_HANDLE);
   }
-  return true;
+  return adt.getObjectSource(sourceUrl);
 }
 
 /** 行尾差異(CRLF vs LF)不應視為內容變更 */

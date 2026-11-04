@@ -12,6 +12,7 @@ import { ok, fail } from "./result.js";
 import type { AppConfig } from "../config.js";
 import { AuditLogger, diffSummary } from "../safety/audit.js";
 import { assertPackageAllowed, assertWriteAllowed, objectNameFromUrl } from "../safety/guards.js";
+import { assertAdtUri } from "../safety/uri.js";
 import { ensureTestInclude, lockedWrite } from "../workflows/lockedWrite.js";
 import { SerialQueue } from "../safety/serialQueue.js";
 import { registerAnalysisTools, registerWriteDevTools } from "./devTools.js";
@@ -148,6 +149,7 @@ export function registerTools(
     },
     async ({ object_url }) => {
       try {
+        assertAdtUri(object_url, cfg);
         const s = await adt.objectStructure(object_url);
         const main = adt.mainInclude(s);
         // metaData 內容依物件類型而異,序列化時做長度保護
@@ -178,6 +180,7 @@ export function registerTools(
     },
     async ({ object_url, start_line, end_line }) => {
       try {
+        assertAdtUri(object_url, cfg);
         const sourceUrl = await resolveSourceUrl(adt, object_url);
         const source = await adt.getObjectSource(sourceUrl);
         const allLines = source.replace(/\r\n/g, "\n").split("\n");
@@ -219,6 +222,7 @@ export function registerTools(
     },
     async ({ object_url, source }) => {
       try {
+        assertAdtUri(object_url, cfg);
         const sourceUrl = await resolveSourceUrl(adt, object_url);
         const content = source ?? (await adt.getObjectSource(sourceUrl));
         const baseObjectUrl = baseOf(sourceUrl);
@@ -322,7 +326,8 @@ export function registerTools(
     serialized(async ({ object_url, new_source, transport, expected_current_source, skip_syntax_check, activate }) => {
       const objectName = objectNameFromUrl(object_url);
       try {
-        // 安全護欄:前綴白名單等
+        // 安全護欄:URI 格式(只接受 /sap/bc/adt/ 相對路徑),再來前綴白名單等
+        assertAdtUri(object_url, cfg);
         assertWriteAllowed(cfg, object_url);
 
         const sourceUrl = await resolveSourceUrl(adt, object_url);
@@ -331,13 +336,14 @@ export function registerTools(
         assertPackageAllowed(cfg, await adt.objectPackage(baseObjectUrl));
 
         // 測試 include 尚未建立時先建立空的,語法檢查才有效(並行檢查在建立之前)
-        const includeCreated = await ensureTestInclude(
+        const createdTemplate = await ensureTestInclude(
           adt,
           baseObjectUrl,
           sourceUrl,
           transport,
           expected_current_source
         );
+        const includeCreated = createdTemplate !== undefined;
         if (includeCreated) {
           audit.log({
             timestamp: new Date().toISOString(),
@@ -369,7 +375,12 @@ export function registerTools(
           sourceUrl,
           newSource: new_source,
           transport,
-          expectedCurrentSource: expected_current_source,
+          // C2:include 是本次才建立的,呼叫端的 "" 代表「原本不存在」;並行比對的基準改成剛建立的範本
+          // (建立後被別人改動,鎖定前後兩次比對仍會發現)
+          expectedCurrentSource:
+            includeCreated && expected_current_source !== undefined && expected_current_source.trim() === ""
+              ? createdTemplate
+              : expected_current_source,
         });
 
         audit.log({
@@ -438,6 +449,7 @@ export function registerTools(
     serialized(async ({ object_url, object_name }) => {
       const name = (object_name ?? objectNameFromUrl(object_url)).toUpperCase();
       try {
+        assertAdtUri(object_url, cfg);
         assertWriteAllowed(cfg, object_url);
         const baseObjectUrl = baseOf(object_url);
         assertPackageAllowed(cfg, await adt.objectPackage(baseObjectUrl));

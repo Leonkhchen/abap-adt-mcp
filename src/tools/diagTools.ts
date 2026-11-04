@@ -11,6 +11,7 @@ import { baseObjectUrl, isSourceUrl } from "../adt/objectTypes.js";
 import type { AppConfig } from "../config.js";
 import type { AuditLogger } from "../safety/audit.js";
 import { assertPackageAllowed, assertWriteAllowed, GuardViolationError, objectNameFromUrl } from "../safety/guards.js";
+import { assertAdtUri } from "../safety/uri.js";
 import type { SerialQueue } from "../safety/serialQueue.js";
 import { assertTableName, assertTablesAllowed, validateSelectSql } from "../safety/sql.js";
 import { formatDataElement, formatDdicFields, formatDomain, formatQueryResult } from "./formatters.js";
@@ -203,7 +204,13 @@ export function registerDiagnosticTools(
       },
       async ({ object_urls }) =>
         writes.run(async () => {
-          const urls = [...new Set(object_urls.map((u) => baseObjectUrl(u.trim())))];
+          let urls: string[];
+          try {
+            // URI 格式先於白名單:任一個不合格就整批拒絕(v0.5.1 S1)
+            urls = [...new Set(object_urls.map((u) => baseObjectUrl(assertAdtUri(u, cfg))))];
+          } catch (e) {
+            return fail(e);
+          }
           try {
             // 兩道白名單:先全部檢查,任一不過就整批拒絕
             const denied: string[] = [];
@@ -269,6 +276,7 @@ export function registerDiagnosticTools(
         if ((compare_from === undefined) !== (compare_to === undefined)) {
           return fail(new GuardViolationError("compare_from 與 compare_to 需同時提供。"));
         }
+        assertAdtUri(object_url);
         const revs = await adt.revisions(object_url);
         if (revs.length === 0) return ok(`${object_url} 沒有任何版本紀錄。`);
         const lines = revs.map((r, i) => `#${i + 1} ${r.date} ${r.author}  ${revisionLabel(r)}`);
@@ -345,6 +353,7 @@ export function registerDiagnosticTools(
     async ({ source, object_url }) => {
       try {
         if (!!source === !!object_url) return fail(new GuardViolationError("source 與 object_url 必須擇一提供。"));
+        if (object_url) assertAdtUri(object_url);
         const input = source ?? (await adt.getObjectSource(isSourceUrl(object_url!) ? object_url! : `${object_url!.replace(/\/$/, "")}/source/main`));
         const r = await adt.prettyPrint(input);
         const same = r.source.replace(/\r\n/g, "\n").trimEnd() === input.replace(/\r\n/g, "\n").trimEnd();
