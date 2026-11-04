@@ -9,6 +9,7 @@ import { parseStreamJson, writeMcpConfig } from "../../eval/lib/claude.js";
 import { parseArgs } from "../../eval/lib/args.js";
 import { ADAPTERS, parseModelSpecs } from "../../eval/lib/adapters.js";
 import { CSV_HEADER, renderCsv, renderMarkdown, writeReports, type TaskResult } from "../../eval/lib/report.js";
+import { bindingNameFromUri, unpublishBody } from "../../eval/lib/harness.js";
 import * as os from "node:os";
 
 const TASK_DIR = path.resolve("eval/tasks");
@@ -189,5 +190,18 @@ describe("評測任務集(F1)", () => {
     expect(() => parseTask("id: x\ntitle: t\nprompt: p\nchecks: []", "a.yaml", "X")).toThrow(/至少要有一個 check/);
     expect(() => parseTask("id: x\ntitle: t\nprompt: p\nchecks: [{kind: magic}]", "a.yaml", "X")).toThrow(/未知的 check/);
     expect(fillPlaceholders("A_{{SFX}} a_{{sfx}}", "Ab1")).toBe("A_AB1 a_ab1");
+  });
+});
+
+describe("評測清除:service binding 先取消發布", () => {
+  it("只有 binding URI 會取出名稱(大寫),其他物件不處理", () => {
+    expect(bindingNameFromUri("/sap/bc/adt/businessservices/bindings/zui_ev6_ab12cd_o4")).toBe("ZUI_EV6_AB12CD_O4");
+    expect(bindingNameFromUri("/sap/bc/adt/ddic/srvd/sources/zui_ev6_ab12cd_o4")).toBeUndefined();
+    expect(bindingNameFromUri("/sap/bc/adt/oo/classes/zcl_x")).toBeUndefined();
+  });
+  it("unpublish 本文含 SCGR 類型與大寫名稱", () => {
+    const b = unpublishBody("zui_ev6_ab12cd_o4");
+    expect(b).toContain('adtcore:type="SCGR"');
+    expect(b).toContain('adtcore:name="ZUI_EV6_AB12CD_O4"');
   });
 });

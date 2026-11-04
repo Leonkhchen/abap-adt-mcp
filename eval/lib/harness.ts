@@ -40,6 +40,22 @@ export function evalEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEn
 
 const norm = (s: string) => s.toLowerCase();
 
+const BINDING_URI = /^\/sap\/bc\/adt\/businessservices\/bindings\/([^/?]+)/i;
+
+/** service binding 的 URI 取出名稱(大寫);不是 binding 回 undefined */
+export function bindingNameFromUri(uri: string): string | undefined {
+  const m = BINDING_URI.exec(uri);
+  return m ? decodeURIComponent(m[1]).toUpperCase() : undefined;
+}
+
+/** 取消發布 OData V4 service binding 的請求本文(已發布的 binding 無法直接刪除) */
+export function unpublishBody(name: string): string {
+  return (
+    `<?xml version="1.0" encoding="UTF-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">` +
+    `<adtcore:objectReference adtcore:type="SCGR" adtcore:name="${name.toUpperCase()}"/></adtcore:objectReferences>`
+  );
+}
+
 export async function createHarness(env: NodeJS.ProcessEnv = evalEnv(), auditPath = ""): Promise<Harness> {
   const cfg = loadConfig(env);
   const server = new McpServer({ name: "abap-adt-mcp-eval", version: "0" });
@@ -88,6 +104,17 @@ export async function createHarness(env: NodeJS.ProcessEnv = evalEnv(), auditPat
   };
 
   const deleteObject = async (uri: string): Promise<string> => {
+    const binding = bindingNameFromUri(uri);
+    if (binding) {
+      // 已發布的 binding 刪除會被拒(Service endpoint … is published):先取消發布;尚未發布或失敗就照常嘗試刪除
+      await raw.httpClient
+        .request("/sap/bc/adt/businessservices/odatav4/unpublishjobs", {
+          method: "POST",
+          headers: { "Content-Type": "application/xml", Accept: "application/xml" },
+          body: unpublishBody(binding),
+        })
+        .catch(() => undefined);
+    }
     try {
       raw.stateful = session_types.stateful;
       const lock = await raw.lock(uri);
