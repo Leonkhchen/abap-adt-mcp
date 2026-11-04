@@ -46,7 +46,7 @@ AI 可以在 `$TMP` 從零完成「建立 → 寫 → 啟用 → ABAP Unit → A
 | `abapgit_repos` | 列出已連結的 abapGit repo(只讀;系統沒有 abapGit ADT 後端時回報說明。**不提供 pull / push**,理由見 SECURITY.md) |
 | `create_object` | ✏️ 建立 CLAS/OC、INTF/OI、PROG/P、DDLS/DF、BDEF/BDO、TABL/DT(資料表) |
 | `rap_generate` | ✏️ **由資料表產生 RAP BO 與 OData V4 UI 服務**(約 14 個物件):預設只預覽,`confirm=true` 才產生;每個物件都要過白名單,任一不過整批拒絕;可發佈並回傳服務網址 |
-| `run_unit_tests` | ⚠️ **會執行測試程式碼**:ABAP Unit(物件或 package;只跑宣告為 RISK LEVEL HARMLESS 的測試) |
+| `run_unit_tests` | ⚠️ **會執行測試程式碼**:ABAP Unit(物件或 package;只跑宣告為 RISK LEVEL HARMLESS 的測試)。**與 `run_class` 一樣受名稱前綴與 package 白名單限制**;package 模式任一物件不符合就整批拒絕 |
 | `run_class` | ⚠️ **會在 SAP 系統上執行程式**:執行 IF_OO_ADT_CLASSRUN(輸出上限 20,000 字元) |
 | `create_transport` | ✏️ 建立 workbench transport request(只在 `SYSTEM_ROLE=dev`) |
 
