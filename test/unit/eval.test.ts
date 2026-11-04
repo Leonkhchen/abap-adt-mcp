@@ -10,6 +10,7 @@ import { parseArgs } from "../../eval/lib/args.js";
 import { ADAPTERS, parseModelSpecs } from "../../eval/lib/adapters.js";
 import { CSV_HEADER, renderCsv, renderMarkdown, writeReports, type TaskResult } from "../../eval/lib/report.js";
 import { bindingNameFromUri, unpublishBody } from "../../eval/lib/harness.js";
+import { formatUnitTestResults } from "../../src/tools/formatters.js";
 import * as os from "node:os";
 
 const TASK_DIR = path.resolve("eval/tasks");
@@ -203,5 +204,18 @@ describe("評測清除:service binding 先取消發布", () => {
     const b = unpublishBody("zui_ev6_ab12cd_o4");
     expect(b).toContain('adtcore:type="SCGR"');
     expect(b).toContain('adtcore:name="ZUI_EV6_AB12CD_O4"');
+  });
+});
+
+describe("第 03 題判定字串對得上 run_unit_tests 的實際輸出", () => {
+  const t03 = loadTasks(TASK_DIR, "ab12cd").find((t) => t.id === "03")!;
+  const check = t03.checks.find((c) => c.kind === "tool" && c.tool === "run_unit_tests") as { contains: string[] };
+  const cls = (alerts: unknown[]) =>
+    [{ testmethods: [{ alerts: [] }, { alerts }], alerts: [], uri: "u", type: "t", name: "LTC", durationCategory: "", riskLevel: "" }] as never;
+  it("全綠通過;有失敗(含 10 失敗之類)不通過", () => {
+    const green = formatUnitTestResults(cls([]));
+    expect(check.contains.every((s) => green.includes(s)), green).toBe(true);
+    const red = formatUnitTestResults(cls([{ kind: "failedAssertion", severity: "critical", title: "x", details: [] }]));
+    expect(check.contains.every((s) => red.includes(s)), red).toBe(false);
   });
 });

@@ -10,7 +10,7 @@ checks:
   - kind: tool
     tool: run_unit_tests
     args: { object_url: /sap/bc/adt/oo/classes/zcl_eval03_{{sfx}} }
-    contains: ["✅ ABAP Unit", " 0 失敗"]
+    contains: ["✅ ABAP Unit", "通過,0 失敗"]
   - kind: tool
     tool: class_components
     args: { object_url: /sap/bc/adt/oo/classes/zcl_eval03_{{sfx}} }
