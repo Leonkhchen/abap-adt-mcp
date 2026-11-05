@@ -23,7 +23,7 @@ export class GuardViolationError extends Error {
  * 例如 /sap/bc/adt/oo/classes/zcl_demo/source/main → ZCL_DEMO
  */
 export function objectNameFromUrl(objectUrl: string): string {
-  const path = objectUrl.split("?")[0];
+  const path = objectUrl.split(/[?#]/)[0];
   const segments = path.split("/").filter(Boolean);
   // 去除尾端的 source/main 等 source 路徑
   while (segments.length && ["main", "source", "includes", "testclasses", "definitions", "implementations", "macros"].includes(segments[segments.length - 1])) {

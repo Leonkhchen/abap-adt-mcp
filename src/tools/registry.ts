@@ -13,13 +13,13 @@ import type { AppConfig } from "../config.js";
 import { AuditLogger, diffSummary } from "../safety/audit.js";
 import { assertPackageAllowed, assertWriteAllowed, objectNameFromUrl } from "../safety/guards.js";
 import { assertAdtUri } from "../safety/uri.js";
-import { ensureTestInclude, lockedWrite } from "../workflows/lockedWrite.js";
+import { ensureTestInclude, isCommentOnly, lockedWrite } from "../workflows/lockedWrite.js";
 import { SerialQueue } from "../safety/serialQueue.js";
 import { registerAnalysisTools, registerWriteDevTools } from "./devTools.js";
 import { registerDiagnosticTools } from "./diagTools.js";
 import { registerRapTools } from "./rapTools.js";
 import { registerGuidance } from "./guidance.js";
-import { baseObjectUrl as baseOf, isSourceUrl } from "../adt/objectTypes.js";
+import { baseObjectUrl as baseOf, isSourceUrl, isTestClassesInclude } from "../adt/objectTypes.js";
 import { VERSION } from "../version.js";
 
 
@@ -344,6 +344,18 @@ export function registerTools(
           expected_current_source
         );
         const includeCreated = createdTemplate !== undefined;
+        // review P2-3:include 先前已由本工具建立(只有 SAP 範本註解),語法錯誤後用 "" 重試時,
+        // 基準改用目前的範本內容(內容若已被改成有程式碼,鎖定前後比對仍會擋下)
+        let blankBaseline = createdTemplate;
+        if (
+          blankBaseline === undefined &&
+          expected_current_source !== undefined &&
+          expected_current_source.trim() === "" &&
+          isTestClassesInclude(sourceUrl)
+        ) {
+          const existing = await adt.getObjectSource(sourceUrl).catch(() => undefined);
+          if (existing !== undefined && isCommentOnly(existing)) blankBaseline = existing;
+        }
         if (includeCreated) {
           audit.log({
             timestamp: new Date().toISOString(),
@@ -378,8 +390,8 @@ export function registerTools(
           // C2:include 是本次才建立的,呼叫端的 "" 代表「原本不存在」;並行比對的基準改成剛建立的範本
           // (建立後被別人改動,鎖定前後兩次比對仍會發現)
           expectedCurrentSource:
-            includeCreated && expected_current_source !== undefined && expected_current_source.trim() === ""
-              ? createdTemplate
+            blankBaseline !== undefined && expected_current_source !== undefined && expected_current_source.trim() === ""
+              ? blankBaseline
               : expected_current_source,
         });
 

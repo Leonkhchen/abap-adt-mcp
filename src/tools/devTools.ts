@@ -169,26 +169,47 @@ export async function recentDumpHint(adt: AdtService, user: string, className: s
 /** 可能含 ABAP Unit 測試的物件類型(ADT 節點類型的前綴):class、program、function group */
 const TESTABLE_NODE_TYPE = /^(CLAS|PROG|FUGR)/;
 
+/** package 模式遞迴檢查的上限 */
+const PACKAGE_SCAN_MAX_DEPTH = 5;
+const PACKAGE_SCAN_MAX_NODES = 500;
+
 /**
  * package 模式的 run_unit_tests:package 內的每個可測試物件都要通過名稱前綴白名單,
  * 子 package 也要通過 package 白名單;任一不過就整批拒絕並列出被擋的項目(跟 activate_objects 同樣做法)。
  * ADT 無法預先知道哪些物件含測試類別,所以保守地檢查 package 內所有 class / program / function group。
  */
 export async function assertPackageContentsAllowed(adt: AdtService, cfg: AppConfig, packageName: string): Promise<void> {
-  const nodes = (await adt.nodeContents("DEVC/K", packageName)).nodes.filter((n) => n.OBJECT_NAME);
   const denied: string[] = [];
-  for (const n of nodes) {
-    const type = n.OBJECT_TYPE ?? "";
-    try {
-      if (type.startsWith("DEVC")) {
-        assertPackageAllowed(cfg, n.OBJECT_NAME);
-      } else if (TESTABLE_NODE_TYPE.test(type)) {
-        assertWriteAllowed(cfg, `/sap/bc/adt/x/${encodeURIComponent(n.OBJECT_NAME.toLowerCase())}`);
+  const visited = new Set<string>([packageName.toUpperCase()]);
+  let examined = 0;
+  // 遞迴走訪子 package(v0.5.1 review P2-2):深度與總節點數有上限,超過就整批拒絕(無法確認範圍時不放行)
+  const walk = async (pkg: string, depth: number): Promise<void> => {
+    const nodes = (await adt.nodeContents("DEVC/K", pkg)).nodes.filter((n) => n.OBJECT_NAME);
+    for (const n of nodes) {
+      const type = n.OBJECT_TYPE ?? "";
+      if (++examined > PACKAGE_SCAN_MAX_NODES) {
+        throw new GuardViolationError(`整批拒絕,沒有執行任何測試:package ${packageName} 的內容超過檢查上限(${PACKAGE_SCAN_MAX_NODES} 個節點)。`);
       }
-    } catch (e) {
-      denied.push(`- ${n.OBJECT_NAME} [${type}]:${e instanceof Error ? e.message : String(e)}`);
+      try {
+        if (type.startsWith("DEVC")) {
+          assertPackageAllowed(cfg, n.OBJECT_NAME);
+          const sub = n.OBJECT_NAME.toUpperCase();
+          if (visited.has(sub)) continue;
+          visited.add(sub);
+          if (depth >= PACKAGE_SCAN_MAX_DEPTH) {
+            throw new GuardViolationError(`子 package 層數超過檢查上限(${PACKAGE_SCAN_MAX_DEPTH})`);
+          }
+          await walk(sub, depth + 1);
+        } else if (TESTABLE_NODE_TYPE.test(type)) {
+          assertWriteAllowed(cfg, `/sap/bc/adt/x/${encodeURIComponent(n.OBJECT_NAME.toLowerCase())}`);
+        }
+      } catch (e) {
+        if (e instanceof GuardViolationError && e.message.startsWith("整批拒絕")) throw e;
+        denied.push(`- ${n.OBJECT_NAME} [${type}]:${e instanceof Error ? e.message : String(e)}`);
+      }
     }
-  }
+  };
+  await walk(packageName, 0);
   if (denied.length > 0) {
     throw new GuardViolationError(`整批拒絕,沒有執行任何測試(package ${packageName} 內有不符合白名單的項目):\n${denied.join("\n")}`);
   }
@@ -330,6 +351,10 @@ export function registerWriteDevTools(
         if (object_url) {
           // 與 run_class 相同:URI 格式 + 兩道白名單(v0.5.1 S2)
           assertAdtUri(target, cfg);
+          // package URI 要走 package_name 分支(才會檢查內容);否則可跳過整批檢查(review P2-1)
+          if (/^\/sap\/bc\/adt\/packages(\/|$|\?|#)/i.test(target)) {
+            throw new GuardViolationError("object_url 不接受 package URI,請改用 package_name 參數。");
+          }
           assertWriteAllowed(cfg, target);
           assertPackageAllowed(cfg, await adt.objectPackage(target));
         } else {

@@ -2333,3 +2333,72 @@ describe("C2 新建測試 include + expected_current_source 為空字串", () =>
     expect(adt.unLock).toHaveBeenCalled();
   });
 });
+
+// ───────────────────────── v0.5.1 獨立審查(claude -p)P2 修正 ─────────────────────────
+
+describe("review P2-3 include 已存在(僅範本)+ expected 空字串(語法錯誤後重試)", () => {
+  const INC = "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses";
+  it("目前只有範本註解 → 視為空基準、成功寫入", async () => {
+    const adt = mockAdt({
+      getObjectSource: vi.fn(async () => "* SAP test include template\n\n"),
+      getSourceInLock: vi.fn(async () => "* SAP test include template\n\n"),
+    });
+    const call = await connectTools(adt);
+    const r = await call("write_source", { object_url: INC, new_source: "CLASS ltc DEFINITION. ENDCLASS.", expected_current_source: "" });
+    expect(r.isError).toBe(false);
+    expect(adt.createTestInclude).not.toHaveBeenCalled();
+    expect(adt.setObjectSource).toHaveBeenCalledTimes(1);
+  });
+  it("目前已有實際程式碼 → 仍視為衝突、不寫入", async () => {
+    const adt = mockAdt({
+      getObjectSource: vi.fn(async () => "CLASS ltc DEFINITION. ENDCLASS."),
+      getSourceInLock: vi.fn(async () => "CLASS ltc DEFINITION. ENDCLASS."),
+    });
+    const call = await connectTools(adt);
+    const r = await call("write_source", { object_url: INC, new_source: "x", expected_current_source: "" });
+    expect(r.isError).toBe(true);
+    expect(adt.setObjectSource).not.toHaveBeenCalled();
+  });
+});
+
+describe("review P2-1/P2-2/P2-4", () => {
+  const cfg = () => makeConfig({ ABAP_MCP_ALLOWED_PREFIXES: "ZSAFE_", ABAP_MCP_ALLOWED_PACKAGES: "ZSAFE*" });
+  const nodes = (...n: [string, string][]) =>
+    ({ nodes: n.map(([OBJECT_NAME, OBJECT_TYPE]) => ({ OBJECT_NAME, OBJECT_TYPE, OBJECT_URI: "" })) }) as never;
+
+  it("P2-1 run_unit_tests 的 object_url 不接受 package URI", async () => {
+    const adt = mockAdt({ objectPackage: vi.fn(async () => "ZSAFE") });
+    const call = await connectTools(adt, cfg());
+    const r = await call("run_unit_tests", { object_url: "/sap/bc/adt/packages/zsafe" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("package_name");
+    expect(adt.runUnitTests).not.toHaveBeenCalled();
+  });
+
+  it("P2-2 子 package 內不符名稱的物件 → 整批拒絕", async () => {
+    const adt = mockAdt({
+      nodeContents: vi.fn(async (_t: string, pkg: string) =>
+        pkg === "ZSAFE" ? nodes(["ZSAFE_SUB", "DEVC/K"], ["ZSAFE_A", "CLAS/OC"]) : nodes(["CL_BAD", "CLAS/OC"])
+      ),
+    });
+    const call = await connectTools(adt, cfg());
+    const r = await call("run_unit_tests", { package_name: "ZSAFE" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("CL_BAD");
+    expect(adt.runUnitTests).not.toHaveBeenCalled();
+  });
+
+  it("P2-2 子 package 互相參照不會無限遞迴", async () => {
+    const adt = mockAdt({
+      nodeContents: vi.fn(async (_t: string, pkg: string) =>
+        pkg === "ZSAFE" ? nodes(["ZSAFE_B", "DEVC/K"]) : nodes(["ZSAFE", "DEVC/K"], ["ZSAFE_A", "CLAS/OC"])
+      ),
+    });
+    const call = await connectTools(adt, cfg());
+    expect((await call("run_unit_tests", { package_name: "ZSAFE" })).isError).toBe(false);
+  });
+
+  it("P2-4 objectNameFromUrl 忽略 #fragment", () => {
+    expect(objectNameFromUrl("/sap/bc/adt/oo/classes/cl_std#/zsafe_x")).toBe("CL_STD");
+  });
+});

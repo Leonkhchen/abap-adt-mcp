@@ -170,6 +170,11 @@ export async function ensureTestInclude(
   return adt.getObjectSource(sourceUrl);
 }
 
+/** 內容只有空行與註解(* 或 " 開頭)→ 沒有實際程式碼,例如 SAP 建立 include 時產生的範本 */
+export function isCommentOnly(s: string): boolean {
+  return s.split(/\r?\n/).every((l) => l.trim() === "" || /^\s*[*"]/.test(l));
+}
+
 /** 行尾差異(CRLF vs LF)不應視為內容變更 */
 function normalize(s: string): string {
   return s.replace(/\r\n/g, "\n").trimEnd();
