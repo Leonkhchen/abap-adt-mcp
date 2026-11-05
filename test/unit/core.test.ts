@@ -2375,6 +2375,16 @@ describe("review P2-1/P2-2/P2-4", () => {
     expect(adt.runUnitTests).not.toHaveBeenCalled();
   });
 
+  it("N1 編碼或重複斜線的 package URI 也被拒絕", async () => {
+    const adt = mockAdt({ objectPackage: vi.fn(async () => "ZSAFE") });
+    const call = await connectTools(adt, cfg());
+    for (const u of ["/sap/bc/adt/%70ackages/zsafe", "/sap/bc/adt//packages/zsafe", "/sap/bc/adt/packages/zsafe?x=1"]) {
+      const r = await call("run_unit_tests", { object_url: u });
+      expect(r.isError, u).toBe(true);
+    }
+    expect(adt.runUnitTests).not.toHaveBeenCalled();
+  });
+
   it("P2-2 子 package 內不符名稱的物件 → 整批拒絕", async () => {
     const adt = mockAdt({
       nodeContents: vi.fn(async (_t: string, pkg: string) =>

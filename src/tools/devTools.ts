@@ -352,7 +352,14 @@ export function registerWriteDevTools(
           // 與 run_class 相同:URI 格式 + 兩道白名單(v0.5.1 S2)
           assertAdtUri(target, cfg);
           // package URI 要走 package_name 分支(才會檢查內容);否則可跳過整批檢查(review P2-1)
-          if (/^\/sap\/bc\/adt\/packages(\/|$|\?|#)/i.test(target)) {
+          // 先解碼並合併連續斜線再比對(N1:%70ackages、//packages 也要擋)
+          let probe = target.split(/[?#]/, 1)[0];
+          try {
+            probe = decodeURIComponent(probe);
+          } catch {
+            /* assertAdtUri 已驗證過編碼格式 */
+          }
+          if (/^\/sap\/bc\/adt\/packages(\/|$)/i.test(probe.replace(/\/{2,}/g, "/"))) {
             throw new GuardViolationError("object_url 不接受 package URI,請改用 package_name 參數。");
           }
           assertWriteAllowed(cfg, target);
