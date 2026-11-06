@@ -75,7 +75,7 @@ ABAP_MCP_ALLOWED_PACKAGES=$TMP,ZFI_*
 - `run_unit_tests` 會在 SAP 上執行測試程式碼,因此與 `run_class` 一樣**唯讀模式(含 prod)不註冊**。它只執行宣告為 `RISK LEVEL HARMLESS`、`DURATION SHORT/MEDIUM` 的測試類別(不跑 DANGEROUS / CRITICAL),但 RISK LEVEL 是測試類別自己的宣告,不保證測試不寫資料,所以不能當作唯讀的依據(v0.3.1 起)
 - `create_object` 在建立前呼叫 SAP 的名稱檢查;非 `$` 開頭的 package 必須給 transport;`create_transport` 只在 `SYSTEM_ROLE=dev` 且非唯讀時註冊
 
-- **URI 驗證(v0.5.1)**:abap-adt-api 的 HTTP request 會附上 SAP Basic 認證與 cookie,而 axios 遇到絕對 URL 會直接改送該主機。因此 `src/safety/uri.ts` 的 `assertAdtUri` 是所有「使用者給的 URI」的必經關卡(`RealAdtService` 每個吃 URI 的方法 + 各工具入口);物件名稱護欄也改用驗證後的路徑取名,避免 `…/cl_std/../zsafe_x` 名稱檢查過了、實際指向別處。redirect 限同 origin(`restrictRedirectsToBaseOrigin`)
+- **URI 驗證(v0.5.1)**:abap-adt-api 的 HTTP request 會附上 SAP Basic 認證與 cookie,而 axios 遇到絕對 URL 會直接改送該主機。因此 `src/safety/uri.ts` 的 `assertAdtUri` 是所有「使用者給的 URI」的必經關卡(`RealAdtService` 每個吃 URI 的方法 + 各工具入口;v0.6 C0-4 補上原本漏掉的 `dump_detail` 的 dump_id、DDIC 的 `dataElementProperties` / `domainProperties`)。**不經 `assertAdtUri` 的只有「名稱」類參數**(`search_objects` 查詢字串、`ddicElement`、`tableContents`、`runQuery`、`nodeContents`、`runClass`、`rapPublish`、`odataV4Service`):它們不是 URI,由 abap-adt-api 以 query string 編碼,或本專案以 `encodeURIComponent` 組成路徑,無法改變 request 的主機;物件名稱護欄也改用驗證後的路徑取名,避免 `…/cl_std/../zsafe_x` 名稱檢查過了、實際指向別處。redirect 限同 origin(`restrictRedirectsToBaseOrigin`;這項依賴 abap-adt-api 的內部結構,若無法安裝限制,啟動時只在 stderr 印警告並繼續,所以主要防線仍是 `assertAdtUri`)
 - `run_unit_tests` 的白名單(v0.5.1):單一物件 = `assertWriteAllowed` + `assertPackageAllowed(objectPackage)`;package 模式 = package 白名單 + package 內每個 class / program / function group 的名稱前綴 + 子 package 白名單,列出所有被擋的項目後整批拒絕;每次呼叫寫 audit
 
 ### 3-4. 401 斷路
