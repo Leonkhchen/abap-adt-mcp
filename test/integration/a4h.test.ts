@@ -1097,3 +1097,57 @@ describe.skipIf(!RUN_WRITE)("v0.6 C0-6 R2 實機確認（A4H，暫存 package）
     expect(pkg.text).toContain(CLS);
   }, 600_000);
 });
+
+// ───────────────────────────── v0.6 P-B：探針模式 B（debugger 快照，T46–T49）─────────────────────────────
+// 前提:A4H 的 $ZINV 在 ZINV baseline 狀態(ZCL_INV_POSTING 第 176 行在 calc_issue_amt 內,單元測試會經過)。
+// 每個測試只用 DEVELOPER 帳號、逾時 ≤ 60 秒;結束後工具自己刪中斷點、取消監聽、登出。
+describe.skipIf(!RUN_WRITE)("v0.6 探針模式 B（A4H，$ZINV 的 ZCL_INV_POSTING）", () => {
+  const POSTING = "/sap/bc/adt/oo/classes/zcl_inv_posting";
+  const base = { ...process.env, ABAP_MCP_READONLY: "false", ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV,$TMP" };
+  let s: Awaited<ReturnType<typeof startServer>>;
+  beforeAll(async () => {
+    s = await startServer(base);
+  }, 60_000);
+  afterAll(async () => s?.close());
+
+  const trigger = { tool: "run_unit_tests", object_url: POSTING };
+
+  it("T46 命中中斷點 → 記錄變數 → 自動繼續,單元測試照常跑完", async () => {
+    const r = await s.call("probe_set", { object_url: POSTING, line: 176, fields: ["iv_qty", "iv_stqty", "iv_stval"], max_hits: 2, trigger, timeout_seconds: 60 });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("36 個測試方法,36 通過,0 失敗");
+    expect(r.text).toMatch(/命中 [12]\/2 次/);
+    const id = /(run-\d+)/.exec(r.text)![1];
+    const logs = await s.call("probe_logs", { run_id: id });
+    expect(logs.text).toContain("iv_stqty = 10");
+    expect(logs.text).toContain("iv_stval = 1000");
+    await s.call("probe_delete", { run_id: id });
+  }, 120_000);
+
+  it("T47 max_hits=1:收滿即停止記錄,執行仍正常結束", async () => {
+    const r = await s.call("probe_set", { object_url: POSTING, line: 176, fields: ["iv_qty"], max_hits: 1, trigger, timeout_seconds: 60 });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("命中 1/1 次");
+    expect(r.text).toContain("36 通過");
+  }, 120_000);
+
+  it("T48 沒人觸發 → 逾時;之後立刻再跑一次仍成功(沒有殘留的監聽或中斷點)", async () => {
+    const t = await s.call("probe_set", { object_url: POSTING, line: 176, fields: ["iv_qty"], trigger: { manual: true }, timeout_seconds: 10 });
+    expect(t.isError, t.text).toBe(false);
+    expect(t.text).toContain("逾時");
+    const again = await s.call("probe_set", { object_url: POSTING, line: 176, fields: ["iv_qty"], max_hits: 1, trigger, timeout_seconds: 60 });
+    expect(again.isError, again.text).toBe(false);
+    expect(again.text).toContain("命中 1/1 次");
+  }, 180_000);
+
+  it("T49 scope=custom:SAP 標準物件被拒絕,且不連 debugger", async () => {
+    const c = await startServer({ ...base, ABAP_MCP_PROBE_SCOPE: "custom" });
+    try {
+      const r = await c.call("probe_set", { object_url: STD_CLASS, line: 10, fields: ["x"], trigger: { manual: true }, timeout_seconds: 10 });
+      expect(r.isError, r.text).toBe(true);
+      expect(r.text).toMatch(/custom|自訂|範圍/);
+    } finally {
+      await c.close();
+    }
+  }, 60_000);
+});
