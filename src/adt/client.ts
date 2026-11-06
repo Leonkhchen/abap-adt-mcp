@@ -27,6 +27,7 @@ import {
 import * as https from "node:https";
 import type { AppConfig } from "../config.js";
 import { assertAdtUri } from "../safety/uri.js";
+import { logoutClient, releaseStateful } from "./session.js";
 import { AuthCircuitOpenError, hasHttpStatus, isAuthFailure } from "./errors.js";
 import { activationBody, parseActivationResponse } from "./activation.js";
 import {
@@ -139,6 +140,8 @@ export interface NewObjectSpec {
 /** MCP 工具層所依賴的 ADT 操作介面(僅暴露 MVP 需要的方法) */
 export interface AdtService {
   login(): Promise<void>;
+  /** 登出所有 ADT client、釋放 SAP 端的 HTTP session(MCP server 結束時呼叫;可重複呼叫) */
+  close?(): Promise<void>;
   /** 每次都實際對 SAP 發一次請求(不依賴快取的登入狀態),回傳耗時 */
   ping(): Promise<{ elapsedMs: number }>;
   searchObject(query: string, objType?: string, max?: number): Promise<SearchResult[]>;
@@ -447,22 +450,23 @@ export class RealAdtService implements AdtService {
       } catch (e) {
         // 鎖定失敗必須恢復 stateless:abap-adt-api 在 stateful 模式下不會自動重登,
         // 若停在 stateful,之後 session 失效時所有呼叫都無法恢復
-        this.endStatefulSession();
+        await releaseStateful(this.lockClient);
         throw e;
       }
     });
   }
 
+  private closed = false;
+
   /**
-   * 回到 stateless,並丟掉 stateful 期間 SAP 發的 sap-contextid cookie。
-   * A4H 實測:解鎖後若保留 sap-contextid,之後任何一次 SAP 端例外(例如讀取尚未建立的 include)
-   * 會結束那個 context,此後所有請求都帶著失效的 context id 而回 400,且無法自行恢復。
+   * 登出 client 與 lockClient(C0-10):MCP server 結束、評測與測試收尾時呼叫。
+   * 只呼叫一次有效;兩個 client 是同一個(測試注入)時只登出一次;登出失敗不丟例外。
    */
-  private endStatefulSession(): void {
-    this.lockClient.stateful = session_types.stateless;
-    // AdtHTTP.cookie 在型別上是 private,執行期為 Map<cookie 名稱, 值>
-    const jar = (this.lockClient.httpClient as unknown as { cookie?: Map<string, string> }).cookie;
-    jar?.delete("sap-contextid");
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    const clients = new Set<ADTClient>([this.client, this.lockClient]);
+    await Promise.all([...clients].map((c) => logoutClient(c)));
   }
 
   async createTestInclude(className: string, lockHandle: string, transport?: string) {
@@ -474,8 +478,11 @@ export class RealAdtService implements AdtService {
       const url = this.u(objectUrl);
       await this.guard(() => this.lockClient.unLock(url, lockHandle));
     } finally {
-      // 無論解鎖成敗(含斷路)都恢復 stateless,釋放後端資源並保留自動重登能力
-      this.endStatefulSession();
+      // 無論解鎖成敗(含斷路)都結束 stateful session(C0-10):
+      // 通知 SAP 放掉 context(釋放 extended memory)、回到 stateless、丟掉失效的 sap-contextid。
+      // A4H 實測:解鎖後若保留 sap-contextid,之後任何一次 SAP 端例外(例如讀取尚未建立的 include)
+      // 會結束那個 context,此後所有請求都帶著失效的 context id 而回 400,且無法自行恢復
+      await releaseStateful(this.lockClient);
     }
   }
 

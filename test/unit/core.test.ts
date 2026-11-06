@@ -148,6 +148,8 @@ function fakeAdtClient(overrides: Record<string, unknown> = {}) {
     searchObject: vi.fn(async () => []),
     lock: vi.fn(async () => ({ LOCK_HANDLE: "LH-1" })),
     unLock: vi.fn(async () => {}),
+    dropSession: vi.fn(async () => {}),
+    logout: vi.fn(async () => {}),
     ...overrides,
   };
   return fake;
@@ -2528,5 +2530,193 @@ describe("review P2-1/P2-2/P2-4", () => {
 
   it("P2-4 objectNameFromUrl 忽略 #fragment", () => {
     expect(objectNameFromUrl("/sap/bc/adt/oo/classes/cl_std#/zsafe_x")).toBe("CL_STD");
+  });
+});
+
+// ───────────────────────── v0.6 C0-10:ADT 工作階段收尾(stateful 流程與 client 生命週期)─────────────────────────
+
+import { releaseStateful, logoutClient } from "../../src/adt/session.js";
+import { installShutdown } from "../../src/lifecycle.js";
+
+describe("C0-10 stateful 流程結束一定通知 SAP 結束 session(dropSession)", () => {
+  const OBJ = "/sap/bc/adt/oo/classes/zcl_x";
+  const SRC = `${OBJ}/source/main`;
+
+  /** 假 client:記錄 dropSession 被呼叫時 sap-contextid 還在不在(必須先通知 SAP,再丟 cookie) */
+  function statefulFake(overrides: Record<string, unknown> = {}) {
+    const cookie = new Map([["SAP_SESSIONID_A4H_001", "s"], ["sap-contextid", "c"]]);
+    const seen: { contextAtDrop: boolean[] } = { contextAtDrop: [] };
+    const fake = fakeAdtClient({
+      httpClient: { request: vi.fn(async () => ({ status: 200 })), cookie },
+      dropSession: vi.fn(async () => {
+        seen.contextAtDrop.push(cookie.has("sap-contextid"));
+      }),
+      getObjectSource: vi.fn(async () => "old"),
+      setObjectSource: vi.fn(async () => {}),
+      ...overrides,
+    });
+    return { fake, cookie, seen };
+  }
+
+  it("lock → unLock 成功:dropSession 恰好 1 次、已回 stateless、sap-contextid 已丟;dropSession 時 context 還在", async () => {
+    const { fake, cookie, seen } = statefulFake();
+    const adt = realAdt(fake);
+    const l = await adt.lock(OBJ);
+    expect(fake.stateful).toBe(session_types.stateful);
+    await adt.unLock(OBJ, l.LOCK_HANDLE);
+    expect(fake.dropSession).toHaveBeenCalledTimes(1);
+    expect(seen.contextAtDrop).toEqual([true]);
+    expect(fake.stateful).toBe(session_types.stateless);
+    expect(cookie.has("sap-contextid")).toBe(false);
+    expect(cookie.has("SAP_SESSIONID_A4H_001")).toBe(true);
+  });
+
+  it("unLock 失敗:仍然 dropSession,且原本的錯誤照丟", async () => {
+    const { fake, cookie } = statefulFake({ unLock: vi.fn(async () => { throw new Error("unlock boom"); }) });
+    const adt = realAdt(fake);
+    const l = await adt.lock(OBJ);
+    await expect(adt.unLock(OBJ, l.LOCK_HANDLE)).rejects.toThrow("unlock boom");
+    expect(fake.dropSession).toHaveBeenCalledTimes(1);
+    expect(fake.stateful).toBe(session_types.stateless);
+    expect(cookie.has("sap-contextid")).toBe(false);
+  });
+
+  it("lock 失敗:仍然 dropSession(不能停在 stateful),錯誤照丟", async () => {
+    const { fake } = statefulFake({ lock: vi.fn(async () => { throw new Error("locked by OTHER"); }) });
+    const adt = realAdt(fake);
+    await expect(adt.lock(OBJ)).rejects.toThrow("locked by OTHER");
+    expect(fake.dropSession).toHaveBeenCalledTimes(1);
+    expect(fake.stateful).toBe(session_types.stateless);
+  });
+
+  it("dropSession 本身失敗(SAP 端 context 已結束,回 400)→ 不丟例外、cookie 仍被清掉", async () => {
+    const { fake, cookie } = statefulFake({ dropSession: vi.fn(async () => { throw new Error("Request failed with status code 400"); }) });
+    const adt = realAdt(fake);
+    const l = await adt.lock(OBJ);
+    await expect(adt.unLock(OBJ, l.LOCK_HANDLE)).resolves.toBeUndefined();
+    expect(fake.stateful).toBe(session_types.stateless);
+    expect(cookie.has("sap-contextid")).toBe(false);
+  });
+
+  it("lockedWrite 成功路徑:一次寫入 → 一次 dropSession", async () => {
+    const { fake } = statefulFake();
+    await lockedWrite(realAdt(fake), { objectUrl: OBJ, sourceUrl: SRC, newSource: "new" });
+    expect(fake.lock).toHaveBeenCalledTimes(1);
+    expect(fake.unLock).toHaveBeenCalledTimes(1);
+    expect(fake.dropSession).toHaveBeenCalledTimes(1);
+    expect(fake.stateful).toBe(session_types.stateless);
+  });
+
+  it("lockedWrite 失敗路徑(寫入丟例外):仍 unLock + dropSession 各 1 次", async () => {
+    const { fake } = statefulFake({ setObjectSource: vi.fn(async () => { throw new Error("write boom"); }) });
+    await expect(lockedWrite(realAdt(fake), { objectUrl: OBJ, sourceUrl: SRC, newSource: "new" })).rejects.toThrow("write boom");
+    expect(fake.unLock).toHaveBeenCalledTimes(1);
+    expect(fake.dropSession).toHaveBeenCalledTimes(1);
+    expect(fake.stateful).toBe(session_types.stateless);
+  });
+
+  it("lockedWrite 並行衝突(鎖定前就中止):沒有鎖定也不需要收尾,不多送請求", async () => {
+    const { fake } = statefulFake({ getObjectSource: vi.fn(async () => "someone else") });
+    await expect(
+      lockedWrite(realAdt(fake), { objectUrl: OBJ, sourceUrl: SRC, newSource: "new", expectedCurrentSource: "mine" })
+    ).rejects.toBeInstanceOf(ConcurrentModificationError);
+    expect(fake.lock).not.toHaveBeenCalled();
+    expect(fake.dropSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("C0-10 releaseStateful / logoutClient", () => {
+  it("dropSession 卡住時不會卡住收尾(逾時後照樣回 stateless、丟 cookie)", async () => {
+    const cookie = new Map([["sap-contextid", "c"]]);
+    const fake = fakeAdtClient({ httpClient: { cookie }, dropSession: vi.fn(() => new Promise(() => {})) });
+    fake.stateful = session_types.stateful;
+    await releaseStateful(fake as unknown as ADTClient, 20);
+    expect(fake.stateful).toBe(session_types.stateless);
+    expect(cookie.size).toBe(0);
+  });
+
+  it("logoutClient:已登入才登出;沒登入不送請求;登出失敗或卡住都不丟例外", async () => {
+    const a = fakeAdtClient();
+    await logoutClient(a as unknown as ADTClient);
+    expect(a.logout).toHaveBeenCalledTimes(1);
+
+    const b = fakeAdtClient({ loggedin: false });
+    await logoutClient(b as unknown as ADTClient);
+    expect(b.logout).not.toHaveBeenCalled();
+
+    const c = fakeAdtClient({ logout: vi.fn(async () => { throw new Error("boom"); }) });
+    await expect(logoutClient(c as unknown as ADTClient)).resolves.toBeUndefined();
+
+    const d = fakeAdtClient({ logout: vi.fn(() => new Promise(() => {})) });
+    await expect(logoutClient(d as unknown as ADTClient, 20)).resolves.toBeUndefined();
+  });
+});
+
+describe("C0-10 RealAdtService.close()", () => {
+  it("client 與 lockClient 各登出一次;重複呼叫不再送請求", async () => {
+    const a = fakeAdtClient();
+    const b = fakeAdtClient();
+    const adt = new RealAdtService(makeConfig(), a as unknown as ADTClient, b as unknown as ADTClient);
+    await adt.close();
+    await adt.close();
+    expect(a.logout).toHaveBeenCalledTimes(1);
+    expect(b.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it("兩個是同一個 client 時只登出一次", async () => {
+    const a = fakeAdtClient();
+    const adt = new RealAdtService(makeConfig(), a as unknown as ADTClient);
+    await adt.close();
+    expect(a.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it("其中一個登出失敗 → 另一個仍登出,close 不丟例外", async () => {
+    const a = fakeAdtClient({ logout: vi.fn(async () => { throw new Error("boom"); }) });
+    const b = fakeAdtClient();
+    const adt = new RealAdtService(makeConfig(), a as unknown as ADTClient, b as unknown as ADTClient);
+    await expect(adt.close()).resolves.toBeUndefined();
+    expect(b.logout).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("C0-10 MCP server 結束時登出(installShutdown)", () => {
+  function setup(close: () => Promise<void>, timeoutMs = 50) {
+    const handlers: Record<string, () => void> = {};
+    const reg = (prefix: string) => ({ on: (ev: string, fn: () => void) => { handlers[`${prefix}:${ev}`] = fn; } });
+    const exit = vi.fn();
+    const adt = { close: vi.fn(close) };
+    const run = installShutdown(adt, { signals: reg("sig"), stdin: reg("stdin"), exit, log: () => {}, timeoutMs });
+    return { handlers, exit, adt, run };
+  }
+
+  it.each([["sig:SIGINT"], ["sig:SIGTERM"], ["stdin:end"], ["stdin:close"]])("%s → close 一次、exit(0)", async (key) => {
+    const { handlers, exit, adt, run } = setup(async () => {});
+    handlers[key]();
+    await run("again");
+    expect(adt.close).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  it("stdin 關閉又收到 SIGTERM:只登出一次、只 exit 一次", async () => {
+    const { handlers, exit, adt, run } = setup(async () => {});
+    handlers["stdin:end"]();
+    handlers["sig:SIGTERM"]();
+    await run("again");
+    expect(adt.close).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledTimes(1);
+  });
+
+  it("登出卡住 → 逾時後仍然結束 process", async () => {
+    const { handlers, exit, run } = setup(() => new Promise(() => {}), 20);
+    handlers["sig:SIGINT"]();
+    await run("again");
+    expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  it("登出丟例外 → 仍然結束 process", async () => {
+    const { handlers, exit, run } = setup(async () => { throw new Error("boom"); });
+    handlers["sig:SIGTERM"]();
+    await run("again");
+    expect(exit).toHaveBeenCalledWith(0);
   });
 });

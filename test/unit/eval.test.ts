@@ -229,6 +229,7 @@ describe("E1 deleteWithLock", () => {
     lock: vi.fn(o.lock ?? (async () => ({ LOCK_HANDLE: "LH-1" }))),
     unLock: vi.fn(o.unLock ?? (async () => undefined)),
     deleteObject: vi.fn(o.deleteObject ?? (async () => undefined)),
+    dropSession: vi.fn(async () => undefined),
   });
 
   it("lock 成功、delete 失敗 → 送出 unLock,並回報刪除錯誤", async () => {
@@ -238,6 +239,17 @@ describe("E1 deleteWithLock", () => {
     expect(out).toContain("刪除失敗");
     expect(out).toContain("object has dependencies");
     expect(r.stateful).toBe("stateless");
+    expect(r.dropSession).toHaveBeenCalledTimes(1); // C0-10:失敗路徑也通知 SAP 結束 session
+  });
+
+  it("C0-10:刪除成功 → 也 dropSession 一次;lock 失敗 → 同樣收尾", async () => {
+    const ok = raw();
+    await deleteWithLock(ok, URI);
+    expect(ok.dropSession).toHaveBeenCalledTimes(1);
+    expect(ok.stateful).toBe("stateless");
+    const bad = raw({ lock: async () => { throw new Error("locked by OTHER"); } });
+    await deleteWithLock(bad, URI);
+    expect(bad.dropSession).toHaveBeenCalledTimes(1);
   });
 
   it("lock 本身失敗 → 不呼叫 unLock", async () => {

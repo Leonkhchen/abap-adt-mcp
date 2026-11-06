@@ -14,7 +14,7 @@
  *
  * 連線設定沿用 SAP_URL / SAP_USER / SAP_PASSWORD / SAP_CLIENT（見 .env.example）。
  */
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, onTestFinished } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -24,6 +24,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ADTClient, session_types } from "abap-adt-api";
 import { loadConfig, type AppConfig } from "../../src/config.js";
 import { RealAdtService } from "../../src/adt/client.js";
+import { logoutClient, releaseStateful } from "../../src/adt/session.js";
 import { AuditLogger } from "../../src/safety/audit.js";
 import { registerTools } from "../../src/tools/registry.js";
 import { VERSION } from "../../src/version.js";
@@ -40,7 +41,8 @@ type ToolResult = { text: string; isError: boolean };
 async function startServer(env: NodeJS.ProcessEnv, auditPath = "") {
   const cfg = loadConfig(env);
   const server = new McpServer({ name: "abap-adt-mcp-it", version: VERSION });
-  registerTools(server, new RealAdtService(cfg), cfg, new AuditLogger(auditPath));
+  const adt = new RealAdtService(cfg);
+  registerTools(server, adt, cfg, new AuditLogger(auditPath));
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
   await server.connect(serverT);
   const client = new Client({ name: "it-client", version: "1.0.0" });
@@ -53,7 +55,16 @@ async function startServer(env: NodeJS.ProcessEnv, auditPath = "") {
     };
     return { text: r.content.map((c) => c.text ?? "").join("\n"), isError: !!r.isError };
   };
-  return { cfg, client, call, close: () => client.close() };
+  // C0-10:close 要登出 RealAdtService 的兩個 ADTClient,否則 SAP 端的 HTTP session 要等逾時才釋放
+  return {
+    cfg,
+    client,
+    call,
+    close: async () => {
+      await client.close();
+      await adt.close();
+    },
+  };
 }
 
 function classSource(name: string, marker: string) {
@@ -160,7 +171,8 @@ describe.skipIf(!RUN_WRITE)("寫入工具（A4H，$TMP 暫存物件）", () => {
     } catch (e) {
       console.error(`清除暫存物件 ${name} 失敗，請在 SE80 / Eclipse 手動刪除：${String(e)}`);
     } finally {
-      raw.stateful = session_types.stateless;
+      await releaseStateful(raw);
+      await logoutClient(raw);
       await s?.close();
     }
   }, 60_000);
@@ -219,7 +231,7 @@ describe.skipIf(!RUN_WRITE)("寫入工具（A4H，$TMP 暫存物件）", () => {
       const lock = await raw.lock(objUrl);
       await raw.unLock(objUrl, lock.LOCK_HANDLE);
     } finally {
-      raw.stateful = session_types.stateless;
+      await releaseStateful(raw);
     }
   }, 60_000);
 
@@ -324,9 +336,10 @@ describe.skipIf(!RUN_WRITE)("v0.3 開發循環工具（A4H，$TMP 暫存物件�
           console.error(`清除暫存物件 ${u} 失敗,請在 Eclipse 的 $TMP 手動刪除:${msg}`);
         }
       } finally {
-        raw.stateful = session_types.stateless;
+        await releaseStateful(raw);
       }
     }
+    await logoutClient(raw);
     await s?.close();
   }, 300_000);
 
@@ -459,9 +472,10 @@ describe.skipIf(!RUN_WRITE)("v0.4 診斷與資料工具（A4H，$TMP 暫存物�
           console.error(`清除暫存物件 ${u} 失敗,請在 Eclipse 的 $TMP 手動刪除:${String(e)}`);
         }
       } finally {
-        raw.stateful = session_types.stateless;
+        await releaseStateful(raw);
       }
     }
+    await logoutClient(raw);
     await s?.close();
   }, 300_000);
 
@@ -583,7 +597,7 @@ describe.skipIf(!RUN_WRITE)("v0.4 診斷與資料工具（A4H，$TMP 暫存物�
       const lock = await raw.lock(url(REV));
       await raw.unLock(url(REV), lock.LOCK_HANDLE);
     } finally {
-      raw.stateful = session_types.stateless;
+      await releaseStateful(raw);
     }
   }, 300_000);
 });
@@ -676,7 +690,7 @@ describe.skipIf(!RUN_WRITE)("v0.5 TABL 與 RAP 產生器(A4H,$TMP 暫存物件)"
         await c.unLock(u, lock.LOCK_HANDLE).catch(() => undefined);
       }
     } finally {
-      c.stateful = session_types.stateless;
+      await releaseStateful(c);
     }
   }
 
@@ -727,6 +741,8 @@ describe.skipIf(!RUN_WRITE)("v0.5 TABL 與 RAP 產生器(A4H,$TMP 暫存物件)"
         if (await stillThere(o.uri)) console.error(`清除暫存物件 ${o.uri} 失敗,請在 Eclipse 的 $TMP 手動刪除:${sapError(e)}`);
       }
     }
+    await logoutClient(c);
+    await logoutClient(raw);
     await s?.close();
   }, 600_000);
 
@@ -746,6 +762,7 @@ describe.skipIf(!RUN_WRITE)("v0.5 TABL 與 RAP 產生器(A4H,$TMP 暫存物件)"
 
   it("T32 rap_generate 預設只預覽:列出物件與 binding,系統裡沒有建立任何物件", async () => {
     const svc = new RealAdtService(s.cfg);
+    onTestFinished(() => svc.close());
     const links = await svc.rapGeneratorLinks(tableUri);
     expect(links, "A4H 應有 ui-service 產生器").toBeDefined();
     planned = (await svc.rapPreview(links!, tableUri, "$TMP")).objects;
@@ -860,9 +877,10 @@ describe.skipIf(!RUN_WRITE)("v0.5.1 安全與一致性修正（A4H，$TMP 暫存
           console.error(`清除暫存物件 ${u} 失敗,請在 Eclipse 的 $TMP 手動刪除:${String(e)}`);
         }
       } finally {
-        raw.stateful = session_types.stateless;
+        await releaseStateful(raw);
       }
     }
+    await logoutClient(raw);
     await s?.close();
   }, 300_000);
 
@@ -907,6 +925,7 @@ describe.skipIf(!RUN_WRITE)("v0.5.1 安全與一致性修正（A4H，$TMP 暫存
 
   it("T40 鎖定後再比對(R3):讀取之後、鎖定之前由第二個 ADT session 改動 → 被擋下,且鎖已釋放", async () => {
     const real = new RealAdtService(s.cfg);
+    onTestFinished(() => real.close());
     const objectUrl = url(C40);
     const sourceUrl = `${objectUrl}/source/main`;
     const v1 = mainSrc(C40, "V1");
@@ -923,7 +942,7 @@ describe.skipIf(!RUN_WRITE)("v0.5.1 安全與一致性修正（A4H，$TMP 暫存
         await raw.setObjectSource(sourceUrl, mainSrc(C40, "OTHER_SESSION"), l.LOCK_HANDLE);
         await raw.unLock(u, l.LOCK_HANDLE);
       } finally {
-        raw.stateful = session_types.stateless;
+        await releaseStateful(raw);
       }
       return real.lock(u);
     };
@@ -942,7 +961,7 @@ describe.skipIf(!RUN_WRITE)("v0.5.1 安全與一致性修正（A4H，$TMP 暫存
       const l = await raw.lock(objectUrl);
       await raw.unLock(objectUrl, l.LOCK_HANDLE);
     } finally {
-      raw.stateful = session_types.stateless;
+      await releaseStateful(raw);
     }
   }, 600_000);
 });
@@ -1034,9 +1053,10 @@ describe.skipIf(!RUN_WRITE)("v0.6 C0-6 R2 實機確認（A4H，暫存 package）
           console.error(`清除暫存物件 ${u} 失敗,請在 Eclipse 手動刪除:${String(e)}`);
         }
       } finally {
-        raw.stateful = session_types.stateless;
+        await releaseStateful(raw);
       }
     }
+    await logoutClient(raw);
     await s?.close();
     await sParentOnly?.close();
   }, 600_000);

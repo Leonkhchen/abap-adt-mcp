@@ -10,6 +10,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ADTClient, session_types } from "abap-adt-api";
 import { loadConfig, type AppConfig } from "../../src/config.js";
 import { RealAdtService } from "../../src/adt/client.js";
+import { logoutClient, releaseStateful } from "../../src/adt/session.js";
 import { AuditLogger } from "../../src/safety/audit.js";
 import { registerTools } from "../../src/tools/registry.js";
 import type { Check, EvalTask } from "./tasks.js";
@@ -95,9 +96,8 @@ export async function deleteWithLock(raw: LockableClient, uri: string): Promise<
       if (!(deleted && NOT_LOCKED.test(m))) unlockError = m;
     }
   }
-  raw.stateful = session_types.stateless;
-  // 丟掉 stateful 期間的 sap-contextid,避免之後的請求帶著失效的 context(同 RealAdtService.endStatefulSession)
-  (raw as unknown as { httpClient?: { cookie?: Map<string, string> } }).httpClient?.cookie?.delete("sap-contextid");
+  // 結束 stateful session(C0-10):通知 SAP 放掉 context、回 stateless、丟掉失效的 sap-contextid(不丟例外)
+  await releaseStateful(raw as unknown as ADTClient);
 
   if (failure !== undefined) {
     // 物件不存在時 SAP 回 does not exist / not found,或「cannot be created without a package」
@@ -114,7 +114,8 @@ export async function deleteWithLock(raw: LockableClient, uri: string): Promise<
 export async function createHarness(env: NodeJS.ProcessEnv = evalEnv(), auditPath = ""): Promise<Harness> {
   const cfg = loadConfig(env);
   const server = new McpServer({ name: "abap-adt-mcp-eval", version: "0" });
-  registerTools(server, new RealAdtService(cfg), cfg, new AuditLogger(auditPath));
+  const adt = new RealAdtService(cfg);
+  registerTools(server, adt, cfg, new AuditLogger(auditPath));
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
   await server.connect(serverT);
   const client = new Client({ name: "eval-harness", version: "0" });
@@ -197,6 +198,9 @@ export async function createHarness(env: NodeJS.ProcessEnv = evalEnv(), auditPat
     },
     async close() {
       await client.close();
+      // 登出評測用的所有 ADT client(C0-10):MCP 用的 RealAdtService 兩個 + 清除用的 raw
+      await adt.close();
+      await logoutClient(raw);
     },
   };
 }

@@ -9,6 +9,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { RealAdtService } from "./adt/client.js";
 import { loadConfig, warnIfPasswordUnquoted } from "./config.js";
+import { installShutdown } from "./lifecycle.js";
 import { AuditLogger } from "./safety/audit.js";
 import { registerTools } from "./tools/registry.js";
 import { VERSION } from "./version.js";
@@ -29,8 +30,10 @@ async function main() {
   });
   registerTools(server, adt, cfg, audit);
 
-  // 4. 啟動 stdio transport
+  // 4. 啟動 stdio transport;結束時(stdin 關閉 / SIGINT / SIGTERM)登出所有 ADT client,
+  //    否則 SAP 端的 HTTP session 要等逾時才釋放(C0-10)
   const transport = new StdioServerTransport();
+  installShutdown(adt, { signals: process, stdin: process.stdin, exit: (code) => process.exit(code) });
   await server.connect(transport);
 
   console.error(
