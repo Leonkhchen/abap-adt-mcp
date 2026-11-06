@@ -21,7 +21,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "abap-adt-api": "^8.4.0",
+    "abap-adt-api": "8.5.0",
     "dotenv": "^17.4.2",
     "zod": "^4.4.3"
   },
