@@ -265,6 +265,28 @@ describe("E1 deleteWithLock", () => {
     const out = await deleteWithLock(b, URI);
     expect(out).toContain("已刪除");
     expect(out).toContain("unlock boom");
+    expect(out.startsWith("❌")).toBe(true); // 鎖可能殘留 → 報表要看見
+  });
+
+  it("C0-3:刪除回「不存在」但解鎖失敗 → 不吞掉解鎖錯誤(❌ 開頭)", async () => {
+    const r = raw({
+      deleteObject: async () => { throw new Error("Resource does not exist (404)"); },
+      unLock: async () => { throw new Error("unlock boom"); },
+    });
+    const out = await deleteWithLock(r, URI);
+    expect(out.startsWith("❌")).toBe(true);
+    expect(out).toContain("unlock boom");
+    expect(out).toContain("不存在");
+  });
+
+  it("C0-3:刪除失敗且解鎖也失敗 → 原本的刪除錯誤仍在最前面,沒被蓋掉", async () => {
+    const r = raw({
+      deleteObject: async () => { throw new Error("object has dependencies"); },
+      unLock: async () => { throw new Error("unlock boom"); },
+    });
+    const out = await deleteWithLock(r, URI);
+    expect(out.indexOf("object has dependencies")).toBeGreaterThan(-1);
+    expect(out.indexOf("object has dependencies")).toBeLessThan(out.indexOf("unlock boom"));
   });
 
   it("物件不存在 → 略過;仍會解鎖(若有 handle)", async () => {

@@ -101,10 +101,14 @@ export async function deleteWithLock(raw: LockableClient, uri: string): Promise<
 
   if (failure !== undefined) {
     // 物件不存在時 SAP 回 does not exist / not found,或「cannot be created without a package」
-    if (/does not exist|not found|404|without a package/i.test(failure)) return `不存在(略過)${uri}`;
+    if (/does not exist|not found|404|without a package/i.test(failure)) {
+      // 解鎖失敗不能被「不存在」蓋掉(N6):殘留的鎖要被報表看見(❌ 開頭)
+      return unlockError ? `❌ 不存在(略過刪除),但解鎖失敗 ${uri}:${unlockError}` : `不存在(略過)${uri}`;
+    }
     return `❌ 刪除失敗 ${uri}:${failure}` + (unlockError ? `;另外解鎖也失敗:${unlockError}` : "");
   }
-  return `已刪除 ${uri}` + (unlockError ? `(⚠️ 解鎖失敗:${unlockError})` : "");
+  // 刪除成功但解鎖失敗:鎖可能殘留,以 ❌ 開頭讓報表列為清除問題
+  return unlockError ? `❌ 已刪除 ${uri},但解鎖失敗:${unlockError}` : `已刪除 ${uri}`;
 }
 
 export async function createHarness(env: NodeJS.ProcessEnv = evalEnv(), auditPath = ""): Promise<Harness> {
