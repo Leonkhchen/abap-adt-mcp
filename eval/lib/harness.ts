@@ -56,6 +56,57 @@ export function unpublishBody(name: string): string {
   );
 }
 
+/** deleteWithLock 需要的 ADTClient 部分(單元測試可用假物件) */
+export interface LockableClient {
+  stateful: session_types;
+  lock(uri: string): Promise<{ LOCK_HANDLE: string }>;
+  unLock(uri: string, lockHandle: string): Promise<unknown>;
+  deleteObject(uri: string, lockHandle: string, transport?: string): Promise<unknown>;
+}
+
+/** 解鎖回「沒有鎖」:刪除成功時 SAP 常已釋放鎖,不算錯誤 */
+const NOT_LOCKED = /not locked|no lock|nicht gesperrt|is not locked|does not exist|not found|404/i;
+
+/**
+ * lock → delete,失敗也一定解鎖(v0.5.1 E1)。
+ *  - lock handle 放在 try 外;lock 本身失敗時沒有 handle,不呼叫 unLock
+ *  - finally 先在同一個 stateful session 嘗試 unLock,再切回 stateless
+ *  - 刪除成功後的「not locked」類解鎖錯誤忽略;
+ *    解鎖失敗不蓋掉刪除錯誤,兩個都回報
+ */
+export async function deleteWithLock(raw: LockableClient, uri: string): Promise<string> {
+  let lockHandle: string | undefined;
+  let deleted = false;
+  let failure: string | undefined;
+  try {
+    raw.stateful = session_types.stateful;
+    lockHandle = (await raw.lock(uri)).LOCK_HANDLE;
+    await raw.deleteObject(uri, lockHandle);
+    deleted = true;
+  } catch (e) {
+    failure = String(e instanceof Error ? e.message : e);
+  }
+  let unlockError: string | undefined;
+  if (lockHandle !== undefined) {
+    try {
+      await raw.unLock(uri, lockHandle);
+    } catch (e) {
+      const m = String(e instanceof Error ? e.message : e);
+      if (!(deleted && NOT_LOCKED.test(m))) unlockError = m;
+    }
+  }
+  raw.stateful = session_types.stateless;
+  // 丟掉 stateful 期間的 sap-contextid,避免之後的請求帶著失效的 context(同 RealAdtService.endStatefulSession)
+  (raw as unknown as { httpClient?: { cookie?: Map<string, string> } }).httpClient?.cookie?.delete("sap-contextid");
+
+  if (failure !== undefined) {
+    // 物件不存在時 SAP 回 does not exist / not found,或「cannot be created without a package」
+    if (/does not exist|not found|404|without a package/i.test(failure)) return `不存在(略過)${uri}`;
+    return `❌ 刪除失敗 ${uri}:${failure}` + (unlockError ? `;另外解鎖也失敗:${unlockError}` : "");
+  }
+  return `已刪除 ${uri}` + (unlockError ? `(⚠️ 解鎖失敗:${unlockError})` : "");
+}
+
 export async function createHarness(env: NodeJS.ProcessEnv = evalEnv(), auditPath = ""): Promise<Harness> {
   const cfg = loadConfig(env);
   const server = new McpServer({ name: "abap-adt-mcp-eval", version: "0" });
@@ -115,19 +166,7 @@ export async function createHarness(env: NodeJS.ProcessEnv = evalEnv(), auditPat
         })
         .catch(() => undefined);
     }
-    try {
-      raw.stateful = session_types.stateful;
-      const lock = await raw.lock(uri);
-      await raw.deleteObject(uri, lock.LOCK_HANDLE);
-      return `已刪除 ${uri}`;
-    } catch (e) {
-      const msg = String(e instanceof Error ? e.message : e);
-      // 物件不存在時 SAP 回 does not exist / not found,或「cannot be created without a package」
-      if (/does not exist|not found|404|without a package/i.test(msg)) return `不存在(略過)${uri}`;
-      return `❌ 刪除失敗 ${uri}:${msg}`;
-    } finally {
-      raw.stateful = session_types.stateless;
-    }
+    return deleteWithLock(raw, uri);
   };
 
   return {

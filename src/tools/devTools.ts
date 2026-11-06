@@ -21,7 +21,8 @@ import {
 import { formatAtcResult, formatClassComponents, formatUnitTestResults, formatWhereUsed } from "./formatters.js";
 import type { AppConfig } from "../config.js";
 import type { AuditLogger } from "../safety/audit.js";
-import { assertPackageAllowed, assertWriteAllowed, GuardViolationError } from "../safety/guards.js";
+import { assertPackageAllowed, assertWriteAllowed, GuardViolationError, objectNameFromUrl } from "../safety/guards.js";
+import { assertAdtUri } from "../safety/uri.js";
 import type { SerialQueue } from "../safety/serialQueue.js";
 import { fail, ok, truncate } from "./result.js";
 
@@ -46,6 +47,7 @@ export function registerAnalysisTools(server: McpServer, adt: AdtService): void 
         if (!!object_url === !!package_name) {
           return fail(new GuardViolationError("object_url 與 package_name 必須擇一提供。"));
         }
+        if (object_url) assertAdtUri(object_url);
         const url = object_url
           ? baseObjectUrl(object_url)
           : packageUrl(package_name!);
@@ -73,6 +75,7 @@ export function registerAnalysisTools(server: McpServer, adt: AdtService): void 
     async ({ object_url, line, column }) => {
       try {
         if (column && !line) return fail(new GuardViolationError("給 column 時必須同時給 line。"));
+        assertAdtUri(object_url);
         let url = object_url;
         // 指定位置時要用 source URI(位置是相對於原始碼)
         if (line && !isSourceUrl(url)) url = `${url.replace(/\/$/, "")}/source/main`;
@@ -103,6 +106,7 @@ export function registerAnalysisTools(server: McpServer, adt: AdtService): void 
     },
     async ({ object_url, line, column, implementation }) => {
       try {
+        assertAdtUri(object_url);
         const sourceUrl = isSourceUrl(object_url)
           ? object_url
           : `${object_url.replace(/\/$/, "")}/source/main`;
@@ -131,6 +135,7 @@ export function registerAnalysisTools(server: McpServer, adt: AdtService): void 
     },
     async ({ object_url }) => {
       try {
+        assertAdtUri(object_url);
         return ok(formatClassComponents(await adt.classComponents(baseObjectUrl(object_url))));
       } catch (e) {
         return fail(e);
@@ -158,6 +163,55 @@ export async function recentDumpHint(adt: AdtService, user: string, className: s
     );
   } catch {
     return "";
+  }
+}
+
+/** 可能含 ABAP Unit 測試的物件類型(ADT 節點類型的前綴):class、program、function group */
+const TESTABLE_NODE_TYPE = /^(CLAS|PROG|FUGR)/;
+
+/** package 模式遞迴檢查的上限 */
+const PACKAGE_SCAN_MAX_DEPTH = 5;
+const PACKAGE_SCAN_MAX_NODES = 500;
+
+/**
+ * package 模式的 run_unit_tests:package 內的每個可測試物件都要通過名稱前綴白名單,
+ * 子 package 也要通過 package 白名單;任一不過就整批拒絕並列出被擋的項目(跟 activate_objects 同樣做法)。
+ * ADT 無法預先知道哪些物件含測試類別,所以保守地檢查 package 內所有 class / program / function group。
+ */
+export async function assertPackageContentsAllowed(adt: AdtService, cfg: AppConfig, packageName: string): Promise<void> {
+  const denied: string[] = [];
+  const visited = new Set<string>([packageName.toUpperCase()]);
+  let examined = 0;
+  // 遞迴走訪子 package(v0.5.1 review P2-2):深度與總節點數有上限,超過就整批拒絕(無法確認範圍時不放行)
+  const walk = async (pkg: string, depth: number): Promise<void> => {
+    const nodes = (await adt.nodeContents("DEVC/K", pkg)).nodes.filter((n) => n.OBJECT_NAME);
+    for (const n of nodes) {
+      const type = n.OBJECT_TYPE ?? "";
+      if (++examined > PACKAGE_SCAN_MAX_NODES) {
+        throw new GuardViolationError(`整批拒絕,沒有執行任何測試:package ${packageName} 的內容超過檢查上限(${PACKAGE_SCAN_MAX_NODES} 個節點)。`);
+      }
+      try {
+        if (type.startsWith("DEVC")) {
+          assertPackageAllowed(cfg, n.OBJECT_NAME);
+          const sub = n.OBJECT_NAME.toUpperCase();
+          if (visited.has(sub)) continue;
+          visited.add(sub);
+          if (depth >= PACKAGE_SCAN_MAX_DEPTH) {
+            throw new GuardViolationError(`子 package 層數超過檢查上限(${PACKAGE_SCAN_MAX_DEPTH})`);
+          }
+          await walk(sub, depth + 1);
+        } else if (TESTABLE_NODE_TYPE.test(type)) {
+          assertWriteAllowed(cfg, `/sap/bc/adt/x/${encodeURIComponent(n.OBJECT_NAME.toLowerCase())}`);
+        }
+      } catch (e) {
+        if (e instanceof GuardViolationError && e.message.startsWith("整批拒絕")) throw e;
+        denied.push(`- ${n.OBJECT_NAME} [${type}]:${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  };
+  await walk(packageName, 0);
+  if (denied.length > 0) {
+    throw new GuardViolationError(`整批拒絕,沒有執行任何測試(package ${packageName} 內有不符合白名單的項目):\n${denied.join("\n")}`);
   }
 }
 
@@ -270,22 +324,56 @@ export function registerWriteDevTools(
       description:
         "會在 SAP 系統上執行測試程式碼:執行物件(class / program)或整個 package 的 ABAP Unit 測試," +
         "回傳每個測試方法的結果、失敗訊息與位置。只執行宣告為 RISK LEVEL HARMLESS、DURATION SHORT/MEDIUM 的測試類別。" +
-        "唯讀模式不提供。object_url 與 package_name 擇一提供。",
+        "唯讀模式不提供。object_url 與 package_name 擇一提供。" +
+        "與 run_class 一樣只能執行符合可寫入前綴與 package 白名單的物件;package 模式會檢查 package 內每個物件的名稱," +
+        "任一個不符合就整批拒絕。",
       inputSchema: {
         object_url: z.string().optional().describe("物件 URI,例如 /sap/bc/adt/oo/classes/zcl_demo"),
         package_name: z.string().optional().describe("package 名稱,例如 $TMP(執行其中所有物件的測試)"),
       },
     },
     async ({ object_url, package_name }) => {
+      const target = object_url ? baseObjectUrl(object_url.trim()) : packageUrl(package_name ?? "");
+      const targetName = object_url ? objectNameFromUrl(target) : (package_name ?? "").toUpperCase();
+      const log = (success: boolean, extra: { summary?: string; error?: string }) =>
+        audit.log({
+          timestamp: new Date().toISOString(),
+          action: "run_unit_tests",
+          objectUrl: target,
+          objectName: targetName,
+          success,
+          ...extra,
+        });
       try {
         if (!!object_url === !!package_name) {
           return fail(new GuardViolationError("object_url 與 package_name 必須擇一提供。"));
         }
-        const url = object_url
-          ? baseObjectUrl(object_url)
-          : packageUrl(package_name!);
-        return ok(formatUnitTestResults(await adt.runUnitTests(url)));
+        if (object_url) {
+          // 與 run_class 相同:URI 格式 + 兩道白名單(v0.5.1 S2)
+          assertAdtUri(target, cfg);
+          // package URI 要走 package_name 分支(才會檢查內容);否則可跳過整批檢查(review P2-1)
+          // 先解碼並合併連續斜線再比對(N1:%70ackages、//packages 也要擋)
+          let probe = target.split(/[?#]/, 1)[0];
+          try {
+            probe = decodeURIComponent(probe);
+          } catch {
+            /* assertAdtUri 已驗證過編碼格式 */
+          }
+          if (/^\/sap\/bc\/adt\/packages(\/|$)/i.test(probe.replace(/\/{2,}/g, "/"))) {
+            throw new GuardViolationError("object_url 不接受 package URI,請改用 package_name 參數。");
+          }
+          assertWriteAllowed(cfg, target);
+          assertPackageAllowed(cfg, await adt.objectPackage(target));
+        } else {
+          const pkg = package_name!.toUpperCase();
+          assertPackageAllowed(cfg, pkg);
+          await assertPackageContentsAllowed(adt, cfg, pkg);
+        }
+        const results = await adt.runUnitTests(target);
+        log(true, { summary: `${results.length} 個測試類別` });
+        return ok(formatUnitTestResults(results));
       } catch (e) {
+        log(false, { error: e instanceof Error ? e.message : String(e) });
         return fail(e);
       }
     }
@@ -366,6 +454,7 @@ export function registerWriteDevTools(
         const packageName = package_name.toUpperCase();
         const refUrl = object_url ?? packageUrl(packageName);
         try {
+          if (object_url) assertAdtUri(object_url, cfg);
           assertPackageAllowed(cfg, packageName);
           if (isLocalPackage(packageName)) {
             return fail(new GuardViolationError(`package ${packageName} 是本機 package,不需要 transport。`));

@@ -9,7 +9,8 @@
 | AI 誤改 SAP 標準物件 | 前綴白名單(預設僅 `Z`/`Y`/`$`)+ package 白名單(預設僅 `$TMP`、`Z*`、`Y*`) |
 | AI 在 SAP 上執行任意程式(`run_class`) | 唯讀模式不註冊;只能執行通過兩道白名單的 class;工具說明開頭明寫「會在 SAP 系統上執行程式」;audit log |
 | AI 大量建立物件或放進錯誤的 package(`create_object`) | 兩道白名單;非本機 package 必須明確給 transport;建立前先做名稱檢查;audit log |
-| ABAP Unit 測試改到資料 | `run_unit_tests` 唯讀模式(含 prod)不註冊;只執行宣告為 RISK LEVEL HARMLESS 的測試 |
+| ABAP Unit 測試改到資料 | `run_unit_tests` 唯讀模式(含 prod)不註冊;只執行宣告為 RISK LEVEL HARMLESS 的測試;與 `run_class` 一樣必須通過名稱前綴與 package 兩道白名單(package 模式檢查 package 內每個 class / program / function group 與子 package,任一不過整批拒絕) |
+| URI 注入與帳密外送(AI 收到被操控的 `object_url`,例如 prompt injection 給出 `https://evil/zsafe_x`) | 所有使用者給的 URI 在送出 request 前經 `assertAdtUri`:只接受 `/sap/bc/adt/` 開頭的相對路徑,拒絕 scheme、`//host`、反斜線、控制字元、`..`(含 `%2e%2e` 與雙重編碼);AdtService 層為主要防線,工具入口在白名單檢查前再擋一次;底層 axios 只跟隨同 origin 的 redirect |
 | 密碼錯誤時自動重試把帳號鎖住 | 401 斷路:連續 2 次認證失敗後停止連線 SAP,需修正密碼後重開 MCP |
 | AI 讀出敏感資料(`data_preview`,例如 USR02 密碼雜湊、薪資) | 預設不註冊;表白名單(預設只有 `/DMO/*`),FROM / JOIN / 子查詢裡的每張表都檢查;無法可靠解析即拒絕 |
 | AI 透過查詢改資料或執行多語句 | 只接受單一 SELECT:去掉字串常值與註解後不得含 `;` 或 INSERT/UPDATE/DELETE/MODIFY/COMMIT/ROLLBACK/CALL/EXEC/INTO 等;SAP 端也只接受 SELECT |
@@ -73,6 +74,9 @@ ABAP_MCP_ALLOWED_PACKAGES=$TMP,ZFI_*
 
 - `run_unit_tests` 會在 SAP 上執行測試程式碼,因此與 `run_class` 一樣**唯讀模式(含 prod)不註冊**。它只執行宣告為 `RISK LEVEL HARMLESS`、`DURATION SHORT/MEDIUM` 的測試類別(不跑 DANGEROUS / CRITICAL),但 RISK LEVEL 是測試類別自己的宣告,不保證測試不寫資料,所以不能當作唯讀的依據(v0.3.1 起)
 - `create_object` 在建立前呼叫 SAP 的名稱檢查;非 `$` 開頭的 package 必須給 transport;`create_transport` 只在 `SYSTEM_ROLE=dev` 且非唯讀時註冊
+
+- **URI 驗證(v0.5.1)**:abap-adt-api 的 HTTP request 會附上 SAP Basic 認證與 cookie,而 axios 遇到絕對 URL 會直接改送該主機。因此 `src/safety/uri.ts` 的 `assertAdtUri` 是所有「使用者給的 URI」的必經關卡(`RealAdtService` 每個吃 URI 的方法 + 各工具入口);物件名稱護欄也改用驗證後的路徑取名,避免 `…/cl_std/../zsafe_x` 名稱檢查過了、實際指向別處。redirect 限同 origin(`restrictRedirectsToBaseOrigin`)
+- `run_unit_tests` 的白名單(v0.5.1):單一物件 = `assertWriteAllowed` + `assertPackageAllowed(objectPackage)`;package 模式 = package 白名單 + package 內每個 class / program / function group 的名稱前綴 + 子 package 白名單,列出所有被擋的項目後整批拒絕;每次呼叫寫 audit
 
 ### 3-4. 401 斷路
 

@@ -17,6 +17,7 @@ export interface AuditEntry {
     | "create_object"
     | "create_test_include"
     | "run_class"
+    | "run_unit_tests"
     | "create_transport"
     | "data_preview"
     | "rap_generate";
