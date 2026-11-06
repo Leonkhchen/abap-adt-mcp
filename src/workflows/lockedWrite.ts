@@ -138,9 +138,37 @@ export async function lockedWrite(
 }
 
 /**
+ * 本工具(本 process)建立的測試 include 範本:sourceUrl → 建立當下在鎖定中讀到的內容。
+ * 只有「與這份記錄完全相同」的 include,才能在語法錯誤後用 expected_current_source="" 重試
+ * (C0-1/N3:不再把「任何只含註解的內容」都當成自己的範本)。
+ */
+const createdTemplates = new Map<string, string>();
+
+export function knownTemplate(sourceUrl: string): string | undefined {
+  return createdTemplates.get(sourceUrl);
+}
+export function forgetTemplate(sourceUrl: string): void {
+  createdTemplates.delete(sourceUrl);
+}
+/** 單元測試用 */
+export function clearKnownTemplates(): void {
+  createdTemplates.clear();
+}
+/** 目前內容是否與本工具建立的範本一致(忽略行尾差異);沒有建立記錄一律 false */
+export function matchesKnownTemplate(sourceUrl: string, current: string): boolean {
+  const known = createdTemplates.get(sourceUrl);
+  return known !== undefined && normalize(known) === normalize(current);
+}
+
+/**
  * class 的測試 include 尚未存在時先建立(空的,內容只有 SAP 的註解範本)。
  * 有建立時回傳建立後讀到的範本內容(C2:呼叫端以它作為後續並行比對的基準,
  * 才不會把自己剛建立的範本誤判成他人修改);沒有建立回傳 undefined。
+ *
+ * - C0-1/N2:範本在**解鎖之前**、同一個鎖定 session 內讀取,且必須只含註解;
+ *   否則(有人在建立與讀取之間寫入實際程式碼)拋 ConcurrentModificationError,不把他人內容當基準。
+ * - C0-2/N4:建立成功的當下就呼叫 onCreated(寫 audit),之後的讀取失敗也不會漏掉紀錄。
+ *
  * A4H 實測:include 不存在時語法檢查只回警告、不會檢查內容;建立後才能在寫入前正確擋下語法錯誤。
  */
 export async function ensureTestInclude(
@@ -148,7 +176,8 @@ export async function ensureTestInclude(
   objectUrl: string,
   sourceUrl: string,
   transport?: string,
-  expectedCurrentSource?: string
+  expectedCurrentSource?: string,
+  onCreated?: () => void
 ): Promise<string | undefined> {
   if (!isTestClassesInclude(sourceUrl)) return undefined;
   try {
@@ -162,12 +191,17 @@ export async function ensureTestInclude(
     throw new ConcurrentModificationError();
   }
   const lock = await adt.lock(objectUrl);
+  let template: string;
   try {
     await adt.createTestInclude(objectNameFromUrl(objectUrl), lock.LOCK_HANDLE, transport);
+    onCreated?.();
+    template = await adt.getSourceInLock(sourceUrl);
   } finally {
     await adt.unLock(objectUrl, lock.LOCK_HANDLE);
   }
-  return adt.getObjectSource(sourceUrl);
+  if (!isCommentOnly(template)) throw new ConcurrentModificationError();
+  createdTemplates.set(sourceUrl, template);
+  return template;
 }
 
 /** 內容只有空行與註解(* 或 " 開頭)→ 沒有實際程式碼,例如 SAP 建立 include 時產生的範本 */

@@ -18,7 +18,7 @@ import {
   objectNameFromUrl,
   GuardViolationError,
 } from "../../src/safety/guards.js";
-import { lockedWrite, ConcurrentModificationError } from "../../src/workflows/lockedWrite.js";
+import { lockedWrite, ConcurrentModificationError, clearKnownTemplates } from "../../src/workflows/lockedWrite.js";
 import { translateAdtError, AuthCircuitOpenError } from "../../src/adt/errors.js";
 import { diffSummary } from "../../src/safety/audit.js";
 import * as https from "node:https";
@@ -2350,20 +2350,71 @@ describe("C2 新建測試 include + expected_current_source 為空字串", () =>
 
 // ───────────────────────── v0.5.1 獨立審查(claude -p)P2 修正 ─────────────────────────
 
-describe("review P2-3 include 已存在(僅範本)+ expected 空字串(語法錯誤後重試)", () => {
+describe("review P2-3 / C0-1 include 已存在(僅範本)+ expected 空字串(語法錯誤後重試)", () => {
   const INC = "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses";
-  it("目前只有範本註解 → 視為空基準、成功寫入", async () => {
+  const TEMPLATE = "* SAP test include template";
+  const SYNTAX_ERR = [{ severity: "E", line: 1, text: "boom", offset: 0, uri: "" }] as never;
+
+  /** include 先不存在;createTestInclude 之後內容是 content(可被測試改動) */
+  function stateful() {
+    const st = { created: false, content: TEMPLATE };
+    const read = vi.fn(async () => {
+      if (!st.created) throw Object.assign(new Error("ZCL_X does not have any inactive version"), { status: 404 });
+      return st.content;
+    });
+    return {
+      st,
+      read,
+      overrides: {
+        getObjectSource: read,
+        getSourceInLock: vi.fn(async () => read()),
+        createTestInclude: vi.fn(async () => { st.created = true; }),
+        setObjectSource: vi.fn(async (_u: string, src: string) => { st.content = src; }),
+      },
+    };
+  }
+
+  it("真實流程:第一次語法錯誤(include 已建立)→ 第二次用 \"\" 重試成功", async () => {
+    clearKnownTemplates();
+    const { overrides } = stateful();
+    const adt = mockAdt({ ...overrides, syntaxCheck: vi.fn().mockResolvedValueOnce(SYNTAX_ERR).mockResolvedValue([]) });
+    const call = await connectTools(adt);
+    const first = await call("write_source", { object_url: INC, new_source: "bad", expected_current_source: "" });
+    expect(first.text).toContain("語法錯誤");
+    expect(adt.createTestInclude).toHaveBeenCalledTimes(1);
+    const second = await call("write_source", { object_url: INC, new_source: "CLASS ltc DEFINITION. ENDCLASS.", expected_current_source: "" });
+    expect(second.isError).toBe(false);
+    expect(adt.createTestInclude).toHaveBeenCalledTimes(1);
+    expect(adt.setObjectSource).toHaveBeenCalledTimes(1);
+  });
+
+  it("N3:include 已存在、只含註解,但不是本工具建立的(沒有記錄)→ 視為衝突、不寫入", async () => {
+    clearKnownTemplates();
     const adt = mockAdt({
       getObjectSource: vi.fn(async () => "* SAP test include template\n\n"),
       getSourceInLock: vi.fn(async () => "* SAP test include template\n\n"),
     });
     const call = await connectTools(adt);
-    const r = await call("write_source", { object_url: INC, new_source: "CLASS ltc DEFINITION. ENDCLASS.", expected_current_source: "" });
-    expect(r.isError).toBe(false);
+    const r = await call("write_source", { object_url: INC, new_source: "x", expected_current_source: "" });
+    expect(r.isError).toBe(true);
     expect(adt.createTestInclude).not.toHaveBeenCalled();
-    expect(adt.setObjectSource).toHaveBeenCalledTimes(1);
+    expect(adt.setObjectSource).not.toHaveBeenCalled();
   });
+
+  it("N3:本工具建立後,別人把內容改成另一段註解 → 與記錄不同,視為衝突", async () => {
+    clearKnownTemplates();
+    const { st, overrides } = stateful();
+    const adt = mockAdt({ ...overrides, syntaxCheck: vi.fn().mockResolvedValueOnce(SYNTAX_ERR).mockResolvedValue([]) });
+    const call = await connectTools(adt);
+    await call("write_source", { object_url: INC, new_source: "bad", expected_current_source: "" });
+    st.content = "* someone else's notes";
+    const r = await call("write_source", { object_url: INC, new_source: "x", expected_current_source: "" });
+    expect(r.isError).toBe(true);
+    expect(adt.setObjectSource).not.toHaveBeenCalled();
+  });
+
   it("目前已有實際程式碼 → 仍視為衝突、不寫入", async () => {
+    clearKnownTemplates();
     const adt = mockAdt({
       getObjectSource: vi.fn(async () => "CLASS ltc DEFINITION. ENDCLASS."),
       getSourceInLock: vi.fn(async () => "CLASS ltc DEFINITION. ENDCLASS."),
@@ -2372,6 +2423,59 @@ describe("review P2-3 include 已存在(僅範本)+ expected 空字串(語法錯
     const r = await call("write_source", { object_url: INC, new_source: "x", expected_current_source: "" });
     expect(r.isError).toBe(true);
     expect(adt.setObjectSource).not.toHaveBeenCalled();
+  });
+
+  it("N2:範本在解鎖之前、同一個鎖定 session 內讀取", async () => {
+    clearKnownTemplates();
+    const { overrides } = stateful();
+    const adt = mockAdt(overrides);
+    const call = await connectTools(adt);
+    await call("write_source", { object_url: INC, new_source: "CLASS ltc DEFINITION. ENDCLASS.", expected_current_source: "" });
+    const create = (adt.createTestInclude as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    const inLock = (adt.getSourceInLock as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    const unlock = (adt.unLock as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    expect(create).toBeLessThan(inLock);
+    expect(inLock).toBeLessThan(unlock);
+  });
+
+  it("N2:建立與讀取之間被別人寫入實際程式碼 → 中止、不當基準、已解鎖", async () => {
+    clearKnownTemplates();
+    const { st, overrides } = stateful();
+    const adt = mockAdt({
+      ...overrides,
+      createTestInclude: vi.fn(async () => { st.created = true; st.content = "CLASS other DEFINITION. ENDCLASS."; }),
+    });
+    const call = await connectTools(adt);
+    const r = await call("write_source", { object_url: INC, new_source: "x", expected_current_source: "" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("不一致");
+    expect(adt.setObjectSource).not.toHaveBeenCalled();
+    expect(adt.unLock).toHaveBeenCalled();
+  });
+
+  it("C0-2/N4:建立成功後讀取範本失敗 → create_test_include 的 audit 仍有紀錄", async () => {
+    clearKnownTemplates();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "abap-mcp-n4-"));
+    const auditPath = path.join(dir, "audit.jsonl");
+    try {
+      const { overrides } = stateful();
+      const adt = mockAdt({ ...overrides, getSourceInLock: vi.fn(async () => { throw new Error("read boom"); }) });
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerTools(server, adt, makeConfig(), new AuditLogger(auditPath));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(clientT);
+      const r = (await client.callTool({ name: "write_source", arguments: { object_url: INC, new_source: "x", expected_current_source: "" } })) as { isError?: boolean };
+      expect(r.isError).toBe(true);
+      expect(adt.createTestInclude).toHaveBeenCalledTimes(1);
+      expect(adt.unLock).toHaveBeenCalled();
+      const entries = fs.readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(entries.some((e) => e.action === "create_test_include" && e.success)).toBe(true);
+      expect(entries.some((e) => e.action === "write_source" && e.success === false && String(e.error).includes("read boom"))).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

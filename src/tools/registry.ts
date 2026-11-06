@@ -13,7 +13,7 @@ import type { AppConfig } from "../config.js";
 import { AuditLogger, diffSummary } from "../safety/audit.js";
 import { assertPackageAllowed, assertWriteAllowed, objectNameFromUrl } from "../safety/guards.js";
 import { assertAdtUri } from "../safety/uri.js";
-import { ensureTestInclude, isCommentOnly, lockedWrite } from "../workflows/lockedWrite.js";
+import { ensureTestInclude, forgetTemplate, lockedWrite, matchesKnownTemplate } from "../workflows/lockedWrite.js";
 import { SerialQueue } from "../safety/serialQueue.js";
 import { registerAnalysisTools, registerWriteDevTools } from "./devTools.js";
 import { registerDiagnosticTools } from "./diagTools.js";
@@ -335,17 +335,30 @@ export function registerTools(
         // 第二道白名單:物件所在 package(在鎖定前檢查)
         assertPackageAllowed(cfg, await adt.objectPackage(baseObjectUrl));
 
-        // 測試 include 尚未建立時先建立空的,語法檢查才有效(並行檢查在建立之前)
+        // 測試 include 尚未建立時先建立空的,語法檢查才有效(並行檢查在建立之前)。
+        // 建立成功的當下就寫 audit(C0-2),之後讀取範本失敗也不會漏掉紀錄
+        let includeCreated = false;
         const createdTemplate = await ensureTestInclude(
           adt,
           baseObjectUrl,
           sourceUrl,
           transport,
-          expected_current_source
+          expected_current_source,
+          () => {
+            includeCreated = true;
+            audit.log({
+              timestamp: new Date().toISOString(),
+              action: "create_test_include",
+              objectUrl: sourceUrl,
+              objectName,
+              transport,
+              summary: "建立空的測試 include(寫入前語法檢查用)",
+              success: true,
+            });
+          }
         );
-        const includeCreated = createdTemplate !== undefined;
-        // review P2-3:include 先前已由本工具建立(只有 SAP 範本註解),語法錯誤後用 "" 重試時,
-        // 基準改用目前的範本內容(內容若已被改成有程式碼,鎖定前後比對仍會擋下)
+        // C0-1:include 先前已由本工具建立,語法錯誤後用 "" 重試時,基準改用「本工具建立當下記錄的範本」;
+        // 目前內容必須與該記錄完全相同(沒有記錄、或已被改成別的內容 → 不當基準,走並行衝突)
         let blankBaseline = createdTemplate;
         if (
           blankBaseline === undefined &&
@@ -354,18 +367,7 @@ export function registerTools(
           isTestClassesInclude(sourceUrl)
         ) {
           const existing = await adt.getObjectSource(sourceUrl).catch(() => undefined);
-          if (existing !== undefined && isCommentOnly(existing)) blankBaseline = existing;
-        }
-        if (includeCreated) {
-          audit.log({
-            timestamp: new Date().toISOString(),
-            action: "create_test_include",
-            objectUrl: sourceUrl,
-            objectName,
-            transport,
-            summary: "建立空的測試 include(寫入前語法檢查用)",
-            success: true,
-          });
+          if (existing !== undefined && matchesKnownTemplate(sourceUrl, existing)) blankBaseline = existing;
         }
 
         // 寫入前語法檢查(預設開啟):避免把壞掉的程式碼寫進系統
@@ -395,6 +397,7 @@ export function registerTools(
               : expected_current_source,
         });
 
+        forgetTemplate(sourceUrl);
         audit.log({
           timestamp: new Date().toISOString(),
           action: "write_source",
