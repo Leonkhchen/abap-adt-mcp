@@ -946,3 +946,134 @@ describe.skipIf(!RUN_WRITE)("v0.5.1 安全與一致性修正（A4H，$TMP 暫存
     }
   }, 600_000);
 });
+
+// ───────────────────────────── v0.6 C0-6：R2 實機確認（T50–T52，暫存 package + class）─────────────────────────────
+// 2026-11-06 實測結論(A4H,ABAP Platform 2025):
+//  1. SAP 的 unit test run 對 package URI 會遞迴執行子 package 的測試(父 package 直屬 0 個 class 也跑得到子 package 的測試)
+//  2. /sap/bc/adt/%70ackages/… 與 /sap/bc/adt//packages/… 不會被 SAP 當成 package(回 0 個測試類別)
+//  3. /sap/bc/adt/Packages/… (大小寫不同)會被當成 package 執行 → 本專案的 package URI 檢查必須不分大小寫(目前有 i 旗標)
+describe.skipIf(!RUN_WRITE)("v0.6 C0-6 R2 實機確認（A4H，暫存 package）", () => {
+  const sfx = Date.now().toString(36).toUpperCase().slice(-6);
+  const PARENT = `$ZMCP_R2P_${sfx}`;
+  const CHILD = `$ZMCP_R2C_${sfx}`;
+  const CLS = `ZCL_MCP_R2_${sfx}`;
+  const pkgUrl = (n: string) => `/sap/bc/adt/packages/${encodeURIComponent(n.toLowerCase())}`;
+  const clsUrl = `/sap/bc/adt/oo/classes/${CLS.toLowerCase()}`;
+  const flags = { harmless: true, dangerous: false, critical: false, short: true, medium: true, long: false };
+  const mainSrc = [
+    `CLASS ${CLS.toLowerCase()} DEFINITION PUBLIC FINAL CREATE PUBLIC.`,
+    `  PUBLIC SECTION.`,
+    `    METHODS dummy.`,
+    `ENDCLASS.`,
+    ``,
+    `CLASS ${CLS.toLowerCase()} IMPLEMENTATION.`,
+    `  METHOD dummy.`,
+    `  ENDMETHOD.`,
+    `ENDCLASS.`,
+  ].join("\n");
+  const testSrc = [
+    `CLASS ltc_r2 DEFINITION FINAL FOR TESTING DURATION SHORT RISK LEVEL HARMLESS.`,
+    `  PRIVATE SECTION.`,
+    `    METHODS green FOR TESTING.`,
+    `ENDCLASS.`,
+    ``,
+    `CLASS ltc_r2 IMPLEMENTATION.`,
+    `  METHOD green.`,
+    `    cl_abap_unit_assert=>assert_equals( act = 1 exp = 1 ).`,
+    `  ENDMETHOD.`,
+    `ENDCLASS.`,
+  ].join("\n");
+
+  let s: Awaited<ReturnType<typeof startServer>>; // 兩個 package 都在白名單
+  let sParentOnly: Awaited<ReturnType<typeof startServer>>; // 只有父 package 在白名單
+  let raw: ADTClient;
+
+  const mkPackage = (name: string, parent: string) =>
+    raw.createObject({
+      objtype: "DEVC/K",
+      name,
+      parentName: parent,
+      parentPath: parent ? pkgUrl(parent) : "/sap/bc/adt/packages",
+      description: "abap-adt-mcp IT R2",
+      responsible: s.cfg.sap.user.toUpperCase(),
+      swcomp: "LOCAL",
+      packagetype: "development",
+      transportLayer: "",
+    } as never);
+
+  const unitRun = async (uri: string) => {
+    const r = (await raw.unitTestRun(uri, flags)) as unknown as { "adtcore:name"?: string }[];
+    return r.length;
+  };
+
+  beforeAll(async () => {
+    const base = { ...process.env, ABAP_MCP_READONLY: "false", ABAP_MCP_SYSTEM_ROLE: "dev", ABAP_MCP_ALLOWED_PREFIXES: "Z,Y,$" };
+    s = await startServer({ ...base, ABAP_MCP_ALLOWED_PACKAGES: `${PARENT},${CHILD}` });
+    sParentOnly = await startServer({ ...base, ABAP_MCP_ALLOWED_PACKAGES: PARENT });
+    raw = new ADTClient(s.cfg.sap.url, s.cfg.sap.user, s.cfg.sap.password, s.cfg.sap.client, s.cfg.sap.language);
+    await raw.login();
+    await mkPackage(PARENT, "");
+    await mkPackage(CHILD, PARENT);
+    let r = await s.call("create_object", { object_type: "CLAS/OC", name: CLS, package_name: CHILD, description: "abap-adt-mcp IT R2" });
+    if (r.isError) throw new Error(r.text);
+    r = await s.call("write_source", { object_url: clsUrl, new_source: mainSrc, activate: true });
+    if (r.isError) throw new Error(r.text);
+    r = await s.call("write_source", { object_url: `${clsUrl}/includes/testclasses`, new_source: testSrc, expected_current_source: "", activate: true });
+    if (r.isError) throw new Error(r.text);
+  }, 600_000);
+
+  afterAll(async () => {
+    // 由內而外:class → 子 package → 父 package
+    for (const u of [clsUrl, pkgUrl(CHILD), pkgUrl(PARENT)]) {
+      try {
+        raw.stateful = session_types.stateful;
+        const lock = await raw.lock(u);
+        await raw.deleteObject(u, lock.LOCK_HANDLE);
+      } catch (e) {
+        if (!/does not exist|not found|404/i.test(String(e))) {
+          console.error(`清除暫存物件 ${u} 失敗,請在 Eclipse 手動刪除:${String(e)}`);
+        }
+      } finally {
+        raw.stateful = session_types.stateless;
+      }
+    }
+    await s?.close();
+    await sParentOnly?.close();
+  }, 600_000);
+
+  it("T50 SAP 對 package 遞迴執行子 package 的測試;工具對父 package 要求子 package 也在白名單", async () => {
+    // SAP 行為:父 package 直屬 0 個 class,仍跑得到子 package 的測試
+    expect(await unitRun(pkgUrl(CHILD))).toBeGreaterThanOrEqual(1);
+    expect(await unitRun(pkgUrl(PARENT))).toBeGreaterThanOrEqual(1);
+    // 工具:兩個 package 都在白名單 → 執行
+    const ok = await s.call("run_unit_tests", { package_name: PARENT });
+    expect(ok.isError, ok.text).toBe(false);
+    expect(ok.text).toContain("1 個測試方法,1 通過,0 失敗");
+    // 子 package 不在白名單 → 整批拒絕(否則會透過遞迴跑到白名單外的測試)
+    const denied = await sParentOnly.call("run_unit_tests", { package_name: PARENT });
+    expect(denied.isError, denied.text).toBe(true);
+    expect(denied.text).toContain("白名單");
+  }, 600_000);
+
+  it("T51 變形 package URI:SAP 對 %70ackages、//packages 不執行測試,Packages(大小寫)會執行;工具一律拒絕", async () => {
+    const enc = encodeURIComponent(CHILD.toLowerCase());
+    // SAP 行為(記錄用):前兩種不被當成 package → 0;大小寫不同仍被當成 package → ≥1
+    expect(await unitRun(`/sap/bc/adt/%70ackages/${enc}`)).toBe(0);
+    expect(await unitRun(`/sap/bc/adt//packages/${enc}`)).toBe(0);
+    expect(await unitRun(`/sap/bc/adt/Packages/${enc}`)).toBeGreaterThanOrEqual(1);
+    // 工具:object_url 不接受任何 package 形式的 URI(sParentOnly 的白名單沒有 CHILD,若沒擋下就會是別的錯誤訊息)
+    for (const u of [`/sap/bc/adt/packages/${enc}`, `/sap/bc/adt/Packages/${enc}`, `/sap/bc/adt/%70ackages/${enc}`, `/sap/bc/adt//packages/${enc}`]) {
+      const r = await sParentOnly.call("run_unit_tests", { object_url: u });
+      expect(r.isError, u).toBe(true);
+      expect(r.text, u).toContain("package_name");
+    }
+  }, 600_000);
+
+  it("T52 暫存 package 與 class 建立正確(對照組):class 在子 package、單一 class 可執行", async () => {
+    const r = await s.call("run_unit_tests", { object_url: clsUrl });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("1 個測試方法,1 通過,0 失敗");
+    const pkg = await s.call("browse_package", { package_name: CHILD });
+    expect(pkg.text).toContain(CLS);
+  }, 600_000);
+});
