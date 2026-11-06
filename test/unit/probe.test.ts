@@ -362,6 +362,7 @@ function fakeAdt(o: { pkg?: (url: string) => string } = {}): AdtService {
   const unit = [{ "adtcore:name": "LTC", alerts: [], testmethods: [{ "adtcore:name": "T1", alerts: [], executionTime: "0", unit: "s" }] }];
   return {
     username: () => "DEVELOPER",
+    baseUrl: () => "http://localhost:50000",
     dlpAvailable: vi.fn(async () => false),
     objectPackage: vi.fn(async (u: string) => (o.pkg ? o.pkg(u) : "$ZINV")),
     runUnitTests: vi.fn(async () => unit as never),
@@ -676,5 +677,76 @@ describe("探針模式 A(Dynamic Logpoints)", () => {
     const bad = await call("probe_set", { ...args, trigger: { tool: "run_unit_tests", object_url: "/sap/bc/adt/oo/classes/zcl_x" } });
     // 觸發物件的 package 由 fakeAdt 回 $ZINV(在白名單),所以是 custom 範圍以外的情況才擋;這裡只確認 trigger 有被執行路徑接受
     expect(bad.isError, bad.text).toBe(false);
+  });
+});
+
+// ───────────────────────── 探針定義存檔與 probe-debug prompt ─────────────────────────
+
+describe("探針定義存檔(save_as)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "probes-"));
+  const env = { ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV,$TMP", ABAP_MCP_PROBES_DIR: dir };
+  const args = { object_url: "/sap/bc/adt/oo/classes/zcl_inv_posting", line: 176, fields: ["iv_qty", "iv_stqty"], max_hits: 5, trigger: SET_ARGS.trigger };
+
+  it("probe_set 帶 save_as:寫出定義、模式、命中次數、結論,但不含任何變數值", async () => {
+    const { adt } = dlpAdt();
+    const { call } = await connect(adt, cfgOf(env));
+    const r = await call("probe_set", { ...args, save_as: "inv-issue-amt", purpose: "查發料金額", conclusion: "呼叫端傳錯 qty", system_version: "A4H" });
+    expect(r.isError, r.text).toBe(false);
+    const raw = fs.readFileSync(path.join(dir, "inv-issue-amt.json"), "utf8");
+    const f = JSON.parse(raw);
+    expect(f).toMatchObject({ name: "inv-issue-amt", purpose: "查發料金額", conclusion: "呼叫端傳錯 qty", mode: "A", hit_count: 2 });
+    expect(f.system.version).toBe("A4H");
+    expect(f.definition.probes[0]).toMatchObject({ object_url: "/sap/bc/adt/oo/classes/zcl_inv_posting/source/main", line: 176, fields: ["iv_qty", "iv_stqty"], max_hits: 5 });
+    expect(f.definition.trigger).toEqual(SET_ARGS.trigger);
+    // 假資料的值是 1 / 3 / 2 / 10:檔案裡不能有任何 value 欄位或命中內容
+    expect(raw).not.toMatch(/"values?"/);
+    expect(raw).not.toContain("lastCall");
+    expect(r.text).toContain("已存成");
+  });
+
+  it("名稱不合法(路徑、副檔名、空白)→ 在動 SAP 之前就拒絕", async () => {
+    const { adt, api } = dlpAdt();
+    const { call } = await connect(adt, cfgOf(env));
+    for (const bad of ["../evil", "a/b", "a\b", "x.json", "", " x", "a".repeat(61)]) {
+      if (bad === "") continue; // 空字串視為沒給
+      const r = await call("probe_set", { ...args, save_as: bad });
+      expect(r.isError, bad).toBe(true);
+    }
+    expect(api.dlpCreate).not.toHaveBeenCalled();
+  });
+
+  it("probe_logs 可事後帶 save_as + conclusion;唯讀模式拒絕寫檔", async () => {
+    const { adt } = dlpAdt();
+    const rw = await connect(adt, cfgOf(env));
+    await rw.call("probe_set", args);
+    const r = await rw.call("probe_logs", { run_id: "run-1", save_as: "later", conclusion: "標準程式正常" });
+    expect(r.isError, r.text).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(dir, "later.json"), "utf8")).conclusion).toBe("標準程式正常");
+    const ro = await connect(adt, cfgOf({ ...env, ABAP_MCP_READONLY: "true" }));
+    const r2 = await ro.call("probe_logs", { run_id: "run-1", save_as: "ro" });
+    expect(r2.isError).toBe(true);
+    expect(fs.existsSync(path.join(dir, "ro.json"))).toBe(false);
+  });
+
+  it("probe-debug prompt 只在探針開啟時存在,內容包含 probe_delete 與 save_as", async () => {
+    const mk = async (cfg: ReturnType<typeof cfgOf>) => {
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerProbeTools(server, fakeAdt(), cfg, new AuditLogger(""), new SerialQueue());
+      const [c, s] = InMemoryTransport.createLinkedPair();
+      await server.connect(s);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(c);
+      return client;
+    };
+    const on = await mk(cfgOf(env));
+    const list = await on.listPrompts();
+    expect(list.prompts.map((p) => p.name)).toContain("probe-debug");
+    const p = await on.getPrompt({ name: "probe-debug", arguments: { object_url: "/sap/bc/adt/oo/classes/zcl_x", symptom: "金額錯" } });
+    const text = (p.messages[0].content as { text: string }).text;
+    expect(text).toContain("probe_delete");
+    expect(text).toContain("save_as");
+    expect(text).toContain("金額錯");
+    const off = await mk(cfgOf());
+    await expect(off.listPrompts()).rejects.toThrow();
   });
 });

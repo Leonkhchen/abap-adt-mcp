@@ -93,6 +93,8 @@ const ConfigSchema = z.object({
   ABAP_MCP_PROBE_SCOPE: z.enum(["all", "custom"]).optional().default("all"),
   /** 不讓探針碰的物件或 package(逗號分隔,* 結尾為前綴) */
   ABAP_MCP_PROBE_DENY: z.string().optional().default(""),
+  /** 探針定義存檔目錄(probe_set / probe_logs 的 save_as);相對路徑以 MCP 的工作目錄為準 */
+  ABAP_MCP_PROBES_DIR: z.string().optional().default("probes"),
   /** 同時有效的探針上限(模式 A) */
   ABAP_MCP_MAX_PROBES: z.coerce.number().int().positive().optional().default(5),
 });
@@ -127,6 +129,8 @@ export type AppConfig = {
       /** 排除清單(大寫,* 結尾為前綴) */
       deny: string[];
       maxProbes: number;
+      /** save_as 的存檔目錄 */
+      dir: string;
     };
   };
 };
@@ -189,6 +193,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         scope: c.ABAP_MCP_PROBE_SCOPE,
         deny: splitList(c.ABAP_MCP_PROBE_DENY),
         maxProbes: c.ABAP_MCP_MAX_PROBES,
+        dir: c.ABAP_MCP_PROBES_DIR,
       },
     },
   };

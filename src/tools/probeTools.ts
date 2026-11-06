@@ -29,6 +29,7 @@ import type { AppConfig } from "../config.js";
 import type { AuditLogger } from "../safety/audit.js";
 import { assertPackageAllowed, assertWriteAllowed, GuardViolationError, objectNameFromUrl } from "../safety/guards.js";
 import { assertProbeAllowed } from "../safety/probeGuards.js";
+import { buildProbeFile, probeFilePath, writeProbeFile, type ProbeFileMeta } from "./probeFile.js";
 import type { SerialQueue } from "../safety/serialQueue.js";
 import { assertAdtUri } from "../safety/uri.js";
 import { formatUnitTestResults } from "./formatters.js";
@@ -153,9 +154,11 @@ export interface ProbeRunRecord {
   /** 模式 A:logpoint 有效到幾點 */
   activeUntil?: string;
   trigger: string;
+  /** 使用者給的 trigger 參數(存檔用) */
+  triggerInput?: unknown;
   triggerOutcome?: string;
   timeoutSeconds: number;
-  probes: { id: string; location: string; kind: string; fields: string[]; condition?: string; maxHits: number; hits: ProbeHit[]; full: boolean; error?: string; dlpId?: string }[];
+  probes: { id: string; location: string; sourceUrl: string; line: number; kind: string; fields: string[]; condition?: string; maxHits: number; hits: ProbeHit[]; full: boolean; error?: string; dlpId?: string }[];
   notes: string[];
 }
 
@@ -292,6 +295,17 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
     return avail ? "dlp" : "debugger";
   };
 
+  const saveProbeFile = (name: string, rec: ProbeRunRecord, meta: ProbeFileMeta): string => {
+    let host = adt.baseUrl();
+    try {
+      host = new URL(host).host;
+    } catch {
+      /* 保留原字串 */
+    }
+    const file = writeProbeFile(cfg.safety.probes.dir, name, buildProbeFile(name, rec, meta, { host, client: cfg.sap.client }));
+    return `\n📁 探針定義已存成 ${file}(只有位置、變數名稱、命中次數與結論,不含變數值)。`;
+  };
+
   /** 建立時回傳解碼後的 id,清單回傳編碼過的 URL:統一成解碼後的 id 才能去重 */
   const dlpKey = (id: string): string => {
     const raw = id.replace(/^\/sap\/bc\/adt\/dlp\/logpoints\//, "");
@@ -328,6 +342,41 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
     }
   };
 
+  server.registerPrompt(
+    "probe-debug",
+    {
+      title: "用探針找 bug 原因",
+      description: "不改程式碼,在可疑的行埋探針取得執行時的變數值,判斷原因後再修正,最後清掉探針",
+      argsSchema: {
+        object_url: z.string().describe("可疑的物件 URI,例如 /sap/bc/adt/oo/classes/zcl_demo(也可以是標準程式)"),
+        symptom: z.string().describe("症狀:哪裡不對、預期與實際各是什麼"),
+        trigger: z.string().optional().describe("選填:怎麼觸發執行,例如「run_unit_tests ZCL_DEMO」或「使用者在 VA01 建單」"),
+      },
+    },
+    ({ object_url, symptom, trigger }) => ({
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text: [
+              `請用探針找出 ${object_url} 的問題原因(症狀:${symptom}):`,
+              "1. 用 read_source 讀原始碼,找出最可疑的行(可執行的陳述式),判斷要看哪幾個變數;沒把握時先 kind=stack 看呼叫路徑。一次只埋少數幾個探針。",
+              `2. 用 probe_set 在那一行記錄變數(fields;必要時加 condition 縮小範圍)。觸發方式:${trigger ?? "run_unit_tests 或 run_class(由工具代為執行);要使用者自己操作時用 trigger={manual:true},並先告訴使用者要做什麼"}。` +
+                "模式 A(Dynamic Logpoints)沒給 trigger 時 logpoint 會保持啟用,等執行後再用 probe_logs 讀。",
+              "3. 用 probe_logs 讀出收集到的值(模式 A 以第一個變數的不同值分組,附執行次數)。",
+              "4. 判斷根本原因;值不夠就調整探針再來一輪。不要只靠推測。若問題出在標準程式本身,說明證據,不要修改標準程式。",
+              "5. 是自己的程式才用 write_source(帶 expected_current_source、activate=true)修正,再用 run_unit_tests 驗證。",
+              "6. **一定要**用 probe_delete 清掉探針與紀錄(忘了也會到期,但業務資料不該留著)。",
+              "7. 若這個探針位置值得之後參考,在 probe_logs 帶 save_as、purpose、conclusion 存成 probes/*.json(不含變數值)。",
+              "8. 回報:原因、證據(探針位置與觀察到的值的意義)、修正內容、驗證結果。",
+            ].join("\n"),
+          },
+        },
+      ],
+    }),
+  );
+
   server.registerTool(
     "probe_list",
     {
@@ -354,13 +403,27 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
       inputSchema: {
         run_id: z.string().describe("probe_set / probe_list 回傳的執行編號,例如 run-1"),
         probe_id: z.string().optional().describe("只看某個探針,例如 p1"),
+        save_as: z.string().optional().describe(`選填:把這次探針的定義與結論存成 ${"probes/<名稱>.json"}(只存位置、變數名稱、命中次數與結論,不存值);名稱只接受英數字、_、-`),
+        purpose: z.string().optional().describe("save_as 用:這次要查什麼問題"),
+        conclusion: z.string().optional().describe("save_as 用:結論(例如「標準程式正確,錯在呼叫端傳入的 qty」)"),
+        system_version: z.string().optional().describe("save_as 用:系統版本,例如 A4H / ABAP Platform 2025"),
       },
     },
-    async ({ run_id, probe_id }) => {
+    async ({ run_id, probe_id, save_as, purpose, conclusion, system_version }) => {
       const r = store.get(run_id);
       if (!r) return fail(new GuardViolationError(`找不到探針執行 ${run_id}(可用 probe_list 查看)。`));
       if (r.mode === "dlp" && r.status === "active") await refreshDlp(r);
-      return ok(formatLogs(r, probe_id));
+      let saved = "";
+      if (save_as) {
+        try {
+          if (cfg.safety.readonly) throw new GuardViolationError("唯讀模式不寫檔(save_as 需要可讀寫模式)。");
+          probeFilePath(cfg.safety.probes.dir, save_as);
+          saved = saveProbeFile(save_as, r, { purpose, conclusion, systemVersion: system_version });
+        } catch (e) {
+          return fail(e);
+        }
+      }
+      return ok(formatLogs(r, probe_id) + saved);
     }
   );
 
@@ -381,6 +444,10 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
         max_hits: z.number().int().positive().optional().describe("單一探針:最多記錄幾次"),
         trigger: triggerSchema.optional().describe("觸發執行的方式(模式 B 必填;模式 A 省略或 manual 表示 logpoint 開著等人執行)"),
         timeout_seconds: z.number().int().positive().optional().describe(`監聽逾時秒數(預設 ${DEFAULT_TIMEOUT_SEC},上限 ${MAX_TIMEOUT_SEC})`),
+        save_as: z.string().optional().describe("選填:把探針定義存成 probes/<名稱>.json(不存變數值);結論通常要讀完 probe_logs 才知道,可改在 probe_logs 帶 save_as 與 conclusion"),
+        purpose: z.string().optional().describe("save_as 用:這次要查什麼問題"),
+        conclusion: z.string().optional().describe("save_as 用:結論"),
+        system_version: z.string().optional().describe("save_as 用:系統版本,例如 A4H / ABAP Platform 2025"),
         duration_minutes: z.number().int().positive().optional().describe("只有模式 A(Dynamic Logpoints)用:探針有效分鐘數(預設 15,最長 1440);模式 B 忽略"),
         definition: z
           .object({ probes: z.array(probeSchema).min(1), trigger: triggerSchema.optional(), timeout_seconds: z.number().int().positive().optional() })
@@ -404,6 +471,7 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
           }
           const maxProbes = cfg.safety.probes.maxProbes;
           if (probeInputs.length > maxProbes) throw new GuardViolationError(`一次最多 ${maxProbes} 個探針(ABAP_MCP_MAX_PROBES),這次給了 ${probeInputs.length} 個。`);
+          if (args.save_as) probeFilePath(cfg.safety.probes.dir, args.save_as); // 名稱不合法就在動 SAP 之前擋下
           const mode = await resolveMode();
           const probes = probeInputs.map((p, i) => normalizeProbe(p, i, mode === "dlp"));
           firstUrl = probes[0].baseUrl;
@@ -494,11 +562,14 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
               status,
               activeUntil: !run && status === "active" ? new Date(Date.now() + minutes * 60_000).toISOString() : undefined,
               trigger: triggerText,
+              triggerInput: rawTrigger,
               triggerOutcome,
               timeoutSeconds: 0,
               probes: states.map((st, i) => ({
                 id: st.p.id,
                 location: locationOf(st.p),
+                sourceUrl: st.p.sourceUrl,
+                line: st.p.line,
                 kind: st.p.kind,
                 fields: st.p.fields,
                 condition: st.p.condition,
@@ -520,7 +591,7 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
               success: status !== "error",
               error: status === "error" ? states.map((st) => st.error).filter(Boolean).join(";") : undefined,
             });
-            const text = formatRunSummary(rec);
+            const text = formatRunSummary(rec) + (args.save_as ? saveProbeFile(args.save_as, rec, { purpose: args.purpose, conclusion: args.conclusion, systemVersion: args.system_version }) : "");
             return status === "error" || status === "trigger_failed" ? { content: [{ type: "text" as const, text }], isError: true } : ok(text);
           }
 
@@ -539,11 +610,14 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
             createdAt: startedAt,
             status: result.status,
             trigger: triggerText,
+            triggerInput: rawTrigger,
             triggerOutcome: result.triggerOutcome,
             timeoutSeconds,
             probes: result.probes.map((s, i) => ({
               id: s.spec.id,
               location: locationOf(probes[i]),
+              sourceUrl: probes[i].sourceUrl,
+              line: probes[i].line,
               kind: s.spec.kind,
               fields: s.spec.variables,
               condition: s.spec.condition,
@@ -564,7 +638,7 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
             success: result.status !== "error",
             error: result.status === "error" ? result.notes.join(";") : undefined,
           });
-          const text = formatRunSummary(rec);
+          const text = formatRunSummary(rec) + (args.save_as ? saveProbeFile(args.save_as, rec, { purpose: args.purpose, conclusion: args.conclusion, systemVersion: args.system_version }) : "");
           return result.status === "error" || result.status === "trigger_failed" ? { content: [{ type: "text" as const, text }], isError: true } : ok(text);
         } catch (e) {
           audit.log({
