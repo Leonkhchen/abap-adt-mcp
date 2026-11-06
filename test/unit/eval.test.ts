@@ -306,3 +306,294 @@ describe("E1 deleteWithLock", () => {
     expect(await deleteWithLock(r, URI)).toContain("不存在(略過)");
   });
 });
+
+// ───────────────────────── v0.6 Z1:評測框架擴充(還原、注入、新判定、--tags)─────────────────────────
+
+import { applyPatch, checkUnitTests, normalizeSource, parseUnitCounts, restoreSources, sameSource } from "../../eval/lib/baseline.js";
+import { selectTasks } from "../../eval/lib/tasks.js";
+import { baselineWarning } from "../../eval/lib/report.js";
+import { evalEnv } from "../../eval/lib/harness.js";
+
+const MIN_TASK = `id: "z1"
+title: t
+prompt: p
+checks:
+  - kind: answer_contains
+    all: [x]
+`;
+
+describe("Z1-2 applyPatch(注入)", () => {
+  it("唯一一處 → 取代;找不到 → count 0 且原樣回傳", () => {
+    const src = "a = b - c.\nd = e.";
+    const p = applyPatch(src, "b - c", "b + c");
+    expect(p.count).toBe(1);
+    expect(p.source).toBe("a = b + c.\nd = e.");
+    const none = applyPatch(src, "zzz", "y");
+    expect(none.count).toBe(0);
+    expect(none.source).toBe(src);
+  });
+  it("出現多次:count 如實回報;all=false 只換第一處、all=true 全換", () => {
+    const src = "x. x. x.";
+    expect(applyPatch(src, "x.", "y.").count).toBe(3);
+    expect(applyPatch(src, "x.", "y.").source).toBe("y. x. x.");
+    expect(applyPatch(src, "x.", "y.", true).source).toBe("y. y. y.");
+  });
+  it("行尾 CRLF 與 LF 不影響比對;多行片段也能找到", () => {
+    const sap = "IF a = 1.\r\n  b = 2.\r\nENDIF.\r\n";
+    const p = applyPatch(sap, "IF a = 1.\n  b = 2.", "IF a = 1.\n  b = 3.");
+    expect(p.count).toBe(1);
+    expect(normalizeSource(p.source)).toBe("IF a = 1.\n  b = 3.\nENDIF.");
+  });
+  it("空的 find 不做事;replace 內含 $& 之類不被當成特殊樣式", () => {
+    expect(applyPatch("abc", "", "x").count).toBe(0);
+    expect(applyPatch("abc", "b", "$&$&").source).toBe("a$&$&c");
+  });
+});
+
+describe("Z1-3 單元測試輸出的解析與判定", () => {
+  const out = (m: number, p: number, f: number, extra = "") => `${f ? "❌" : "✅"} ABAP Unit:${m} 個測試方法,${p} 通過,${f} 失敗${extra}\n✅ x`;
+  it("parseUnitCounts 取出 N / 通過 / 失敗 / 類別錯誤", () => {
+    expect(parseUnitCounts(out(36, 36, 0))).toEqual({ methods: 36, passed: 36, failed: 0, classErrors: 0 });
+    expect(parseUnitCounts(out(37, 36, 1, ";2 個測試類別本身有錯誤"))).toEqual({ methods: 37, passed: 36, failed: 1, classErrors: 2 });
+    expect(parseUnitCounts("找不到可執行的 ABAP Unit 測試")).toBeUndefined();
+  });
+  it("checkUnitTests:失敗 0 且通過數 ≥ N 才算過", () => {
+    expect(checkUnitTests(out(37, 37, 0), 37)).toBeUndefined();
+    expect(checkUnitTests(out(36, 36, 0), 37)).toContain("少於要求的 37");
+    expect(checkUnitTests(out(36, 35, 1), 1)).toContain("1 個失敗");
+    expect(checkUnitTests(out(1, 1, 0, ";1 個測試類別本身有錯誤"), 1)).toContain("類別本身有錯誤");
+    expect(checkUnitTests("找不到可執行的 ABAP Unit 測試", 1)).toContain("找不到測試結果");
+  });
+});
+
+describe("Z1-1 restoreSources(還原流程)", () => {
+  const URL_A = "/sap/bc/adt/oo/classes/zcl_a/source/main";
+  const URL_B = "/sap/bc/adt/oo/classes/zcl_a/includes/testclasses";
+  const ok36 = "✅ ABAP Unit:36 個測試方法,36 通過,0 失敗";
+
+  /** 假系統:store 是目前內容;write 會更新(可指定失敗或寫壞) */
+  function fakeSystem(initial: Record<string, string>, o: { failWrite?: string[]; corruptWrite?: string[]; tests?: string } = {}) {
+    const store = new Map(Object.entries(initial));
+    const deps = {
+      read: vi.fn(async (u: string) => store.get(u) ?? ""),
+      write: vi.fn(async (u: string, src: string) => {
+        if (o.failWrite?.includes(u)) throw new Error("write boom");
+        store.set(u, o.corruptWrite?.includes(u) ? src + "\n* corrupted" : src);
+      }),
+      runUnitTests: vi.fn(async () => o.tests ?? ok36),
+    };
+    return { store, deps };
+  }
+
+  it("成功:被改過的物件寫回、比對一致、基準測試 36/36 → 沒有問題", async () => {
+    const { store, deps } = fakeSystem({ [URL_A]: "MODIFIED", [URL_B]: "ORIGINAL B" });
+    const originals = new Map([[URL_A, "ORIGINAL A"], [URL_B, "ORIGINAL B"]]);
+    const problems = await restoreSources(deps, originals, { object_url: "/sap/bc/adt/oo/classes/zcl_a", passed: 36 });
+    expect(problems).toEqual([]);
+    expect(store.get(URL_A)).toBe("ORIGINAL A");
+    expect(deps.write).toHaveBeenCalledTimes(1); // B 沒被改,不重寫
+    expect(deps.write).toHaveBeenCalledWith(URL_A, "ORIGINAL A");
+    expect(deps.runUnitTests).toHaveBeenCalledTimes(1);
+  });
+
+  it("行尾不同不算被改(SAP 回 CRLF、基準是 LF)→ 不寫", async () => {
+    const { deps } = fakeSystem({ [URL_A]: "line1\r\nline2\r\n" });
+    const problems = await restoreSources(deps, new Map([[URL_A, "line1\nline2"]]));
+    expect(problems).toEqual([]);
+    expect(deps.write).not.toHaveBeenCalled();
+  });
+
+  it("寫回失敗 → 回報問題,但其他物件仍會還原、基準測試仍會跑", async () => {
+    const { store, deps } = fakeSystem({ [URL_A]: "MOD A", [URL_B]: "MOD B" }, { failWrite: [URL_A] });
+    const problems = await restoreSources(deps, new Map([[URL_A, "ORIG A"], [URL_B, "ORIG B"]]), { object_url: "/x", passed: 36 });
+    expect(problems.some((p) => p.includes(URL_A) && p.includes("write boom"))).toBe(true);
+    expect(store.get(URL_B)).toBe("ORIG B");
+    expect(deps.runUnitTests).toHaveBeenCalledTimes(1);
+  });
+
+  it("寫回後比對不一致 → 回報", async () => {
+    const { deps } = fakeSystem({ [URL_A]: "MOD" }, { corruptWrite: [URL_A] });
+    const problems = await restoreSources(deps, new Map([[URL_A, "ORIG"]]));
+    expect(problems).toEqual([expect.stringContaining("不一致")]);
+  });
+
+  it("基準測試不是 36/36(35 通過 1 失敗、或只有 35 個方法)→ 回報", async () => {
+    const orig = new Map([[URL_A, "A"]]);
+    const verify = { object_url: "/x", passed: 36 };
+    const failing = await restoreSources(fakeSystem({ [URL_A]: "A" }, { tests: "❌ ABAP Unit:36 個測試方法,35 通過,1 失敗" }).deps, orig, verify);
+    expect(failing).toEqual([expect.stringContaining("應為 36/36")]);
+    const fewer = await restoreSources(fakeSystem({ [URL_A]: "A" }, { tests: "✅ ABAP Unit:35 個測試方法,35 通過,0 失敗" }).deps, orig, verify);
+    expect(fewer).toEqual([expect.stringContaining("應為 36/36")]);
+    const none = await restoreSources(fakeSystem({ [URL_A]: "A" }, { tests: "找不到可執行的 ABAP Unit 測試" }).deps, orig, verify);
+    expect(none).toEqual([expect.stringContaining("找不到測試結果")]);
+  });
+
+  it("基準測試無法執行(丟例外)→ 回報,不丟出去", async () => {
+    const { deps } = fakeSystem({ [URL_A]: "A" });
+    deps.runUnitTests.mockRejectedValueOnce(new Error("503"));
+    const problems = await restoreSources(deps, new Map([[URL_A, "A"]]), { object_url: "/x", passed: 36 });
+    expect(problems).toEqual([expect.stringContaining("無法執行")]);
+  });
+
+  it("沒有 originals(不是還原題)→ 什麼都不做", async () => {
+    const { deps } = fakeSystem({});
+    expect(await restoreSources(deps, new Map())).toEqual([]);
+    expect(deps.read).not.toHaveBeenCalled();
+  });
+
+  it("sameSource 忽略行尾與結尾空白", () => {
+    expect(sameSource("a\r\nb\r\n", "a\nb")).toBe(true);
+    expect(sameSource("a\nb", "a\nc")).toBe(false);
+  });
+});
+
+describe("Z1 任務檔新欄位與驗證", () => {
+  it("tags / opt_in / allowed_packages / 逾時 / restore / restore_verify 都能解析", () => {
+    const t = parseTask(
+      `${MIN_TASK}tags: [zinv, legacy]
+opt_in: true
+allowed_packages: ["$ZINV"]
+timeout_min: 30
+budget_usd: 4
+tool_timeout_sec: 240
+restore: [/sap/bc/adt/oo/classes/zcl_inv_posting/source/main]
+restore_verify: { object_url: /sap/bc/adt/oo/classes/zcl_inv_posting, passed: 36 }
+setup:
+  - tool: patch
+    args: { object_url: /sap/bc/adt/oo/classes/zcl_inv_posting/source/main, find: a, replace: b }
+  - tool: expect_unit_tests
+    args: { object_url: /sap/bc/adt/oo/classes/zcl_inv_posting }
+`,
+      "t.yaml",
+      "ABC123"
+    );
+    expect(t.tags).toEqual(["zinv", "legacy"]);
+    expect(t.optIn).toBe(true);
+    expect(t.allowedPackages).toEqual(["$ZINV"]);
+    expect([t.timeoutMin, t.budgetUsd, t.toolTimeoutSec]).toEqual([30, 4, 240]);
+    expect(t.restore).toEqual(["/sap/bc/adt/oo/classes/zcl_inv_posting/source/main"]);
+    expect(t.restoreVerify).toEqual({ object_url: "/sap/bc/adt/oo/classes/zcl_inv_posting", passed: 36 });
+  });
+
+  it("沒寫的欄位有安全預設(舊題不受影響)", () => {
+    const t = parseTask(MIN_TASK, "t.yaml", "ABC123");
+    expect(t.tags).toEqual([]);
+    expect(t.optIn).toBe(false);
+    expect(t.allowedPackages).toBeUndefined();
+    expect(t.restore).toEqual([]);
+    expect(t.restoreVerify).toBeUndefined();
+  });
+
+  it.each([
+    ["patch 缺 find", "setup:\n  - tool: patch\n    args: { object_url: /sap/bc/adt/oo/classes/zx/source/main, replace: b }\n", /patch 需要 find/],
+    ["patch object_url 不是 ADT URI", "setup:\n  - tool: patch\n    args: { object_url: https://evil/x, find: a, replace: b }\n", /patch 需要 object_url/],
+    ["expect_unit_tests 缺 object_url", "setup:\n  - tool: expect_unit_tests\n    args: {}\n", /expect_unit_tests 需要 object_url/],
+    ["restore 不是 ADT URI", "restore: [zcl_x]\n", /restore 必須是 ADT URI/],
+    ["restore_verify 沒搭配 restore", "restore_verify: { object_url: /sap/bc/adt/oo/classes/zx, passed: 36 }\n", /必須搭配 restore/],
+    ["restore_verify passed 不是正整數", "restore: [/sap/bc/adt/oo/classes/zx/source/main]\nrestore_verify: { object_url: /sap/bc/adt/oo/classes/zx, passed: 0 }\n", /restore_verify 需要/],
+    ["unit_tests 缺 object_url", "checks:\n  - kind: unit_tests\n", /unit_tests 需要 object_url/],
+    ["source_not_contains 缺清單", "checks:\n  - kind: source_not_contains\n    object_url: /sap/bc/adt/oo/classes/zx/source/main\n", /source_not_contains 需要/],
+    ["atc_max 缺 max", "checks:\n  - kind: atc_max\n    object_url: /sap/bc/adt/oo/classes/zx\n", /atc_max 需要/],
+    ["tags 不是字串陣列", "tags: zinv\n", /tags 必須是非空的字串陣列/],
+    ["timeout_min 不是正數", "timeout_min: 0\n", /timeout_min 必須是正數/],
+  ])("驗證:%s → 報錯", (_n, extra, re) => {
+    // 把額外欄位接在最小任務後面;若 extra 自帶 checks 就取代最小任務的 checks
+    const base = extra.startsWith("checks:") ? "id: z1\ntitle: t\nprompt: p\n" : MIN_TASK;
+    expect(() => parseTask(base + extra, "t.yaml", "ABC123")).toThrow(re);
+  });
+
+  it("四種新判定 + unchanged 的格式都能解析", () => {
+    const t = parseTask(
+      `id: z1
+title: t
+prompt: p
+checks:
+  - { kind: unit_tests, object_url: /sap/bc/adt/oo/classes/zcl_inv_posting, min_passed: 37 }
+  - { kind: source_contains, object_url: /sap/bc/adt/oo/classes/zcl_inv_posting/source/main, contains: [check_wh] }
+  - { kind: source_not_contains, object_url: /sap/bc/adt/oo/classes/zcl_inv_posting/source/main, not_contains: [bug] }
+  - { kind: atc_max, object_url: /sap/bc/adt/oo/classes/zcl_inv_posting, max: 0 }
+  - { kind: unchanged, object_url: /sap/bc/adt/programs/programs/zinv_entry/source/main }
+`,
+      "t.yaml",
+      "ABC123"
+    );
+    expect(t.checks.map((c) => c.kind)).toEqual(["unit_tests", "source_contains", "source_not_contains", "atc_max", "unchanged"]);
+  });
+});
+
+describe("Z1-4 --tags 篩選與預設不跑 opt_in 題組", () => {
+  function tmpTaskDir() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "abap-mcp-tags-"));
+    const w = (name: string, id: string, extra = "") =>
+      fs.writeFileSync(path.join(dir, name), `id: "${id}"\ntitle: t${id}\nprompt: p\nchecks:\n  - { kind: answer_contains, all: [x] }\n${extra}`);
+    w("01.yaml", "01");
+    w("02.yaml", "02", "tags: [legacy]\n");
+    w("zinv-01.yaml", "zinv-01", "tags: [zinv, legacy]\nopt_in: true\n");
+    w("zinv-02.yaml", "zinv-02", "tags: [zinv]\nopt_in: true\n");
+    return dir;
+  }
+
+  it("--tags 只留任一 tag 符合的題;--tasks 與 --tags 同時給 → 兩者都要符合", () => {
+    const dir = tmpTaskDir();
+    try {
+      expect(loadTasks(dir, "ABC123", undefined, ["zinv"]).map((t) => t.id)).toEqual(["zinv-01", "zinv-02"]);
+      expect(loadTasks(dir, "ABC123", undefined, ["legacy"]).map((t) => t.id)).toEqual(["02", "zinv-01"]);
+      expect(loadTasks(dir, "ABC123", ["zinv-02"], ["zinv"]).map((t) => t.id)).toEqual(["zinv-02"]);
+      expect(loadTasks(dir, "ABC123", ["01"], ["zinv"])).toEqual([]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("沒有 --tags / --tasks:不含 opt_in 題組(原本的題目照跑);明確選取時全部跑", () => {
+    const dir = tmpTaskDir();
+    try {
+      const all = loadTasks(dir, "ABC123");
+      expect(selectTasks(all, { explicit: false }).map((t) => t.id)).toEqual(["01", "02"]);
+      expect(selectTasks(all, { explicit: true }).map((t) => t.id)).toEqual(["01", "02", "zinv-01", "zinv-02"]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("repo 內現有的題目都不是 opt_in(原本 8 題不受影響)", () => {
+    const tasks = loadTasks(TASK_DIR, "ABC123");
+    expect(tasks.length).toBeGreaterThanOrEqual(8);
+    for (const t of tasks.filter((x) => /^0[1-8]$/.test(x.id))) {
+      expect(t.optIn, t.id).toBe(false);
+      expect(t.restore, t.id).toEqual([]);
+    }
+  });
+
+  it("參數解析:--tags 需要值", () => {
+    expect(parseArgs(["--tags", "zinv,legacy"]).values.get("tags")).toBe("zinv,legacy");
+    expect(() => parseArgs(["--tags"])).toThrow(/需要一個值/);
+  });
+});
+
+describe("Z1-4 evalEnv 與還原失敗的報表警告", () => {
+  it("task 有 allowed_packages 才覆寫;沒有就沿用原本設定(舊題不受影響)", () => {
+    const base = { ABAP_MCP_ALLOWED_PACKAGES: "$TMP,Z*,Y*" } as NodeJS.ProcessEnv;
+    expect(evalEnv(base, { allowedPackages: ["$ZINV"] }).ABAP_MCP_ALLOWED_PACKAGES).toBe("$ZINV");
+    expect(evalEnv(base, { allowedPackages: undefined }).ABAP_MCP_ALLOWED_PACKAGES).toBe("$TMP,Z*,Y*");
+    expect(evalEnv(base).ABAP_MCP_ALLOWED_PACKAGES).toBe("$TMP,Z*,Y*");
+    expect(evalEnv(base).ABAP_MCP_READONLY).toBe("false");
+  });
+
+  const result = (o: Partial<TaskResult> = {}): TaskResult => ({
+    task: "zinv-03", title: "修 bug", model: "sonnet", passed: true, details: [], cleanup: [], suffix: "ABC123", ...o,
+  });
+
+  it("沒有還原問題 → 沒有警告;有 → 報表最上方標出,並列在失敗與清除問題", () => {
+    expect(baselineWarning([result()])).toBeUndefined();
+    const broken = [result(), result({ task: "zinv-04", baselineBroken: "ZCL_INV_POSTING:寫回失敗" })];
+    expect(baselineWarning(broken)).toContain("baseline zip");
+    expect(baselineWarning(broken)).toContain("zinv-04");
+    const md = renderMarkdown({ startedAt: new Date("2026-11-06T00:00:00Z"), stamp: "s", dryRun: false, models: ["sonnet"], results: broken });
+    const firstLines = md.split("\n").slice(0, 4).join("\n");
+    expect(firstLines).toContain("ZINV 基準可能已損壞");
+    expect(md).toContain("還原失敗:ZCL_INV_POSTING:寫回失敗");
+    const clean = renderMarkdown({ startedAt: new Date("2026-11-06T00:00:00Z"), stamp: "s", dryRun: false, models: ["sonnet"], results: [result()] });
+    expect(clean).not.toContain("ZINV 基準可能已損壞");
+  });
+});

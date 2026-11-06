@@ -5,14 +5,15 @@ export const USAGE = `用法:npx tsx eval/run.ts [選項]
   --model <清單>        opus / sonnet / haiku,逗號分隔可多個(預設 sonnet);
                         也可寫 claude:<模型 ID>;codex: / gemini: 本版未實作
   --matrix              確認要跑多模型矩陣(--model 超過一個時必須加)
-  --tasks <01,07,…>     只跑指定題目(預設全部)
+  --tasks <01,07,…>     只跑指定題目(預設:全部、但不含需明確選取的題組)
+  --tags <zinv,…>       只跑帶這些 tag 的題目(任一符合);ZINV 題組要用 --tags zinv 才會跑
   --dry-run             不呼叫模型:只驗證事前準備、判定與清除
   --timeout-min <分>    每題逾時(預設 20)
   --budget <USD>        每題費用上限(預設 3)
   --out <目錄>          結果目錄(預設 eval/results)
   --help                顯示說明後結束(不連 SAP、不呼叫模型)`;
 
-const VALUE_OPTS = new Set(["model", "tasks", "timeout-min", "budget", "out"]);
+const VALUE_OPTS = new Set(["model", "tasks", "tags", "timeout-min", "budget", "out"]);
 const FLAG_OPTS = new Set(["dry-run", "help", "matrix"]);
 
 /** 嚴格解析參數:未知選項或缺值一律報錯,不會「忽略後照跑」 */
