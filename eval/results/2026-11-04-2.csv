@@ -1,0 +1,10 @@
+﻿task,title,model,passed,turns,seconds,cost_usd,tool_calls,status,timed_out,setup_error
+01,讀懂並解釋 /DMO/ class,sonnet,true,5,23,0.1463,3,success,false,
+02,修語法錯誤,sonnet,true,6,42,0.0982,4,success,false,
+03,新建 class + ABAP Unit 全綠,sonnet,true,7,35,0.1189,5,success,false,
+04,修短傾印,sonnet,true,5,25,0.0987,3,success,false,
+05,ATC 變乾淨,sonnet,true,7,73,0.1055,5,success,false,
+06,從 Z 表產生 RAP BO,sonnet,true,4,84,0.0914,2,success,false,
+07,data_preview 統計問題,sonnet,true,3,11,0.1068,1,success,false,
+08,where_used 找呼叫處並改名,sonnet,true,10,63,0.1301,8,success,false,
+TOTAL,8/8 passed,sonnet,true,47,356,0.8959,31,,,

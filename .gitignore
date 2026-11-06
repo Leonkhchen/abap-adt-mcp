@@ -8,3 +8,9 @@ audit.jsonl
 # 評測:原始 stream-json 記錄與逐題 JSON 不入版控(報表 .md/.csv 入版控)
 eval/results/logs/
 eval/results/*.json
+
+# 含本機路徑的 agent 指引,不進版控
+AGENTS.md
+CLAUDE.md
+eval/results/**/logs/
+eval/results/**/*.json
