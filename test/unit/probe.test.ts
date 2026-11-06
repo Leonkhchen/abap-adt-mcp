@@ -362,6 +362,7 @@ function fakeAdt(o: { pkg?: (url: string) => string } = {}): AdtService {
   const unit = [{ "adtcore:name": "LTC", alerts: [], testmethods: [{ "adtcore:name": "T1", alerts: [], executionTime: "0", unit: "s" }] }];
   return {
     username: () => "DEVELOPER",
+    dlpAvailable: vi.fn(async () => false),
     objectPackage: vi.fn(async (u: string) => (o.pkg ? o.pkg(u) : "$ZINV")),
     runUnitTests: vi.fn(async () => unit as never),
     runClass: vi.fn(async () => "out"),
@@ -557,5 +558,123 @@ describe("探針紀錄存放與輸出上限", () => {
     const text = formatLogs(r);
     expect(text.length).toBeLessThanOrEqual(PROBE_LOGS_MAX_CHARS + 200);
     expect(text).toContain("已截斷");
+  });
+});
+
+// ───────────────────────── 模式 A:Dynamic Logpoints ─────────────────────────
+
+function dlpAdt(o: { available?: boolean; existing?: { location: string; description: string }[]; readError?: boolean } = {}) {
+  const base = fakeAdt() as unknown as Record<string, unknown>;
+  const live = new Map<string, string>(); // location → description
+  for (const e of o.existing ?? []) live.set(e.location, e.description);
+  let n = 0;
+  const api = {
+    ...base,
+    dlpAvailable: vi.fn(async () => o.available ?? true),
+    dlpList: vi.fn(async () => [...live].map(([location, description]) => ({ location, description, sourceUri: "", executions: 0, activeUntil: "", state: "A" }))),
+    dlpCreate: vi.fn(async (i: { description: string }) => {
+      const id = `LP${++n}`;
+      live.set(id, i.description);
+      return id;
+    }),
+    dlpDelete: vi.fn(async (id: string) => {
+      live.delete(id);
+    }),
+    dlpRead: vi.fn(async () => {
+      if (o.readError) throw new Error("read boom");
+      return [
+        { key: "1", calls: 6, lastCall: "t1", fields: [{ name: "iv_qty", values: ["1"] }, { name: "iv_stqty", values: ["3"] }] },
+        { key: "2", calls: 1, lastCall: "t2", fields: [{ name: "iv_qty", values: ["2"] }, { name: "iv_stqty", values: ["10"] }] },
+      ];
+    }),
+  };
+  return { adt: api as unknown as AdtService, api, live };
+}
+
+describe("探針模式 A(Dynamic Logpoints)", () => {
+  const env = { ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV,$TMP" };
+  const args = { object_url: "/sap/bc/adt/oo/classes/zcl_inv_posting", line: 176, fields: ["iv_qty", "iv_stqty"], max_hits: 5 };
+
+  it("auto + 有端點 + trigger:建立 → 觸發 → 讀取 → 移除,結果存進紀錄", async () => {
+    const { adt, api, live } = dlpAdt();
+    const { call } = await connect(adt, cfgOf(env));
+    const r = await call("probe_set", { ...args, trigger: SET_ARGS.trigger });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("模式 A");
+    expect(r.text).toContain("命中 2/5 次");
+    expect(api.dlpCreate).toHaveBeenCalledTimes(1);
+    expect(live.size).toBe(0); // 讀完就移除,不留 logpoint
+    const logs = await call("probe_logs", { run_id: "run-1" });
+    expect(logs.text).toContain("共執行 6 次");
+    expect(logs.text).toContain("iv_stqty = 10");
+  });
+
+  it("沒給 trigger:立即回傳,logpoint 保持啟用;probe_logs 重讀;probe_delete 移除 SAP 上的 logpoint", async () => {
+    const { adt, api, live } = dlpAdt();
+    const { call } = await connect(adt, cfgOf(env));
+    const r = await call("probe_set", args);
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("探針已啟用");
+    expect(r.text).toContain("有效到");
+    expect(live.size).toBe(1);
+    expect(api.dlpRead).not.toHaveBeenCalled();
+    const logs = await call("probe_logs", { run_id: "run-1" });
+    expect(api.dlpRead).toHaveBeenCalledTimes(1);
+    expect(logs.text).toContain("iv_qty = 2");
+    const d = await call("probe_delete", { run_id: "run-1" });
+    expect(d.isError, d.text).toBe(false);
+    expect(live.size).toBe(0);
+  });
+
+  it("描述帶 abap-adt-mcp 標記:上限只算自己建的;probe_delete all 只清自己的(含先前 process 留下的)", async () => {
+    const { adt, live } = dlpAdt({
+      existing: [
+        { location: "OLD1", description: "abap-adt-mcp" },
+        { location: "ECLIPSE1", description: "someone else" },
+      ],
+    });
+    const { call } = await connect(adt, cfgOf({ ...env, ABAP_MCP_MAX_PROBES: "2" }));
+    expect((await call("probe_set", args)).isError).toBe(false); // 1 個自己的 + 1 個新的 = 2 ≤ 2
+    const over = await call("probe_set", args); // 2 + 1 > 2
+    expect(over.isError).toBe(true);
+    expect(over.text).toContain("上限");
+    await call("probe_delete", { all: true });
+    expect([...live.keys()]).toEqual(["ECLIPSE1"]);
+  });
+
+  it("讀取失敗:例外照樣往上報,但 logpoint 一定被移除", async () => {
+    const { adt, live } = dlpAdt({ readError: true });
+    const { call } = await connect(adt, cfgOf(env));
+    const r = await call("probe_set", { ...args, trigger: SET_ARGS.trigger });
+    expect(r.isError).toBe(true);
+    expect(live.size).toBe(0);
+  });
+
+  it("ABAP_MCP_PROBE_MODE=dlp 但系統沒有端點 → 報錯;=debugger 完全不碰 dlp;auto 沒端點 → 走模式 B(要 trigger)", async () => {
+    const none = dlpAdt({ available: false });
+    const a = await connect(none.adt, cfgOf({ ...env, ABAP_MCP_PROBE_MODE: "dlp" }));
+    const r1 = await a.call("probe_set", args);
+    expect(r1.isError).toBe(true);
+    expect(r1.text).toContain("沒有 /sap/bc/adt/dlp");
+    const some = dlpAdt();
+    const b = await connect(some.adt, cfgOf({ ...env, ABAP_MCP_PROBE_MODE: "debugger" }));
+    const r2 = await b.call("probe_set", args); // 模式 B 沒有 trigger → 參數錯誤
+    expect(r2.isError).toBe(true);
+    expect(r2.text).toContain("trigger");
+    expect(some.api.dlpAvailable).not.toHaveBeenCalled();
+    expect(some.api.dlpCreate).not.toHaveBeenCalled();
+    const c = await connect(none.adt, cfgOf(env));
+    expect((await c.call("probe_set", args)).text).toContain("trigger"); // auto 沒端點 → 模式 B
+  });
+
+  it("kind=sql 只有模式 A 接受;範圍檢查與 trigger 白名單照常", async () => {
+    const { adt, api } = dlpAdt();
+    const { call } = await connect(adt, cfgOf(env));
+    const r = await call("probe_set", { object_url: args.object_url, line: 176, kind: "sql" });
+    expect(r.isError, r.text).toBe(false);
+    expect(api.dlpCreate).toHaveBeenCalledWith(expect.objectContaining({ kind: "sql" }));
+    const bad = await call("probe_set", { ...args, trigger: { tool: "run_unit_tests", object_url: "/sap/bc/adt/oo/classes/zcl_x" } });
+    // 觸發物件的 package 由 fakeAdt 回 $ZINV(在白名單),所以是 custom 範圍以外的情況才擋;這裡只確認 trigger 有被執行路徑接受
+    expect(bad.isError, bad.text).toBe(false);
   });
 });

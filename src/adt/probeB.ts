@@ -45,6 +45,8 @@ export interface VariableValue {
 export interface ProbeHit {
   n: number;
   at: string;
+  /** 模式 A:這個 key 被執行了幾次 */
+  calls?: number;
   variables?: VariableValue[];
   stack?: StackFrame[];
 }

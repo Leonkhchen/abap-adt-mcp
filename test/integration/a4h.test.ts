@@ -23,7 +23,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ADTClient, session_types } from "abap-adt-api";
 import { loadConfig, type AppConfig } from "../../src/config.js";
-import { RealAdtService } from "../../src/adt/client.js";
+import { RealAdtService, createAdtClient } from "../../src/adt/client.js";
 import { logoutClient, releaseStateful } from "../../src/adt/session.js";
 import { AuditLogger } from "../../src/safety/audit.js";
 import { registerTools } from "../../src/tools/registry.js";
@@ -1103,7 +1103,7 @@ describe.skipIf(!RUN_WRITE)("v0.6 C0-6 R2 實機確認（A4H，暫存 package）
 // 每個測試只用 DEVELOPER 帳號、逾時 ≤ 60 秒;結束後工具自己刪中斷點、取消監聽、登出。
 describe.skipIf(!RUN_WRITE)("v0.6 探針模式 B（A4H，$ZINV 的 ZCL_INV_POSTING）", () => {
   const POSTING = "/sap/bc/adt/oo/classes/zcl_inv_posting";
-  const base = { ...process.env, ABAP_MCP_READONLY: "false", ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV,$TMP" };
+  const base = { ...process.env, ABAP_MCP_READONLY: "false", ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_PROBE_MODE: "debugger", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV,$TMP" };
   let s: Awaited<ReturnType<typeof startServer>>;
   beforeAll(async () => {
     s = await startServer(base);
@@ -1150,4 +1150,95 @@ describe.skipIf(!RUN_WRITE)("v0.6 探針模式 B（A4H，$ZINV 的 ZCL_INV_POSTI
       await c.close();
     }
   }, 60_000);
+});
+
+// ───────────────────────────── v0.6 P-A：探針模式 A（Dynamic Logpoints，T41–T45）─────────────────────────────
+// 前提同 T46:$ZINV 在 baseline。每個測試結束前確認 SAP 上沒有留下帶 abap-adt-mcp 標記的 logpoint。
+describe.skipIf(!RUN_WRITE)("v0.6 探針模式 A（A4H，Dynamic Logpoints）", () => {
+  const POSTING = "/sap/bc/adt/oo/classes/zcl_inv_posting";
+  const env = { ...process.env, ABAP_MCP_READONLY: "false", ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_PROBE_MODE: "dlp", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV,$TMP" };
+  let s: Awaited<ReturnType<typeof startServer>>;
+  beforeAll(async () => {
+    s = await startServer(env);
+  }, 60_000);
+  afterAll(async () => {
+    await s?.call("probe_delete", { all: true }).catch(() => undefined);
+    await s?.close();
+  });
+
+  /** 直接問 SAP:這個帳號底下還有幾個 MCP 建立的 logpoint */
+  async function leftovers(): Promise<number> {
+    const c = createAdtClient(s.cfg);
+    try {
+      await c.login();
+      return (await c.logpoints(s.cfg.sap.user)).filter((l) => (l.definition.description ?? "").startsWith("abap-adt-mcp")).length;
+    } finally {
+      await logoutClient(c, 5000);
+    }
+  }
+  const trigger = { tool: "run_unit_tests", object_url: POSTING };
+  const vars = { object_url: POSTING, line: 176, fields: ["iv_qty", "iv_stqty", "iv_stval"], max_hits: 10 };
+
+  it("T41 trigger=run_unit_tests:logpoint 記到不同的值與次數,讀完自動移除", async () => {
+    const r = await s.call("probe_set", { ...vars, trigger });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("模式 A");
+    expect(r.text).toContain("36 通過");
+    const id = /(run-\d+)/.exec(r.text)![1];
+    const logs = await s.call("probe_logs", { run_id: id });
+    expect(logs.text).toContain("iv_stqty = 10");
+    expect(logs.text).toContain("iv_stval = 1000");
+    expect(logs.text).toMatch(/共執行 \d+ 次/);
+    expect(await leftovers()).toBe(0);
+  }, 180_000);
+
+  it("T42 不給 trigger:logpoint 保持啟用,另外執行後 probe_logs 讀到;probe_delete 後 SAP 上沒有殘留", async () => {
+    const r = await s.call("probe_set", { ...vars, duration_minutes: 5 });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("探針已啟用");
+    expect(await leftovers()).toBe(1);
+    const id = /(run-\d+)/.exec(r.text)![1];
+    const t = await s.call("run_unit_tests", { object_url: POSTING });
+    expect(t.isError, t.text).toBe(false);
+    const logs = await s.call("probe_logs", { run_id: id });
+    expect(logs.text).toContain("iv_stqty = 10");
+    const d = await s.call("probe_delete", { run_id: id });
+    expect(d.isError, d.text).toBe(false);
+    expect(await leftovers()).toBe(0);
+  }, 180_000);
+
+  it("T43 kind=stack:記錄呼叫堆疊", async () => {
+    const r = await s.call("probe_set", { object_url: POSTING, line: 176, kind: "stack", max_hits: 3, trigger });
+    expect(r.isError, r.text).toBe(false);
+    const id = /(run-\d+)/.exec(r.text)![1];
+    const logs = await s.call("probe_logs", { run_id: id });
+    expect(logs.text).toMatch(/命中 [1-9]/);
+    expect(await leftovers()).toBe(0);
+  }, 180_000);
+
+  it("T44 condition:只記條件成立的值", async () => {
+    const r = await s.call("probe_set", { ...vars, condition: "iv_qty = 2", trigger });
+    expect(r.isError, r.text).toBe(false);
+    const id = /(run-\d+)/.exec(r.text)![1];
+    const logs = await s.call("probe_logs", { run_id: id });
+    expect(logs.text).toContain("iv_qty = 2");
+    expect(logs.text).not.toMatch(/iv_qty = 1\s/);
+    expect(await leftovers()).toBe(0);
+  }, 180_000);
+
+  it("T45 probe_delete all 清掉殘留;超過 ABAP_MCP_MAX_PROBES 被拒", async () => {
+    const small = await startServer({ ...env, ABAP_MCP_MAX_PROBES: "1" });
+    try {
+      expect((await small.call("probe_set", vars)).isError).toBe(false);
+      const over = await small.call("probe_set", vars);
+      expect(over.isError).toBe(true);
+      expect(over.text).toContain("上限");
+      expect(await leftovers()).toBe(1);
+      const d = await small.call("probe_delete", { all: true });
+      expect(d.isError, d.text).toBe(false);
+      expect(await leftovers()).toBe(0);
+    } finally {
+      await small.close();
+    }
+  }, 180_000);
 });

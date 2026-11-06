@@ -13,7 +13,7 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { AdtService } from "../adt/client.js";
+import type { AdtService, DlpKeyLog } from "../adt/client.js";
 import { AdtDebugPort } from "../adt/debugPort.js";
 import { baseObjectUrl, isSourceUrl } from "../adt/objectTypes.js";
 import {
@@ -45,6 +45,11 @@ const DEFAULT_TIMEOUT_SEC = 180;
 const MAX_TIMEOUT_SEC = 300;
 const MIN_TIMEOUT_SEC = 10;
 const MAX_FIELDS = 10;
+/** 模式 A(Dynamic Logpoints):預設有效 15 分鐘、最長 24 小時;標記在 logpoint 的描述,清除時只動自己建的 */
+const DEFAULT_DLP_MINUTES = 15;
+const MAX_DLP_MINUTES = 1440;
+export const DLP_TAG = "abap-adt-mcp";
+const MAX_VALUE_CHARS = 500;
 const MAX_LINE = 1_000_000;
 
 /** 變數名稱或運算式:ABAP 名稱、結構欄位、物件屬性、field symbol、類別屬性 */
@@ -77,7 +82,7 @@ export interface NormalizedProbe {
   sourceUrl: string;
   baseUrl: string;
   line: number;
-  kind: "variables" | "stack";
+  kind: "variables" | "stack" | "sql";
   fields: string[];
   condition?: string;
   maxHits: number;
@@ -97,9 +102,9 @@ export function probeSourceUrl(objectUrl: string, include?: string): string {
 }
 
 /** 驗證並正規化探針參數(不連 SAP);違反時丟 GuardViolationError */
-export function normalizeProbe(p: ProbeInput, index: number): NormalizedProbe {
+export function normalizeProbe(p: ProbeInput, index: number, allowSql = false): NormalizedProbe {
   const label = `探針 ${index + 1}`;
-  if (p.kind === "sql") throw new GuardViolationError(`${label}:kind=sql 只有 Dynamic Logpoints(模式 A)支援,debugger 快照模式(B)不支援。`);
+  if (p.kind === "sql" && !allowSql) throw new GuardViolationError(`${label}:kind=sql 只有 Dynamic Logpoints(模式 A)支援,debugger 快照模式(B)不支援。`);
   const kind = p.kind ?? "variables";
   if (!(p.line > 0 && p.line <= MAX_LINE)) throw new GuardViolationError(`${label}:行號必須是 1–${MAX_LINE}。`);
   const fields = (p.fields ?? []).map((f) => f.trim()).filter(Boolean);
@@ -142,13 +147,15 @@ export function normalizeTrigger(t: TriggerInput | undefined): NormalizedTrigger
 
 export interface ProbeRunRecord {
   id: string;
-  mode: "debugger";
+  mode: "debugger" | "dlp";
   createdAt: string;
-  status: EngineResult["status"];
+  status: EngineResult["status"] | "active";
+  /** 模式 A:logpoint 有效到幾點 */
+  activeUntil?: string;
   trigger: string;
   triggerOutcome?: string;
   timeoutSeconds: number;
-  probes: { id: string; location: string; kind: string; fields: string[]; condition?: string; maxHits: number; hits: ProbeHit[]; full: boolean; error?: string }[];
+  probes: { id: string; location: string; kind: string; fields: string[]; condition?: string; maxHits: number; hits: ProbeHit[]; full: boolean; error?: string; dlpId?: string }[];
   notes: string[];
 }
 
@@ -182,7 +189,8 @@ export class ProbeStore {
 
 // ───────────────────────────── 輸出格式 ─────────────────────────────
 
-const STATUS_TEXT: Record<EngineResult["status"], string> = {
+const STATUS_TEXT: Record<EngineResult["status"] | "active", string> = {
+  active: "探針已啟用,等待執行",
   completed: "觸發的執行已跑完",
   all_full: "所有探針都已收滿",
   timeout: "逾時",
@@ -193,7 +201,7 @@ const STATUS_TEXT: Record<EngineResult["status"], string> = {
 const locationOf = (p: NormalizedProbe) => `${objectNameFromUrl(p.sourceUrl)}${/\/includes\/([^/]+)$/.test(p.sourceUrl) ? `(${p.sourceUrl.split("/").pop()})` : ""} 第 ${p.line} 行`;
 
 export function formatHit(h: ProbeHit): string {
-  const lines = [`  #${h.n}(${h.at})`];
+  const lines = [`  #${h.n}(${h.at}${h.calls !== undefined ? `,共執行 ${h.calls} 次` : ""})`];
   for (const v of h.variables ?? []) {
     lines.push(`    ${v.name} = ${v.note ? `(${v.note})` : v.value === "" ? "(空)" : v.value}${v.meta && v.meta !== "simple" && v.meta !== "string" ? `  [${v.meta}]` : ""}`);
   }
@@ -203,7 +211,7 @@ export function formatHit(h: ProbeHit): string {
 
 export function formatRunSummary(r: ProbeRunRecord): string {
   const out = [
-    `${r.status === "completed" || r.status === "all_full" ? "✅" : r.status === "timeout" ? "⏱️" : "❌"} 探針執行 ${r.id}(模式 B:debugger 快照):${STATUS_TEXT[r.status]}`,
+    `${r.status === "completed" || r.status === "all_full" || r.status === "active" ? "✅" : r.status === "timeout" ? "⏱️" : "❌"} 探針執行 ${r.id}(模式 ${r.mode === "dlp" ? "A:Dynamic Logpoints" : "B:debugger 快照"}):${STATUS_TEXT[r.status]}`,
     `觸發:${r.trigger}${r.triggerOutcome ? `;結果:${r.triggerOutcome}` : ""}`,
   ];
   for (const p of r.probes) {
@@ -212,6 +220,7 @@ export function formatRunSummary(r: ProbeRunRecord): string {
         (p.error ? `❌ 中斷點設定失敗:${p.error}` : `命中 ${p.hits.length}/${p.maxHits} 次${p.full ? "(已收滿並移除)" : ""}`)
     );
   }
+  if (r.activeUntil) out.push(`有效到 ${r.activeUntil}。程式執行後用 probe_logs(run_id="${r.id}")讀取,用完請 probe_delete(run_id="${r.id}")移除 logpoint。`);
   for (const n of r.notes) out.push(`ℹ️ ${n}`);
   if (r.probes.some((p) => p.hits.length > 0)) out.push(`用 probe_logs(run_id="${r.id}")讀取每次命中的值;用完請 probe_delete(run_id="${r.id}")清掉紀錄。`);
   return out.join("\n");
@@ -249,17 +258,75 @@ export interface ProbeToolDeps {
 }
 
 const SET_DESCRIPTION =
-  "⚠️ 會在 SAP 上執行程式並暫時停住它:在指定程式行埋「探針」,程式跑到那一行時自動記下變數值或呼叫堆疊,然後立刻繼續執行(不改程式、不改變數值)。" +
-  "可以埋在 SAP 標準程式,用來確認問題出在標準程式還是呼叫端。目前為 debugger 快照模式:probe_set 在監聽期間同步等待結果(預設 3 分鐘、最長 5 分鐘)," +
-  "所以必須指定 trigger——run_unit_tests / run_class 由工具代為觸發;{manual:true} 表示由使用者自己在 SAP GUI 用「同一個帳號」執行(例如 VA01)," +
-  "此時請先告訴使用者要在幾分鐘內執行什麼,再呼叫本工具。參數可用單一探針(object_url + line + fields …)或完整 definition({probes:[…], trigger, timeout_seconds})。" +
-  "已知限制:update task、背景 RFC、背景作業裡的程式碼不會停下來。探針的值可能含業務資料,用完請 probe_delete。";
+  "⚠️ 會在 SAP 上埋「探針」:程式跑到指定的那一行時自動記下變數值(或呼叫堆疊、SQL),不改程式、不改變數值。可以埋在 SAP 標準程式,用來確認問題出在標準程式還是呼叫端。" +
+  "有兩種模式(ABAP_MCP_PROBE_MODE,預設 auto:系統有 Dynamic Logpoints 就用 A,否則用 B)。" +
+  "模式 A(Dynamic Logpoints):在 SAP 設 logpoint(duration_minutes,預設 15、最長 1440 分鐘),只對 MCP 帳號自己的執行生效,程式不會被停住;" +
+  "給 trigger(run_unit_tests / run_class)時由工具代為執行並立即讀取、移除;不給 trigger(或 manual)就立即回傳,等使用者用「同一個帳號」執行後,用 probe_logs 讀取,最後 probe_delete 移除。" +
+  "模式 A 以「第一個 fields 變數的不同值」分組,每個不同的值算一筆(附執行次數);支援 kind=variables / stack / sql。" +
+  "模式 B(debugger 快照):probe_set 在監聽期間同步等待(預設 3 分鐘、最長 5 分鐘),必須指定 trigger;{manual:true} 表示使用者在逾時前自己執行(例如 VA01),此時請先告訴使用者要在幾分鐘內執行什麼,再呼叫本工具。" +
+  "參數可用單一探針(object_url + line + fields …)或完整 definition({probes:[…], trigger, timeout_seconds})。" +
+  "已知限制:模式 B 的 update task、背景 RFC、背景作業裡的程式碼不會停下來;模式 A 目前支援 class 與程式(report / include)。探針的值可能含業務資料,用完請 probe_delete。";
+
+/** 模式 A 一個 key 的紀錄 → 命中紀錄(每個不同的值算一筆,calls 是執行次數) */
+export function keyLogsToHits(logs: DlpKeyLog[]): ProbeHit[] {
+  return logs.map((l, i) => ({
+    n: i + 1,
+    at: l.lastCall,
+    calls: l.calls,
+    variables: l.fields.map((f) => ({ name: f.name, value: truncate(f.values.join(", "), MAX_VALUE_CHARS) })),
+  }));
+}
 
 export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppConfig, audit: AuditLogger, writes: SerialQueue, deps: ProbeToolDeps = {}): void {
   if (!cfg.safety.probes.enabled) return;
   const store = deps.store ?? new ProbeStore();
   const portFactory = deps.portFactory ?? (() => new AdtDebugPort(cfg));
   const engineDeps = deps.engineDeps ?? realDeps;
+
+  /** ABAP_MCP_PROBE_MODE:debugger = 模式 B;dlp = 模式 A(系統沒有端點就報錯);auto = 有 dlp 端點用 A,否則 B */
+  const resolveMode = async (): Promise<"dlp" | "debugger"> => {
+    const m = cfg.safety.probes.mode;
+    if (m === "debugger") return "debugger";
+    const avail = await adt.dlpAvailable();
+    if (m === "dlp" && !avail) throw new GuardViolationError("ABAP_MCP_PROBE_MODE=dlp,但這個系統沒有 /sap/bc/adt/dlp 端點(Dynamic Logpoints)。請改用 auto 或 debugger。");
+    return avail ? "dlp" : "debugger";
+  };
+
+  /** 建立時回傳解碼後的 id,清單回傳編碼過的 URL:統一成解碼後的 id 才能去重 */
+  const dlpKey = (id: string): string => {
+    const raw = id.replace(/^\/sap\/bc\/adt\/dlp\/logpoints\//, "");
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
+  };
+
+  const deleteLogpoints = async (ids: string[]): Promise<string[]> => {
+    const errs: string[] = [];
+    for (const id of [...new Map(ids.map((i) => [dlpKey(i), i])).values()]) {
+      try {
+        await adt.dlpDelete(id);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!/does not exist|not found|404/i.test(msg)) errs.push(`${id}:${msg}`); // 已逾期或被刪掉 = 目的已達成
+      }
+    }
+    return errs;
+  };
+
+  /** 從 SAP 重讀模式 A 這次執行的紀錄(probe_logs 用);失敗只記進 notes,保留舊資料 */
+  const refreshDlp = async (r: ProbeRunRecord): Promise<void> => {
+    for (const p of r.probes) {
+      if (!p.dlpId) continue;
+      try {
+        p.hits = keyLogsToHits(await adt.dlpRead(p.dlpId, p.maxHits));
+        p.full = p.hits.length >= p.maxHits;
+      } catch (e) {
+        r.notes.push(`重讀 ${p.id} 失敗(logpoint 可能已逾期或被刪除):${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  };
 
   server.registerTool(
     "probe_list",
@@ -273,7 +340,7 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
       if (runs.length === 0) return ok("目前沒有探針紀錄。");
       return ok(
         runs
-          .map((r) => `- ${r.id}(${r.createdAt},模式 B,${STATUS_TEXT[r.status]}):` + r.probes.map((p) => `${p.id} ${p.location} 命中 ${p.hits.length}/${p.maxHits}`).join(";"))
+          .map((r) => `- ${r.id}(${r.createdAt},模式 ${r.mode === "dlp" ? "A" : "B"},${STATUS_TEXT[r.status]}):` + r.probes.map((p) => `${p.id} ${p.location} 命中 ${p.hits.length}/${p.maxHits}`).join(";"))
           .join("\n")
       );
     }
@@ -292,6 +359,7 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
     async ({ run_id, probe_id }) => {
       const r = store.get(run_id);
       if (!r) return fail(new GuardViolationError(`找不到探針執行 ${run_id}(可用 probe_list 查看)。`));
+      if (r.mode === "dlp" && r.status === "active") await refreshDlp(r);
       return ok(formatLogs(r, probe_id));
     }
   );
@@ -307,13 +375,13 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
         object_url: z.string().optional().describe("單一探針:物件 URI"),
         include: z.string().optional().describe("單一探針:class 的 include,預設 main"),
         line: z.number().int().positive().optional().describe("單一探針:行號"),
-        kind: z.enum(["variables", "stack", "sql"]).optional().describe("單一探針:variables(預設)/ stack / sql(模式 B 不支援)"),
+        kind: z.enum(["variables", "stack", "sql"]).optional().describe("單一探針:variables(預設)/ stack / sql(只有模式 A 支援)"),
         fields: z.array(z.string()).optional().describe("單一探針:要記錄的變數"),
         condition: z.string().optional().describe("單一探針:條件"),
         max_hits: z.number().int().positive().optional().describe("單一探針:最多記錄幾次"),
-        trigger: triggerSchema.optional().describe("觸發執行的方式(模式 B 必填)"),
+        trigger: triggerSchema.optional().describe("觸發執行的方式(模式 B 必填;模式 A 省略或 manual 表示 logpoint 開著等人執行)"),
         timeout_seconds: z.number().int().positive().optional().describe(`監聽逾時秒數(預設 ${DEFAULT_TIMEOUT_SEC},上限 ${MAX_TIMEOUT_SEC})`),
-        duration_minutes: z.number().int().positive().optional().describe("只有模式 A(Dynamic Logpoints)用:探針有效分鐘數;模式 B 忽略"),
+        duration_minutes: z.number().int().positive().optional().describe("只有模式 A(Dynamic Logpoints)用:探針有效分鐘數(預設 15,最長 1440);模式 B 忽略"),
         definition: z
           .object({ probes: z.array(probeSchema).min(1), trigger: triggerSchema.optional(), timeout_seconds: z.number().int().positive().optional() })
           .optional()
@@ -336,9 +404,12 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
           }
           const maxProbes = cfg.safety.probes.maxProbes;
           if (probeInputs.length > maxProbes) throw new GuardViolationError(`一次最多 ${maxProbes} 個探針(ABAP_MCP_MAX_PROBES),這次給了 ${probeInputs.length} 個。`);
-          const probes = probeInputs.map((p, i) => normalizeProbe(p, i));
+          const mode = await resolveMode();
+          const probes = probeInputs.map((p, i) => normalizeProbe(p, i, mode === "dlp"));
           firstUrl = probes[0].baseUrl;
-          const trigger = normalizeTrigger(args.definition ? args.definition.trigger ?? args.trigger : args.trigger);
+          const rawTrigger = args.definition ? args.definition.trigger ?? args.trigger : args.trigger;
+          // 模式 A 的 logpoint 可以一直開著等人去執行,所以 trigger 可省略(等同 manual);模式 B 一定要有
+          const trigger = mode === "dlp" && !rawTrigger ? ({ kind: "manual" } as const) : normalizeTrigger(rawTrigger);
           const timeoutSeconds = args.definition?.timeout_seconds ?? args.timeout_seconds ?? DEFAULT_TIMEOUT_SEC;
           if (!(timeoutSeconds >= MIN_TIMEOUT_SEC && timeoutSeconds <= MAX_TIMEOUT_SEC)) {
             throw new GuardViolationError(`timeout_seconds 必須是 ${MIN_TIMEOUT_SEC}–${MAX_TIMEOUT_SEC} 秒。`);
@@ -361,14 +432,103 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
             triggerText = `run_class ${trigger.className}`;
             run = async () => `輸出 ${(await adt.runClass(trigger.className)).length} 字元`;
           } else {
-            triggerText = `手動(使用者在 ${timeoutSeconds} 秒內用帳號 ${adt.username()} 執行)`;
+            triggerText = mode === "dlp" ? `手動(用帳號 ${adt.username()} 執行)` : `手動(使用者在 ${timeoutSeconds} 秒內用帳號 ${adt.username()} 執行)`;
+          }
+
+          if (mode === "dlp") {
+            // ───── 模式 A:Dynamic Logpoints ─────
+            const minutes = args.duration_minutes ?? DEFAULT_DLP_MINUTES;
+            if (!(minutes >= 1 && minutes <= MAX_DLP_MINUTES)) throw new GuardViolationError(`duration_minutes 必須是 1–${MAX_DLP_MINUTES}(預設 ${DEFAULT_DLP_MINUTES})。`);
+            const mine = (await adt.dlpList()).filter((e) => e.description.startsWith(DLP_TAG));
+            if (mine.length + probes.length > maxProbes) {
+              throw new GuardViolationError(`本帳號已有 ${mine.length} 個由 MCP 建立的 logpoint,再加 ${probes.length} 個會超過上限 ${maxProbes}(ABAP_MCP_MAX_PROBES)。先用 probe_delete 清掉舊的。`);
+            }
+            const states = probes.map((p) => ({ p, dlpId: undefined as string | undefined, error: undefined as string | undefined }));
+            const notes: string[] = [];
+            let triggerOutcome: string | undefined;
+            let status: ProbeRunRecord["status"] = "active";
+            let hitsBy: ProbeHit[][] = probes.map(() => []);
+            try {
+              for (const st of states) {
+                try {
+                  st.dlpId = await adt.dlpCreate({
+                    sourceUrl: st.p.sourceUrl,
+                    line: st.p.line,
+                    kind: st.p.kind,
+                    fields: st.p.fields,
+                    condition: st.p.condition,
+                    description: DLP_TAG,
+                    minutes,
+                  });
+                } catch (e) {
+                  st.error = e instanceof Error ? e.message : String(e);
+                }
+              }
+              if (states.every((st) => !st.dlpId)) status = "error";
+              else if (run) {
+                // 有 trigger:執行 → 讀取 → 移除(finally),不留 logpoint
+                try {
+                  triggerOutcome = await run();
+                  status = "completed";
+                } catch (e) {
+                  triggerOutcome = e instanceof Error ? e.message : String(e);
+                  status = "trigger_failed";
+                }
+                hitsBy = [];
+                for (const st of states) hitsBy.push(st.dlpId ? keyLogsToHits(await adt.dlpRead(st.dlpId, st.p.maxHits)) : []);
+                notes.push("模式 A 以「第一個變數的不同值」分組:每個不同的值算一筆,「共執行 N 次」是該值出現的次數。");
+              } else {
+                notes.push("模式 A 以「第一個變數的不同值」分組:每個不同的值算一筆。");
+              }
+            } finally {
+              if (run || status === "error") {
+                const errs = await deleteLogpoints(states.filter((st) => st.dlpId).map((st) => st.dlpId!));
+                for (const e of errs) notes.push(`⚠️ 移除 logpoint 失敗,請用 probe_delete 或 Eclipse 清除:${e}`);
+                for (const st of states) if (!errs.some((x) => st.dlpId && x.startsWith(st.dlpId))) st.dlpId = undefined;
+              }
+            }
+            if (!run && status === "active") notes.push(`logpoint 在 SAP 上啟用到 ${new Date(Date.now() + minutes * 60_000).toISOString()} 為止(只對 ${adt.username()} 的執行生效)。`);
+            const rec = store.add({
+              mode: "dlp",
+              createdAt: startedAt,
+              status,
+              activeUntil: !run && status === "active" ? new Date(Date.now() + minutes * 60_000).toISOString() : undefined,
+              trigger: triggerText,
+              triggerOutcome,
+              timeoutSeconds: 0,
+              probes: states.map((st, i) => ({
+                id: st.p.id,
+                location: locationOf(st.p),
+                kind: st.p.kind,
+                fields: st.p.fields,
+                condition: st.p.condition,
+                maxHits: st.p.maxHits,
+                hits: hitsBy[i] ?? [],
+                full: (hitsBy[i]?.length ?? 0) >= st.p.maxHits,
+                error: st.error,
+                dlpId: st.dlpId,
+              })),
+              notes,
+            });
+            const total = rec.probes.reduce((a, p) => a + p.hits.length, 0);
+            audit.log({
+              timestamp: new Date().toISOString(),
+              action: "probe_set",
+              objectUrl: firstUrl,
+              objectName: objectNameFromUrl(firstUrl),
+              summary: `模式 A ${rec.id}:${probes.length} 個 logpoint、${run ? `觸發 ${triggerText}、` : ""}${STATUS_TEXT[status]}、共 ${total} 筆`,
+              success: status !== "error",
+              error: status === "error" ? states.map((st) => st.error).filter(Boolean).join(";") : undefined,
+            });
+            const text = formatRunSummary(rec);
+            return status === "error" || status === "trigger_failed" ? { content: [{ type: "text" as const, text }], isError: true } : ok(text);
           }
 
           // 3. 執行(同時只有一個監聽:經寫入佇列)
           const result = await runDebuggerProbes(
             portFactory(),
             {
-              probes: probes.map<ProbeSpec>((p) => ({ id: p.id, objectUrl: p.sourceUrl, line: p.line, kind: p.kind, variables: p.fields, condition: p.condition, maxHits: p.maxHits })),
+              probes: probes.map<ProbeSpec>((p) => ({ id: p.id, objectUrl: p.sourceUrl, line: p.line, kind: p.kind as "variables" | "stack", variables: p.fields, condition: p.condition, maxHits: p.maxHits })),
               timeoutSeconds,
               trigger: run,
             },
@@ -426,7 +586,7 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
       title: "清除探針紀錄",
       description:
         "清除探針執行紀錄(含收集到的值)。run_id 指定一次執行,或 all=true 清掉本次 MCP 建立的全部。" +
-        "debugger 快照模式在 probe_set 結束時就已移除中斷點、關閉監聽,這裡只清記憶體裡的紀錄(避免業務資料留著)。",
+        "debugger 快照模式在 probe_set 結束時就已移除中斷點、關閉監聽,這裡只清記憶體裡的紀錄(避免業務資料留著);Dynamic Logpoints 模式還會移除 SAP 上的 logpoint(all=true 也清掉先前留下、帶 abap-adt-mcp 標記的)。",
       inputSchema: {
         run_id: z.string().optional().describe("要清除的執行編號,例如 run-1"),
         all: z.boolean().optional().describe("true = 清除全部"),
@@ -436,16 +596,27 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
       writes.run(async () => {
         try {
           if (!!run_id === !!all) throw new GuardViolationError("run_id 與 all 必須擇一提供。");
+          // 模式 A:先移除 SAP 上的 logpoint(all 時連同先前 MCP process 留下、描述有 abap-adt-mcp 標記的)
+          const errs: string[] = [];
+          let removed = 0;
+          const dlpRuns = (all ? store.list() : [store.get(run_id!)]).filter((r): r is ProbeRunRecord => !!r && r.mode === "dlp");
+          const ids = dlpRuns.flatMap((r) => r.probes.map((p) => p.dlpId).filter((x): x is string => !!x));
+          if (all && (await adt.dlpAvailable().catch(() => false))) {
+            for (const e of await adt.dlpList()) if (e.description.startsWith(DLP_TAG) && !ids.some((i) => dlpKey(i) === dlpKey(e.location))) ids.push(e.location);
+          }
+          errs.push(...(await deleteLogpoints(ids)));
+          removed = new Set(ids.map(dlpKey)).size - errs.length;
+          if (errs.length) throw new GuardViolationError(`移除 logpoint 失敗(紀錄保留,可重試):${errs.join(";")}`);
           const n = all ? store.clear() : store.delete(run_id!) ? 1 : 0;
           audit.log({
             timestamp: new Date().toISOString(),
             action: "probe_delete",
             objectUrl: "",
             objectName: all ? "(全部)" : run_id!,
-            summary: `清除 ${n} 筆探針執行紀錄`,
+            summary: `清除 ${n} 筆探針執行紀錄${removed ? `、移除 ${removed} 個 logpoint` : ""}`,
             success: true,
           });
-          return ok(n === 0 ? `沒有符合的探針紀錄(${run_id ?? "全部"})。` : `✅ 已清除 ${n} 筆探針執行紀錄。`);
+          return ok(n === 0 ? `沒有符合的探針紀錄(${run_id ?? "全部"})。` : `✅ 已清除 ${n} 筆探針執行紀錄${removed ? `,並移除 SAP 上 ${removed} 個 logpoint` : ""}。`);
         } catch (e) {
           return fail(e);
         }

@@ -138,6 +138,35 @@ export interface NewObjectSpec {
 }
 
 /** MCP 工具層所依賴的 ADT 操作介面(僅暴露 MVP 需要的方法) */
+/** Dynamic Logpoints:清單項目 */
+export interface DlpEntry {
+  location: string;
+  description: string;
+  sourceUri: string;
+  executions: number;
+  activeUntil: string;
+  state: string;
+}
+
+export interface DlpCreateInput {
+  /** 要埋探針的 source URI(class:/oo/classes/x/source/main 或 includes/…;程式:/programs/programs/x/source/main) */
+  sourceUrl: string;
+  line: number;
+  kind: "variables" | "stack" | "sql";
+  fields: string[];
+  condition?: string;
+  description: string;
+  minutes: number;
+}
+
+/** 一個 key(第一個變數的不同值)的紀錄 */
+export interface DlpKeyLog {
+  key: string;
+  calls: number;
+  lastCall: string;
+  fields: { name: string; values: string[] }[];
+}
+
 export interface AdtService {
   login(): Promise<void>;
   /** 登出所有 ADT client、釋放 SAP 端的 HTTP session(MCP server 結束時呼叫;可重複呼叫) */
@@ -242,6 +271,15 @@ export interface AdtService {
   runQuery(sql: string, rows: number): Promise<QueryResult>;
   /** 建立 workbench transport request,回傳 TR 編號;refUrl 為相關物件(或 package)的 URI */
   createTransport(refUrl: string, description: string, packageName: string): Promise<string>;
+  /** Dynamic Logpoints(v0.6 探針模式 A):這個系統有沒有 /sap/bc/adt/dlp 端點(結果快取) */
+  dlpAvailable(): Promise<boolean>;
+  /** 目前登入帳號的 logpoint 清單 */
+  dlpList(): Promise<DlpEntry[]>;
+  /** 建立並啟用一個 logpoint,回傳 SAP 的 logpoint 位置 id */
+  dlpCreate(input: DlpCreateInput): Promise<string>;
+  dlpDelete(location: string): Promise<void>;
+  /** 先把記憶體裡的 log 轉進資料庫,再讀最多 maxKeys 個不同 key 的紀錄 */
+  dlpRead(location: string, maxKeys: number): Promise<DlpKeyLog[]>;
   /** 取得目前登入的使用者帳號 */
   username(): string;
   /** 取得系統 base URL(供診斷訊息使用) */
@@ -413,6 +451,98 @@ export class RealAdtService implements AdtService {
     const url = this.u(objectUrl);
     const response = await this.guard(() => this.client.httpClient.request(url));
     return packageFromObjectXml(String(response.body ?? ""));
+  }
+
+  // ───── Dynamic Logpoints(探針模式 A)─────
+  private dlpAvail?: boolean;
+
+  async dlpAvailable(): Promise<boolean> {
+    if (this.dlpAvail !== undefined) return this.dlpAvail;
+    const d = await this.guard(() => this.client.adtDiscovery());
+    this.dlpAvail = JSON.stringify(d).includes("/sap/bc/adt/dlp/logpoints");
+    return this.dlpAvail;
+  }
+
+  async dlpList(): Promise<DlpEntry[]> {
+    const list = await this.guard(() => this.client.logpoints(this.cfg.sap.user));
+    return list.map((l) => ({
+      location: l.links.find((x) => x.rel === "self")?.href ?? "",
+      description: l.definition.description ?? "",
+      sourceUri: l.location.includePosition.uri,
+      executions: Number(l.summary.executions ?? 0),
+      activeUntil: l.activation.activeUntil,
+      state: l.activation.state,
+    }));
+  }
+
+  async dlpCreate(i: DlpCreateInput): Promise<string> {
+    const src = this.u(i.sourceUrl);
+    const m = /^\/sap\/bc\/adt\/oo\/classes\/([^/]+)/.exec(src);
+    let includePosition: { uri: string; type: string; name: string; parentUri?: string };
+    let mainProgram: { uri: string; type: string; name: string };
+    const at = `${src}#start=${i.line},0`;
+    if (m) {
+      const name = decodeURIComponent(m[1]).toUpperCase();
+      const pool = `${name.padEnd(30, "=")}CP`;
+      includePosition = { uri: at, type: "CLAS/I", name, parentUri: `/sap/bc/adt/oo/classes/${m[1]}` };
+      mainProgram = { uri: `/sap/bc/adt/programs/programs/${pool.toLowerCase()}`, type: "PROG/P", name: pool };
+    } else {
+      const p = /^\/sap\/bc\/adt\/programs\/(programs|includes)\/([^/]+)/.exec(src);
+      if (!p) throw new Error("Dynamic Logpoints 目前只支援 class 與程式(report / include);其他物件類型請用 debugger 快照模式(ABAP_MCP_PROBE_MODE=debugger)。");
+      const name = decodeURIComponent(p[2]).toUpperCase();
+      includePosition = { uri: at, type: p[1] === "programs" ? "PROG/P" : "PROG/I", name };
+      if (p[1] === "programs") mainProgram = { uri: `/sap/bc/adt/programs/programs/${p[2]}`, type: "PROG/P", name };
+      else {
+        const mains = await this.guard(() => this.client.mainPrograms(src));
+        const first = mains[0];
+        if (!first) throw new Error(`找不到 include ${name} 的主程式,無法設定 logpoint。`);
+        mainProgram = { uri: first["adtcore:uri"], type: first["adtcore:type"], name: first["adtcore:name"] };
+      }
+    }
+    const common = { description: i.description, condition: i.condition };
+    const definition = this.client.createLogPointDefinition(
+      i.kind === "stack"
+        ? { type: "StackTrace", ...common }
+        : i.kind === "sql"
+          ? { type: "SqlTrace", stack: "Off", ...common }
+          : { type: "UserDefined", subKey: i.fields[0], fields: i.fields.join(" "), ...common }
+    );
+    const id = await this.guard(() =>
+      this.client.createLogpoint({
+        location: { includePosition, mainProgram },
+        definition,
+        activation: {
+          state: "A",
+          activatedBy: this.cfg.sap.user,
+          activeSince: new Date().toISOString(),
+          activeUntil: new Date(Date.now() + i.minutes * 60_000).toISOString(),
+          users: [this.cfg.sap.user],
+        },
+      })
+    );
+    if (!id) throw new Error("SAP 沒有回傳 logpoint 位置。");
+    return id;
+  }
+
+  async dlpDelete(location: string): Promise<void> {
+    await this.guard(() => this.client.deleteLogpoint(location));
+  }
+
+  async dlpRead(location: string, maxKeys: number): Promise<DlpKeyLog[]> {
+    // 命中紀錄先在 SAP 的共用記憶體,讀取前要轉進資料庫(Eclipse 的 Refresh 做的同一件事)
+    await this.guard(() => this.client.getLogServers()).catch(() => undefined);
+    const keys = await this.guard(() => this.client.getLogKeys(location, maxKeys));
+    const out: DlpKeyLog[] = [];
+    for (const k of keys.slice(0, maxKeys)) {
+      const logs = await this.guard(() => this.client.getLogPointLogs(location, k));
+      out.push({
+        key: String(k.value),
+        calls: Number(k.calls ?? 0),
+        lastCall: k.lastCall,
+        fields: logs.fields.map((f) => ({ name: f.name, values: f.values.map((v) => String(v.value)) })),
+      });
+    }
+    return out;
   }
 
   async getObjectSource(sourceUrl: string) {
