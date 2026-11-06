@@ -2091,6 +2091,20 @@ describe("S1 AdtService 層:任何 request 之前就拒絕", () => {
     }
   });
 
+  it("C0-4:dumpDetail 與 DDIC 屬性方法也在送出前拒絕(含編碼的路徑穿越)", async () => {
+    const fake = fakeAdtClient({ getDataElementProperties: vi.fn(), getDomainProperties: vi.fn() });
+    const adt = realAdt(fake);
+    await expect(adt.dumpDetail("/sap/bc/adt/runtime/dump/%2e%2e/%2e%2e/oo/classes/zx")).rejects.toThrow(GuardViolationError);
+    await expect(adt.dumpDetail("/sap/bc/adt/runtime/dump/a%2f%2e%2e%2fb")).rejects.toThrow(GuardViolationError);
+    for (const bad of ["https://outside.example.invalid/x", "/sap/bc/adt/ddic/dataelements/%2e%2e/x", "//outside.example.invalid/x"]) {
+      await expect(adt.dataElementProperties(bad)).rejects.toThrow(GuardViolationError);
+      await expect(adt.domainProperties(bad)).rejects.toThrow(GuardViolationError);
+    }
+    expect(fake.httpClient.request).not.toHaveBeenCalled();
+    expect(fake.getDataElementProperties).not.toHaveBeenCalled();
+    expect(fake.getDomainProperties).not.toHaveBeenCalled();
+  });
+
   it("正常同系統 ADT URI 可通過並取得 package", async () => {
     const fake = fakeAdtClient();
     fake.httpClient.request.mockResolvedValueOnce({ status: 200, body: '<x><adtcore:packageRef adtcore:name="$TMP"/></x>' } as never);

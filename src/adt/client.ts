@@ -828,7 +828,8 @@ export class RealAdtService implements AdtService {
   }
 
   async dumpDetail(dumpId: string) {
-    const id = normalizeDumpId(dumpId);
+    // normalizeDumpId 只管格式;URI 安全(編碼的 ..、//)統一再過 assertAdtUri
+    const id = this.u(normalizeDumpId(dumpId));
     const xml = await this.guard(() =>
       this.client.httpClient.request(id, { headers: { Accept: "application/vnd.sap.adt.runtime.dump.v1+xml" } })
     );
@@ -845,11 +846,13 @@ export class RealAdtService implements AdtService {
     return this.guard(() => this.client.ddicElement(name));
   }
 
-  async dataElementProperties(url: string) {
+  async dataElementProperties(rawUrl: string) {
+    const url = this.u(rawUrl);
     return this.guard(() => this.client.getDataElementProperties(url)) as Promise<DdicTypeProperties>;
   }
 
-  async domainProperties(url: string) {
+  async domainProperties(rawUrl: string) {
+    const url = this.u(rawUrl);
     return this.guard(() => this.client.getDomainProperties(url)) as Promise<DdicTypeProperties>;
   }
 
