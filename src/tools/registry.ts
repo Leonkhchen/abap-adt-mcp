@@ -18,6 +18,7 @@ import { SerialQueue } from "../safety/serialQueue.js";
 import { registerAnalysisTools, registerWriteDevTools } from "./devTools.js";
 import { registerDiagnosticTools } from "./diagTools.js";
 import { registerRapTools } from "./rapTools.js";
+import { registerProbeTools } from "./probeTools.js";
 import { registerGuidance } from "./guidance.js";
 import { baseObjectUrl as baseOf, isSourceUrl, isTestClassesInclude } from "../adt/objectTypes.js";
 import { VERSION } from "../version.js";
@@ -285,6 +286,9 @@ export function registerTools(
 
   // v0.5 MCP prompts 與 resources(唯讀模式也提供,見 tools/guidance.ts)
   registerGuidance(server, cfg);
+
+  // v0.6 除錯探針(預設關閉;prod 不註冊;唯讀模式只有 probe_list / probe_logs,見 tools/probeTools.ts)
+  registerProbeTools(server, adt, cfg, audit, writes);
 
   // ───────────────────────────── 寫入(唯讀模式下不註冊)─────────────────────────────
   if (cfg.safety.readonly) {

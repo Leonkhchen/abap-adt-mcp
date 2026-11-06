@@ -1,0 +1,561 @@
+/**
+ * v0.6 探針模式 B(Debugger 快照)的單元測試:不連 SAP,用假的 DebugPort 與假的 AdtService。
+ */
+import { describe, it, expect, vi } from "vitest";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { loadConfig } from "../../src/config.js";
+import { AuditLogger } from "../../src/safety/audit.js";
+import { SerialQueue } from "../../src/safety/serialQueue.js";
+import { assertProbeAllowed } from "../../src/safety/probeGuards.js";
+import { GuardViolationError } from "../../src/safety/guards.js";
+import { registerTools } from "../../src/tools/registry.js";
+import {
+  PROBE_LOGS_MAX_CHARS,
+  ProbeStore,
+  formatLogs,
+  normalizeProbe,
+  normalizeTrigger,
+  probeSourceUrl,
+  registerProbeTools,
+  type ProbeRunRecord,
+} from "../../src/tools/probeTools.js";
+import { xmlAttr } from "../../src/adt/debugPort.js";
+import {
+  ZERO_HIT_NOTE,
+  runDebuggerProbes,
+  type BreakpointRequest,
+  type BreakpointResult,
+  type DebugPort,
+  type EngineDeps,
+  type ProbeSpec,
+} from "../../src/adt/probeB.js";
+import type { AdtService } from "../../src/adt/client.js";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
+const BASE_ENV = { SAP_URL: "https://sap.example.invalid:44300", SAP_USER: "DEVELOPER", SAP_PASSWORD: "x", SAP_CLIENT: "001" };
+const cfgOf = (extra: Record<string, string> = {}) => loadConfig({ ...BASE_ENV, ...extra } as NodeJS.ProcessEnv);
+
+const URL_MAIN = "/sap/bc/adt/oo/classes/zcl_inv_posting/source/main";
+const spec = (o: Partial<ProbeSpec> = {}): ProbeSpec => ({ id: "p1", objectUrl: URL_MAIN, line: 173, kind: "variables", variables: ["iv_qty"], maxHits: 2, ...o });
+
+/** 假 engine deps:時間由測試控制,sleep 立即完成但推進假時鐘 */
+function fakeClock(startMs = 1_000_000, opts: { timesOut?: boolean } = {}) {
+  let t = startMs;
+  const deps: EngineDeps = {
+    now: () => t,
+    // 暖機 / 寬限 / 清除時的短暫等待:立即完成,但推進假時鐘
+    sleep: (ms) => {
+      t += ms;
+      return Promise.resolve();
+    },
+    // 總逾時計時器:timesOut=true 時立刻逾時;否則永不逾時(測試靠事件結束)
+    timer: (ms) => {
+      if (!opts.timesOut) return new Promise<void>(() => {});
+      t += ms;
+      return Promise.resolve();
+    },
+    warmupMs: 10,
+  };
+  return { deps, advance: (ms: number) => (t += ms), get time() { return t; } };
+}
+
+/**
+ * 假 DebugPort:`stops` 是依序出現的「停駐」,每個停駐是一串連續停下的中斷點(同一次執行,continue 後又碰到下一個)。
+ * listen() 每次回傳下一個停駐;沒有了就一直等(直到 cancelListen)。
+ */
+function fakePort(o: { stops?: string[][]; bpErrors?: Record<string, string>; variablesFor?: (names: string[]) => { name: string; value: string }[]; failContinue?: boolean; listenError?: string } = {}) {
+  const calls: string[] = [];
+  const stops = [...(o.stops ?? [])];
+  let resolveListen: ((v: { debuggeeId: string } | undefined) => void) | undefined;
+  let current: string[] = [];
+  let attachedNow = false;
+  const bpIds = new Map<string, string>(); // clientId → bp id
+  const port: DebugPort & { calls: string[]; deleted: string[]; attachedNow: () => boolean } = {
+    calls,
+    deleted: [],
+    attachedNow: () => attachedNow,
+    async setBreakpoints(reqs: BreakpointRequest[]): Promise<BreakpointResult[]> {
+      calls.push("setBreakpoints");
+      return reqs.map((r) => {
+        if (o.bpErrors?.[r.clientId]) return { clientId: r.clientId, error: o.bpErrors[r.clientId] };
+        const id = `BP-${r.clientId}`;
+        bpIds.set(r.clientId, id);
+        return { clientId: r.clientId, id };
+      });
+    },
+    async deleteBreakpoint(id) {
+      calls.push(`deleteBreakpoint:${id}`);
+      port.deleted.push(id);
+    },
+    listen() {
+      calls.push("listen");
+      if (o.listenError) return Promise.reject(new Error(o.listenError));
+      const next = stops.shift();
+      if (next) {
+        current = [...next];
+        return Promise.resolve({ debuggeeId: `DBG-${calls.length}` });
+      }
+      return new Promise((resolve) => {
+        resolveListen = resolve;
+      });
+    },
+    async cancelListen() {
+      calls.push("cancelListen");
+      resolveListen?.(undefined);
+    },
+    async attach() {
+      calls.push("attach");
+      attachedNow = true;
+      return { reachedBreakpointIds: current.length ? [current[0]] : [] };
+    },
+    async stack() {
+      return [{ program: "ZCL_INV_POSTING=====CP", include: "ZCL_INV_POSTING=====CM00A", line: 173, event: "METHOD CALC_ISSUE_AMT" }];
+    },
+    async variables(names) {
+      calls.push(`variables:${names.join(",")}`);
+      return (o.variablesFor ?? ((ns) => ns.map((name) => ({ name, value: "42" }))))(names);
+    },
+    async continue() {
+      calls.push("continue");
+      if (o.failContinue) throw new Error("continue boom");
+      current.shift();
+      if (current.length) return { reachedBreakpointIds: [current[0]], ended: false };
+      attachedNow = false;
+      return { reachedBreakpointIds: [], ended: true };
+    },
+    async terminate() {
+      calls.push("terminate");
+      attachedNow = false;
+    },
+    async close() {
+      calls.push("close");
+    },
+  };
+  return port;
+}
+
+describe("probeB 引擎", () => {
+  it("命中 → 讀值 → 自動繼續;觸發跑完就結束;一定 close", async () => {
+    const port = fakePort({ stops: [["BP-p1"]] });
+    const clock = fakeClock();
+    const r = await runDebuggerProbes(port, { probes: [spec()], timeoutSeconds: 60, trigger: async () => "✅ ABAP Unit:36 個測試方法,36 通過,0 失敗" }, clock.deps);
+    expect(r.status).toBe("completed");
+    expect(r.probes[0].hits).toHaveLength(1);
+    expect(r.probes[0].hits[0].variables).toEqual([{ name: "iv_qty", value: "42" }]);
+    expect(r.triggerOutcome).toContain("36 通過");
+    expect(port.calls).toContain("attach");
+    expect(port.calls).toContain("continue");
+    expect(port.calls[port.calls.length - 1]).toBe("close");
+    expect(port.attachedNow()).toBe(false);
+  });
+
+  it("max_hits 收滿 → 刪掉自己的中斷點、之後不再為它停;全部收滿就結束", async () => {
+    // 同一次執行連續停 3 次;max_hits=2 → 第 2 次後刪中斷點,第 3 次不記錄
+    const port = fakePort({ stops: [["BP-p1", "BP-p1", "BP-p1"]] });
+    const r = await runDebuggerProbes(port, { probes: [spec({ maxHits: 2 })], timeoutSeconds: 60, trigger: () => new Promise(() => {}) }, fakeClock().deps);
+    expect(r.status).toBe("all_full");
+    expect(r.probes[0].hits).toHaveLength(2);
+    expect(r.probes[0].full).toBe(true);
+    expect(port.deleted).toEqual(["BP-p1"]); // 只刪一次,不重複
+  });
+
+  it("多個探針:各自計數、各自收滿", async () => {
+    const port = fakePort({ stops: [["BP-p1", "BP-p2", "BP-p1"]] });
+    const r = await runDebuggerProbes(
+      port,
+      { probes: [spec({ id: "p1", maxHits: 2 }), spec({ id: "p2", line: 180, maxHits: 1, variables: ["lv_amt"] })], timeoutSeconds: 60, trigger: () => new Promise(() => {}) },
+      fakeClock().deps
+    );
+    expect(r.status).toBe("all_full");
+    expect(r.probes.map((p) => p.hits.length)).toEqual([2, 1]);
+    expect(r.probes[1].hits[0].variables?.[0].name).toBe("lv_amt");
+  });
+
+  it("kind=stack 記錄堆疊、不讀變數", async () => {
+    const port = fakePort({ stops: [["BP-p1"]] });
+    const r = await runDebuggerProbes(port, { probes: [spec({ kind: "stack", variables: [] })], timeoutSeconds: 60, trigger: async () => "ok" }, fakeClock().deps);
+    expect(r.probes[0].hits[0].stack?.[0].line).toBe(173);
+    expect(r.probes[0].hits[0].variables).toBeUndefined();
+    expect(port.calls.some((c) => c.startsWith("variables:"))).toBe(false);
+  });
+
+  it("沒有命中:觸發跑完 → completed,附上「命中 0 次」的提醒(update task / 背景)", async () => {
+    const port = fakePort({ stops: [] });
+    const r = await runDebuggerProbes(port, { probes: [spec()], timeoutSeconds: 60, trigger: async () => "✅" }, fakeClock().deps);
+    expect(r.status).toBe("completed");
+    expect(r.probes[0].hits).toHaveLength(0);
+    expect(r.notes).toContain(ZERO_HIT_NOTE);
+    expect(r.notes.join("")).toContain("update task");
+    expect(port.deleted).toEqual(["BP-p1"]); // 沒收滿的中斷點在 finally 刪除
+    expect(port.calls).toContain("cancelListen");
+    expect(port.calls[port.calls.length - 1]).toBe("close");
+  });
+
+  it("逾時(觸發的程式沒有經過中斷點、一直不結束)→ timeout,清理乾淨:刪中斷點、關閉監聽、close", async () => {
+    const port = fakePort({ stops: [] });
+    const r = await runDebuggerProbes(port, { probes: [spec()], timeoutSeconds: 30, trigger: () => new Promise(() => {}) }, fakeClock(1_000_000, { timesOut: true }).deps);
+    expect(r.status).toBe("timeout");
+    expect(port.deleted).toEqual(["BP-p1"]);
+    expect(port.calls).toContain("cancelListen");
+    expect(port.calls[port.calls.length - 1]).toBe("close");
+    expect(r.notes.join("")).toContain("仍未結束");
+  });
+
+  it("手動觸發(沒有 trigger):等到逾時,清理乾淨", async () => {
+    const port = fakePort({ stops: [] });
+    const r = await runDebuggerProbes(port, { probes: [spec()], timeoutSeconds: 30 }, fakeClock(1_000_000, { timesOut: true }).deps);
+    expect(r.status).toBe("timeout");
+    expect(r.triggerOutcome).toBeUndefined();
+    expect(port.calls[port.calls.length - 1]).toBe("close");
+  });
+
+  it("手動觸發:使用者執行後命中 → 記錄,收滿就結束", async () => {
+    const port = fakePort({ stops: [["BP-p1"]] });
+    const r = await runDebuggerProbes(port, { probes: [spec({ maxHits: 1 })], timeoutSeconds: 30 }, fakeClock().deps);
+    expect(r.status).toBe("all_full");
+    expect(r.probes[0].hits).toHaveLength(1);
+  });
+
+  it("觸發失敗(例如 run_class 出錯)→ trigger_failed,仍然清理", async () => {
+    const port = fakePort({ stops: [] });
+    const r = await runDebuggerProbes(port, { probes: [spec()], timeoutSeconds: 60, trigger: async () => { throw new Error("class dump"); } }, fakeClock().deps);
+    expect(r.status).toBe("trigger_failed");
+    expect(r.notes.join("")).toContain("class dump");
+    expect(port.deleted).toEqual(["BP-p1"]);
+    expect(port.calls[port.calls.length - 1]).toBe("close");
+  });
+
+  it("所有中斷點都設定失敗 → error,不監聽、不觸發,仍 close", async () => {
+    const port = fakePort({ bpErrors: { p1: "位置不存在" } });
+    const trigger = vi.fn(async () => "x");
+    const r = await runDebuggerProbes(port, { probes: [spec()], timeoutSeconds: 60, trigger }, fakeClock().deps);
+    expect(r.status).toBe("error");
+    expect(r.probes[0].error).toBe("位置不存在");
+    expect(trigger).not.toHaveBeenCalled();
+    expect(port.calls).not.toContain("listen");
+    expect(port.calls[port.calls.length - 1]).toBe("close");
+  });
+
+  it("部分中斷點失敗:其他探針照常運作", async () => {
+    const port = fakePort({ stops: [["BP-p2"]], bpErrors: { p1: "不可設中斷點" } });
+    const r = await runDebuggerProbes(port, { probes: [spec({ id: "p1" }), spec({ id: "p2", maxHits: 1 })], timeoutSeconds: 60, trigger: () => new Promise(() => {}) }, fakeClock().deps);
+    expect(r.probes[0].error).toBe("不可設中斷點");
+    expect(r.probes[1].hits).toHaveLength(1);
+    expect(r.status).toBe("all_full");
+  });
+
+  it("監聽衝突(例如 Eclipse 已在監聽)→ error 並說明,不觸發執行", async () => {
+    const port = fakePort({ listenError: "已有其他 debugger 在監聽" });
+    const trigger = vi.fn(async () => "x");
+    const r = await runDebuggerProbes(port, { probes: [spec()], timeoutSeconds: 60, trigger }, fakeClock().deps);
+    expect(r.status).toBe("error");
+    expect(r.notes.join("")).toContain("已有其他 debugger 在監聽");
+    expect(port.calls[port.calls.length - 1]).toBe("close");
+  });
+
+  it("繼續執行失敗 → 終止停住的程式(不讓它停在那裡),仍清理", async () => {
+    const port = fakePort({ stops: [["BP-p1"]], failContinue: true });
+    const r = await runDebuggerProbes(port, { probes: [spec()], timeoutSeconds: 60, trigger: () => new Promise(() => {}) }, fakeClock().deps);
+    expect(r.status).toBe("error");
+    expect(port.calls).toContain("terminate");
+    expect(port.attachedNow()).toBe(false);
+    expect(port.calls[port.calls.length - 1]).toBe("close");
+  });
+
+  it("變數讀取失敗 → 記成 note,不中斷整個流程", async () => {
+    const port = fakePort({ stops: [["BP-p1"]] });
+    port.variables = async () => { throw new Error("no access"); };
+    const r = await runDebuggerProbes(port, { probes: [spec()], timeoutSeconds: 60, trigger: async () => "ok" }, fakeClock().deps);
+    expect(r.probes[0].hits[0].variables?.[0].note).toContain("讀取失敗");
+    expect(r.status).toBe("completed");
+  });
+
+  it("SAP 沒回中斷點編號時,以最上層堆疊的行號對應探針", async () => {
+    const port = fakePort({ stops: [["x"]] });
+    port.attach = async () => ({ reachedBreakpointIds: [] });
+    const r = await runDebuggerProbes(port, { probes: [spec({ line: 173 })], timeoutSeconds: 60, trigger: async () => "ok" }, fakeClock().deps);
+    expect(r.probes[0].hits).toHaveLength(1);
+  });
+});
+
+describe("探針參數驗證", () => {
+  const ok = { object_url: "/sap/bc/adt/oo/classes/zcl_x", line: 10, fields: ["lv_a"] };
+  it("正常:class 預設 main;include=testclasses;source URI 原樣保留;程式用 source/main", () => {
+    expect(normalizeProbe(ok, 0)).toMatchObject({ id: "p1", sourceUrl: "/sap/bc/adt/oo/classes/zcl_x/source/main", baseUrl: "/sap/bc/adt/oo/classes/zcl_x", maxHits: 5, kind: "variables" });
+    expect(probeSourceUrl("/sap/bc/adt/oo/classes/zcl_x", "testclasses")).toBe("/sap/bc/adt/oo/classes/zcl_x/includes/testclasses");
+    expect(probeSourceUrl("/sap/bc/adt/oo/classes/zcl_x/includes/testclasses", "main")).toBe("/sap/bc/adt/oo/classes/zcl_x/includes/testclasses");
+    expect(probeSourceUrl("/sap/bc/adt/programs/programs/sapmv45a", "main")).toBe("/sap/bc/adt/programs/programs/sapmv45a/source/main");
+    expect(normalizeProbe({ ...ok, kind: "stack", fields: undefined }, 2).id).toBe("p3");
+  });
+  it.each([
+    ["行號 0", { ...ok, line: 0 }, /行號/],
+    ["行號太大", { ...ok, line: 2_000_000 }, /行號/],
+    ["variables 沒有 fields", { ...ok, fields: [] }, /需要 fields/],
+    ["fields 太多", { ...ok, fields: Array.from({ length: 11 }, (_, i) => `v${i}`) }, /最多記錄 10/],
+    ["變數名稱含引號", { ...ok, fields: ['a" injected="1'] }, /不合法/],
+    ["變數名稱含空白", { ...ok, fields: ["a b"] }, /不合法/],
+    ["kind=sql(模式 B 不支援)", { ...ok, kind: "sql" as const }, /只有 Dynamic Logpoints/],
+    ["max_hits 超過上限", { ...ok, max_hits: 51 }, /max_hits/],
+    ["condition 太長", { ...ok, condition: "x".repeat(201) }, /condition/],
+    ["URI 不是 ADT 路徑", { ...ok, object_url: "https://evil.example.invalid/x" }, /只接受 \/sap\/bc\/adt\//],
+    ["URI 路徑穿越", { ...ok, object_url: "/sap/bc/adt/oo/classes/%2e%2e/zx" }, /路徑穿越/],
+    ["include 含斜線", { ...ok, include: "../x" }, /include/],
+  ])("拒絕:%s", (_n, input, re) => {
+    expect(() => normalizeProbe(input as never, 0)).toThrow(re);
+  });
+  it("允許常見的 ABAP 運算式:結構欄位、物件屬性、field symbol、類別屬性、表格索引", () => {
+    const p = normalizeProbe({ ...ok, fields: ["ls_stock-qty", "me->mv_x", "<fs>-a", "zcl_x=>gv_y", "lt_tab[1]"] }, 0);
+    expect(p.fields).toHaveLength(5);
+  });
+  it("trigger:run_unit_tests / run_class / manual;缺少必要欄位或同時指定都拒絕", () => {
+    expect(normalizeTrigger({ tool: "run_unit_tests", object_url: "/sap/bc/adt/oo/classes/zcl_x" })).toEqual({ kind: "unit_tests", objectUrl: "/sap/bc/adt/oo/classes/zcl_x" });
+    expect(normalizeTrigger({ tool: "run_class", class_name: "zcl_x" })).toEqual({ kind: "class", className: "ZCL_X" });
+    expect(normalizeTrigger({ manual: true })).toEqual({ kind: "manual" });
+    expect(() => normalizeTrigger(undefined)).toThrow(/需要 trigger/);
+    expect(() => normalizeTrigger({})).toThrow(/需要 tool/);
+    expect(() => normalizeTrigger({ tool: "run_unit_tests" })).toThrow(/object_url/);
+    expect(() => normalizeTrigger({ tool: "run_class", class_name: "bad name" })).toThrow(/class_name/);
+    expect(() => normalizeTrigger({ tool: "run_class", class_name: "zcl_x", manual: true })).toThrow(/不能同時/);
+    expect(() => normalizeTrigger({ tool: "run_unit_tests", object_url: "//evil/x" })).toThrow();
+  });
+  it("xmlAttr 跳脫 condition 裡的 XML 特殊字元", () => {
+    expect(xmlAttr('a < b AND c = "x" & d > e')).toBe("a &lt; b AND c = &quot;x&quot; &amp; d &gt; e");
+  });
+});
+
+describe("探針範圍與排除清單(probeGuards)", () => {
+  const STD = "/sap/bc/adt/programs/programs/sapmv45a/source/main";
+  const CUSTOM = "/sap/bc/adt/oo/classes/zcl_inv_posting/source/main";
+  it("scope=all(預設):標準與自訂程式都可以", () => {
+    const cfg = cfgOf({ ABAP_MCP_ALLOW_PROBES: "true" });
+    expect(() => assertProbeAllowed(cfg, STD, "VA")).not.toThrow();
+    expect(() => assertProbeAllowed(cfg, CUSTOM, "$ZINV")).not.toThrow();
+  });
+  it("scope=custom:只限寫入白名單(名稱前綴 + package);標準程式被拒", () => {
+    const cfg = cfgOf({ ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_PROBE_SCOPE: "custom", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV" });
+    expect(() => assertProbeAllowed(cfg, CUSTOM, "$ZINV")).not.toThrow();
+    expect(() => assertProbeAllowed(cfg, STD, "VA")).toThrow(/custom/);
+    expect(() => assertProbeAllowed(cfg, CUSTOM, "$TMP")).toThrow(/package/);
+    expect(() => assertProbeAllowed(cfg, CUSTOM, "")).toThrow(/無法判斷/);
+  });
+  it("PROBE_DENY:物件名稱或 package 符合就拒絕(* 結尾為前綴),任何範圍都適用", () => {
+    const cfg = cfgOf({ ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_PROBE_DENY: "SAPMV45A, SUSR*, $SECRET" });
+    expect(() => assertProbeAllowed(cfg, STD, "VA")).toThrow(/排除清單/);
+    expect(() => assertProbeAllowed(cfg, "/sap/bc/adt/programs/programs/susr_dummy", "X")).toThrow(/排除清單/);
+    expect(() => assertProbeAllowed(cfg, CUSTOM, "$SECRET")).toThrow(/排除清單/);
+    expect(() => assertProbeAllowed(cfg, CUSTOM, "$ZINV")).not.toThrow();
+  });
+  it("一律先過 assertAdtUri", () => {
+    const cfg = cfgOf({ ABAP_MCP_ALLOW_PROBES: "true" });
+    expect(() => assertProbeAllowed(cfg, "https://evil.example.invalid/x", "")).toThrow(GuardViolationError);
+    expect(() => assertProbeAllowed(cfg, "/sap/bc/adt/oo/classes/%252e%252e/zx", "")).toThrow(GuardViolationError);
+  });
+});
+
+// ───────────────────────── 工具層 ─────────────────────────
+
+function fakeAdt(o: { pkg?: (url: string) => string } = {}): AdtService {
+  const unit = [{ "adtcore:name": "LTC", alerts: [], testmethods: [{ "adtcore:name": "T1", alerts: [], executionTime: "0", unit: "s" }] }];
+  return {
+    username: () => "DEVELOPER",
+    objectPackage: vi.fn(async (u: string) => (o.pkg ? o.pkg(u) : "$ZINV")),
+    runUnitTests: vi.fn(async () => unit as never),
+    runClass: vi.fn(async () => "out"),
+  } as unknown as AdtService;
+}
+
+async function connect(adt: AdtService, cfg = cfgOf({ ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV,$TMP" }), deps?: Parameters<typeof registerProbeTools>[5], audit = new AuditLogger("")) {
+  const server = new McpServer({ name: "unit", version: "0" });
+  registerProbeTools(server, adt, cfg, audit, new SerialQueue(), deps);
+  const [c, s] = InMemoryTransport.createLinkedPair();
+  await server.connect(s);
+  const client = new Client({ name: "c", version: "0" });
+  await client.connect(c);
+  // 沒有註冊任何工具時 SDK 的 listTools 會回 Method not found
+  const tools = await client.listTools().then((r) => r.tools.map((t) => t.name), () => [] as string[]);
+  const call = async (name: string, args: Record<string, unknown> = {}) => {
+    const r = (await client.callTool({ name, arguments: args })) as { content: { text?: string }[]; isError?: boolean };
+    return { text: r.content.map((x) => x.text ?? "").join("\n"), isError: !!r.isError };
+  };
+  return { tools, call };
+}
+
+const SET_ARGS = { object_url: "/sap/bc/adt/oo/classes/zcl_inv_posting", line: 173, fields: ["iv_qty"], trigger: { tool: "run_unit_tests", object_url: "/sap/bc/adt/oo/classes/zcl_inv_posting" } };
+
+describe("探針工具:註冊條件", () => {
+  const adt = () => fakeAdt();
+  it("預設(ABAP_MCP_ALLOW_PROBES 未設)→ 4 個工具都不註冊", async () => {
+    const { tools } = await connect(adt(), cfgOf());
+    expect(tools.filter((t) => t.startsWith("probe_"))).toEqual([]);
+  });
+  it("開啟且可讀寫 → 4 個工具;唯讀模式 → 只有 probe_list / probe_logs", async () => {
+    expect((await connect(adt())).tools.filter((t) => t.startsWith("probe_")).sort()).toEqual(["probe_delete", "probe_list", "probe_logs", "probe_set"]);
+    const ro = cfgOf({ ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_READONLY: "true" });
+    expect((await connect(adt(), ro)).tools.filter((t) => t.startsWith("probe_")).sort()).toEqual(["probe_list", "probe_logs"]);
+  });
+  it("prod 一律不註冊(即使 ABAP_MCP_ALLOW_PROBES=true)", async () => {
+    const prod = cfgOf({ ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_SYSTEM_ROLE: "prod" });
+    expect(prod.safety.probes.enabled).toBe(false);
+    expect((await connect(adt(), prod)).tools.filter((t) => t.startsWith("probe_"))).toEqual([]);
+  });
+  it("經 registerTools 整合:開關關閉時完全看不到 probe_*", async () => {
+    const server = new McpServer({ name: "unit", version: "0" });
+    registerTools(server, adt(), cfgOf(), new AuditLogger(""));
+    const [c, s] = InMemoryTransport.createLinkedPair();
+    await server.connect(s);
+    const client = new Client({ name: "c", version: "0" });
+    await client.connect(c);
+    expect((await client.listTools()).tools.some((t) => t.name.startsWith("probe_"))).toBe(false);
+  });
+});
+
+describe("探針工具:probe_set / probe_logs / probe_list / probe_delete", () => {
+  const stops = [["BP-p1"]];
+  const portFactory = () => fakePort({ stops: stops.map((x) => [...x]) });
+  const engineDeps = fakeClock().deps;
+
+  it("完整流程:set → 摘要 → list → logs → delete,且 audit 有紀錄", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "abap-mcp-probe-"));
+    try {
+      const auditPath = path.join(dir, "audit.jsonl");
+      const adt = fakeAdt();
+      const { call } = await connect(adt, undefined, { portFactory, engineDeps }, new AuditLogger(auditPath));
+      const set = await call("probe_set", SET_ARGS);
+      expect(set.isError, set.text).toBe(false);
+      expect(set.text).toContain("run-1");
+      expect(set.text).toContain("命中 1/5 次");
+      expect(adt.runUnitTests).toHaveBeenCalledTimes(1);
+
+      expect((await call("probe_list")).text).toContain("run-1");
+      const logs = await call("probe_logs", { run_id: "run-1" });
+      expect(logs.text).toContain("iv_qty = 42");
+      expect(logs.text).toContain("ZCL_INV_POSTING 第 173 行");
+      expect((await call("probe_logs", { run_id: "run-9" })).isError).toBe(true);
+
+      const del = await call("probe_delete", { run_id: "run-1" });
+      expect(del.text).toContain("已清除 1 筆");
+      expect((await call("probe_list")).text).toContain("沒有探針紀錄");
+
+      const entries = fs.readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(entries.some((e) => e.action === "probe_set" && e.success && /模式 B run-1/.test(e.summary))).toBe(true);
+      expect(entries.some((e) => e.action === "probe_delete" && e.success)).toBe(true);
+      // audit 不含變數值
+      expect(JSON.stringify(entries)).not.toContain("= 42");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("definition(JSON)與單一探針參數不能並用;缺 trigger、超過探針數上限、逾時範圍都拒絕,且不連 SAP", async () => {
+    const adt = fakeAdt();
+    const { call } = await connect(adt, cfgOf({ ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_MAX_PROBES: "2", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV" }), { portFactory, engineDeps });
+    const one = { object_url: SET_ARGS.object_url, line: 10, fields: ["a"] };
+    expect((await call("probe_set", { ...SET_ARGS, definition: { probes: [one] } })).text).toContain("只能擇一");
+    expect((await call("probe_set", { object_url: SET_ARGS.object_url, line: 10, fields: ["a"] })).text).toContain("需要 trigger");
+    expect((await call("probe_set", { definition: { probes: [one, one, one], trigger: SET_ARGS.trigger } })).text).toContain("最多 2 個探針");
+    expect((await call("probe_set", { ...SET_ARGS, timeout_seconds: 301 })).text).toContain("timeout_seconds");
+    expect((await call("probe_set", { ...SET_ARGS, timeout_seconds: 5 })).text).toContain("timeout_seconds");
+    expect(adt.runUnitTests).not.toHaveBeenCalled();
+  });
+
+  it("definition 的格式可用:多個探針 + trigger + timeout_seconds", async () => {
+    const adt = fakeAdt();
+    const { call } = await connect(adt, undefined, { portFactory: () => fakePort({ stops: [["BP-p1", "BP-p2"]] }), engineDeps });
+    const r = await call("probe_set", {
+      definition: {
+        probes: [
+          { object_url: "/sap/bc/adt/oo/classes/zcl_inv_posting", line: 173, fields: ["iv_qty"], max_hits: 1 },
+          { object_url: "/sap/bc/adt/oo/classes/zcl_inv_posting", line: 176, fields: ["rv_amt"], condition: "iv_qty > 0", max_hits: 1 },
+        ],
+        trigger: SET_ARGS.trigger,
+        timeout_seconds: 60,
+      },
+    });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("p1");
+    expect(r.text).toContain("p2");
+    expect(r.text).toContain("條件 iv_qty > 0");
+  });
+
+  it("探針範圍:PROBE_DENY 內的位置被拒,不設中斷點也不觸發", async () => {
+    const adt = fakeAdt();
+    const factory = vi.fn(portFactory);
+    const { call } = await connect(adt, cfgOf({ ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_PROBE_DENY: "ZCL_INV_POSTING", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV" }), { portFactory: factory, engineDeps });
+    const r = await call("probe_set", SET_ARGS);
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("排除清單");
+    expect(factory).not.toHaveBeenCalled();
+    expect(adt.runUnitTests).not.toHaveBeenCalled();
+  });
+
+  it("scope=custom:標準程式的探針被拒;觸發物件走寫入白名單(白名單外的 class 不能當 trigger)", async () => {
+    const adt = fakeAdt({ pkg: (u) => (u.includes("cl_std") ? "SAP_STD" : "$ZINV") });
+    const { call } = await connect(adt, cfgOf({ ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_PROBE_SCOPE: "custom", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV" }), { portFactory, engineDeps });
+    const std = await call("probe_set", { ...SET_ARGS, object_url: "/sap/bc/adt/oo/classes/cl_std", fields: ["a"] });
+    expect(std.isError).toBe(true);
+    expect(std.text).toContain("custom");
+    // scope=all 時,標準程式可以埋,但 trigger 仍要符合寫入白名單
+    const adt2 = fakeAdt({ pkg: (u) => (u.includes("cl_std") ? "SAP_STD" : "$ZINV") });
+    const { call: call2 } = await connect(adt2, cfgOf({ ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV" }), { portFactory, engineDeps });
+    const trig = await call2("probe_set", { ...SET_ARGS, trigger: { tool: "run_unit_tests", object_url: "/sap/bc/adt/oo/classes/cl_std" } });
+    expect(trig.isError).toBe(true);
+    expect(trig.text).toContain("白名單");
+    expect(adt2.runUnitTests).not.toHaveBeenCalled();
+  });
+
+  it("引擎回 error / trigger_failed → 工具回 isError,但紀錄仍存(可以 probe_logs 看原因)", async () => {
+    const adt = fakeAdt();
+    const { call } = await connect(adt, undefined, { portFactory: () => fakePort({ bpErrors: { p1: "位置不存在" } }), engineDeps });
+    const r = await call("probe_set", SET_ARGS);
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("中斷點設定失敗:位置不存在");
+    expect((await call("probe_logs", { run_id: "run-1" })).text).toContain("位置不存在");
+  });
+
+  it("probe_delete:run_id 與 all 必須擇一;all 清全部", async () => {
+    const adt = fakeAdt();
+    const { call } = await connect(adt, undefined, { portFactory, engineDeps });
+    await call("probe_set", SET_ARGS);
+    await call("probe_set", SET_ARGS);
+    expect((await call("probe_delete", {})).isError).toBe(true);
+    expect((await call("probe_delete", { run_id: "run-1", all: true })).isError).toBe(true);
+    expect((await call("probe_delete", { all: true })).text).toContain("已清除 2 筆");
+  });
+});
+
+describe("探針紀錄存放與輸出上限", () => {
+  const rec = (n: number, hits: number, valueLen = 10): Omit<ProbeRunRecord, "id"> => ({
+    mode: "debugger",
+    createdAt: "t",
+    status: "completed",
+    trigger: "x",
+    timeoutSeconds: 60,
+    notes: [],
+    probes: [{ id: "p1", location: "ZCL_X 第 1 行", kind: "variables", fields: ["a"], maxHits: 100, full: false, hits: Array.from({ length: hits }, (_, i) => ({ n: i + 1, at: "t", variables: [{ name: "a", value: "v".repeat(valueLen) }] })) }],
+  });
+  it("最多保留 20 筆,舊的先丟", () => {
+    const s = new ProbeStore();
+    for (let i = 0; i < 25; i++) s.add(rec(i, 1));
+    expect(s.list()).toHaveLength(20);
+    expect(s.get("run-1")).toBeUndefined();
+    expect(s.get("run-25")).toBeDefined();
+  });
+  it("probe_logs 最多 100 筆(超過註明未顯示)", () => {
+    const s = new ProbeStore();
+    const r = s.add(rec(1, 130));
+    const text = formatLogs(r);
+    expect(text).toContain("另有 30 筆未顯示");
+    expect(text.split("\n").filter((l) => /^ {2}#\d+/.test(l))).toHaveLength(100);
+  });
+  it("probe_logs 輸出字元上限 20,000(超過截斷)", () => {
+    const s = new ProbeStore();
+    const r = s.add(rec(1, 100, 1000));
+    const text = formatLogs(r);
+    expect(text.length).toBeLessThanOrEqual(PROBE_LOGS_MAX_CHARS + 200);
+    expect(text).toContain("已截斷");
+  });
+});

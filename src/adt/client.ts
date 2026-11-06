@@ -296,6 +296,18 @@ export function restrictRedirectsToBaseOrigin(client: ADTClient, baseUrl: string
 export const MAX_AUTH_FAILURES = 2;
 
 /**
+ * 建立一個連 SAP 的 ADTClient(帶 TLS 設定,redirect 限同 origin)。
+ * 每個 ADTClient 在 SAP 端是一個獨立的 HTTP session(SM04 看得到),用完要登出(見 adt/session.ts)。
+ */
+export function createAdtClient(cfg: AppConfig): ADTClient {
+  const c = new ADTClient(cfg.sap.url, cfg.sap.user, cfg.sap.password, cfg.sap.client, cfg.sap.language, adtClientOptions(cfg));
+  if (!restrictRedirectsToBaseOrigin(c, cfg.sap.url)) {
+    console.error("[abap-adt-mcp] 警告:無法限制 redirect 為同 origin(abap-adt-api 內部結構與預期不同)。");
+  }
+  return c;
+}
+
+/**
  * 真實實作:包裝 abap-adt-api 的 ADTClient。
  *
  * 用兩個 ADTClient(兩個獨立的 SAP session):
@@ -316,20 +328,7 @@ export class RealAdtService implements AdtService {
    * @param lockClient 選填:注入鎖定/寫入用的 ADTClient;只注入 client 時兩者共用
    */
   constructor(private cfg: AppConfig, client?: ADTClient, lockClient?: ADTClient) {
-    const create = () => {
-      const c = new ADTClient(
-        cfg.sap.url,
-        cfg.sap.user,
-        cfg.sap.password,
-        cfg.sap.client,
-        cfg.sap.language,
-        adtClientOptions(cfg)
-      );
-      if (!restrictRedirectsToBaseOrigin(c, cfg.sap.url)) {
-        console.error("[abap-adt-mcp] 警告:無法限制 redirect 為同 origin(abap-adt-api 內部結構與預期不同)。");
-      }
-      return c;
-    };
+    const create = () => createAdtClient(cfg);
     this.client = client ?? create();
     this.lockClient = lockClient ?? (client ? client : create());
   }
