@@ -155,7 +155,7 @@ describe("報表(F4)", () => {
 
 describe("評測任務集(F1)", () => {
   it("8 題都能解析,id 01–08 不重複,每題都有判定條件", () => {
-    const tasks = loadTasks(TASK_DIR, "AB12CD");
+    const tasks = selectTasks(loadTasks(TASK_DIR, "AB12CD"), { explicit: false }); // ZINV 題組是 opt_in,預設不選
     expect(tasks.map((t) => t.id)).toEqual(["01", "02", "03", "04", "05", "06", "07", "08"]);
     for (const t of tasks) {
       expect(t.prompt.length).toBeGreaterThan(10);
@@ -163,8 +163,24 @@ describe("評測任務集(F1)", () => {
     }
   });
 
+  it("ZINV 題組:9 題(zinv-01–09)都是 opt_in、限 $ZINV、有還原與基準測試;只有 zinv-09 開探針並要求先探針後寫入", () => {
+    const z = loadTasks(TASK_DIR, "AB12CD", undefined, ["zinv"]);
+    expect(z.map((t) => t.id)).toEqual(["zinv-01", "zinv-02", "zinv-03", "zinv-04", "zinv-05", "zinv-06", "zinv-07", "zinv-08", "zinv-09"]);
+    for (const t of z) {
+      expect(t.optIn, t.id).toBe(true);
+      expect(t.allowedPackages, t.id).toEqual(["$ZINV"]);
+      expect(t.restore.length, t.id).toBeGreaterThanOrEqual(2);
+      expect(t.restoreVerify?.passed, t.id).toBe(36);
+      expect(t.allowProbes, t.id).toBe(t.id === "zinv-09");
+    }
+    expect(z.find((t) => t.id === "zinv-09")!.requireToolOrder).toEqual(["probe_set", "write_source"]);
+    expect(z.find((t) => t.id === "zinv-05")!.restore).toContain("/sap/bc/adt/oo/classes/zcl_inv_period/source/main");
+    // 預設(沒有明確選取)不會跑 ZINV
+    expect(selectTasks(loadTasks(TASK_DIR, "AB12CD"), { explicit: false }).some((t) => t.id.startsWith("zinv"))).toBe(false);
+  });
+
   it("佔位符在解析前取代:物件名稱大寫、URI 小寫;不殘留 {{", () => {
-    const tasks = loadTasks(TASK_DIR, "ab12cd");
+    const tasks = selectTasks(loadTasks(TASK_DIR, "ab12cd"), { explicit: false });
     const t02 = tasks.find((t) => t.id === "02")!;
     expect(t02.prompt).toContain("ZCL_EVAL02_AB12CD");
     expect(t02.setup[0].args.name).toBe("ZCL_EVAL02_AB12CD");
@@ -634,5 +650,27 @@ describe("探針評測支援", () => {
     const line = (name: string) => JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name }] } });
     const r = parseStreamJson([line("ToolSearch"), line("mcp__abap-a4h__read_source"), line("mcp__abap-a4h__probe_set"), line("mcp__abap-a4h__write_source")].join("\n"));
     expect(r.toolOrder).toEqual(["read_source", "probe_set", "write_source"]);
+  });
+});
+
+describe("還原:inactive 殘留(zinv-05 注入語法錯誤時 active 版本沒變)", () => {
+  const url = "/sap/bc/adt/oo/classes/zcl_x/source/main";
+  const orig = new Map([[url, "A\nB\n"]]);
+  it("active 內容相同但有 inactive 版本 → 仍會寫回(清掉草稿);寫回後沒有殘留 → 沒有問題", async () => {
+    let inactive = true;
+    const write = vi.fn(async () => {
+      inactive = false;
+    });
+    const problems = await restoreSources({ read: async () => "A\nB\n", write, runUnitTests: async () => "", hasInactive: async () => inactive }, orig);
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(problems).toEqual([]);
+  });
+  it("沒有 inactive 且內容相同 → 不重寫;寫回後仍有 inactive → 回報問題", async () => {
+    const write = vi.fn(async () => undefined);
+    expect(await restoreSources({ read: async () => "A\nB\n", write, runUnitTests: async () => "", hasInactive: async () => false }, orig)).toEqual([]);
+    expect(write).not.toHaveBeenCalled();
+    const stuck = await restoreSources({ read: async () => "A\nB\n", write, runUnitTests: async () => "", hasInactive: async () => true }, orig);
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(stuck.join("")).toContain("仍有 inactive 版本");
   });
 });

@@ -231,13 +231,15 @@ export async function createHarness(env: NodeJS.ProcessEnv = evalEnv(), auditPat
       }
       for (const s of task.setup) {
         if (s.tool === "patch") {
-          const a = s.args as { object_url: string; find: string; replace: string; all?: boolean };
+          const a = s.args as { object_url: string; find: string; replace: string; all?: boolean; inactive?: boolean };
           const cur = await adt.getObjectSource(a.object_url);
           const p = applyPatch(cur, a.find, a.replace, a.all === true);
           if (p.count === 0) throw new Error(`第 ${task.id} 題事前準備失敗(patch):${a.object_url} 找不到要換掉的字串`);
           if (p.count > 1 && !a.all) throw new Error(`第 ${task.id} 題事前準備失敗(patch):要換掉的字串出現 ${p.count} 次,不是唯一一處(要全部換請加 all: true)`);
-          const w = await call("write_source", { object_url: a.object_url, new_source: p.source, activate: true });
-          if (w.isError || !w.text.includes("已啟用")) throw new Error(`第 ${task.id} 題事前準備失敗(patch 後未啟用):${w.text.slice(0, 400)}`);
+          // inactive: true = 注入語法錯誤用:略過語法檢查、不啟用(留下 inactive 版本,active 版本不變)
+          const inactive = a.inactive === true;
+          const w = await call("write_source", { object_url: a.object_url, new_source: p.source, ...(inactive ? { activate: false, skip_syntax_check: true } : { activate: true }) });
+          if (w.isError || (!inactive && !w.text.includes("已啟用"))) throw new Error(`第 ${task.id} 題事前準備失敗(patch ${inactive ? "寫入" : "後未啟用"}):${w.text.slice(0, 400)}`);
           continue;
         }
         if (s.tool === "expect_unit_tests") {
@@ -280,6 +282,10 @@ export async function createHarness(env: NodeJS.ProcessEnv = evalEnv(), auditPat
           write: async (u, src) => {
             const w = await call("write_source", { object_url: u, new_source: src, activate: true });
             if (w.isError || !w.text.includes("已啟用")) throw new Error(w.text.slice(0, 300));
+          },
+          hasInactive: async (u) => {
+            const base = u.replace(/\/(source\/main|includes\/[^/]+)$/i, "").toLowerCase();
+            return (await adt.inactiveObjects()).some((e) => e.uri.toLowerCase().startsWith(base));
           },
           runUnitTests: async (u) => {
             const r = await call("run_unit_tests", { object_url: u });

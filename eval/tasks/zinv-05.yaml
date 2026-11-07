@@ -1,0 +1,47 @@
+# 2026-11-07 手動確認(A4H):
+#   注入(inactive 版本,略過語法檢查,active 版本不變):compute 方法裡 lv_prev_year 改成 TYPE i,
+#   傳給 previous 的 ev_gjahr(TYPE gjahr)型別不符 → 語法錯誤、無法啟用。基準 active 版本不受影響,所以不用 expect_unit_tests。
+id: "zinv-05"
+title: 修 ZCL_INV_PERIOD 的語法錯誤
+tags: [zinv, legacy, fix-bug]
+# 會動共用的 ZINV 物件,所以預設不跑;要用 --tags zinv(或 --tasks)明確選到才跑。作答前讀出、作答後(不論成敗)寫回並比對,
+# 再跑 ZCL_INV_POSTING 基準單元測試 36/36;任何一步失敗就中止整個評測。
+opt_in: true
+allowed_packages: ["$ZINV"]
+timeout_min: 25
+budget_usd: 1.5
+tool_timeout_sec: 180
+restore:
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/includes/testclasses
+  - /sap/bc/adt/oo/classes/zcl_inv_period/source/main
+restore_verify: { object_url: /sap/bc/adt/oo/classes/zcl_inv_posting, passed: 36 }
+prompt: |
+  ZINV 系統的 class ZCL_INV_PERIOD(package $ZINV)有語法錯誤,無法啟用。
+  請找出錯誤並修正,讓它啟用成功;ZCL_INV_POSTING 的單元測試要維持全部通過。
+setup:
+  - tool: patch
+    args:
+      object_url: /sap/bc/adt/oo/classes/zcl_inv_period/source/main
+      inactive: true
+      find: |2-
+            DATA lv_prev_year TYPE gjahr.
+            DATA lv_prev_month TYPE monat.
+            DATA lt_bal TYPE HASHED
+      replace: |2-
+            DATA lv_prev_year TYPE i.
+            DATA lv_prev_month TYPE monat.
+            DATA lt_bal TYPE HASHED
+checks:
+  - kind: tool
+    tool: syntax_check
+    args: { object_url: /sap/bc/adt/oo/classes/zcl_inv_period }
+    contains: ["語法檢查通過"]
+  - kind: tool
+    tool: list_inactive
+    args: {}
+    not_contains: [ZCL_INV_PERIOD]
+  - kind: unit_tests
+    object_url: /sap/bc/adt/oo/classes/zcl_inv_posting
+    min_passed: 36
+cleanup: []

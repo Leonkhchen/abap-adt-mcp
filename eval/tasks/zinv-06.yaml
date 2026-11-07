@@ -1,0 +1,30 @@
+# 2026-11-07 手動確認(A4H):
+#   ATC(ZABAP_CLOUD_DEVELOPMENT)基準:ZCL_INV_POSTING 優先級 1 = 0、優先級 2 = 2(第 314、315 行 sy-datum / sy-uzeit),優先級 3 = 1。
+#   規格的範例 class 若優先級 1–2 已是 0 要改題:ZCL_INV_PERIOD 有 2 筆但它的測試在 POSTING 的 include,所以選 ZCL_INV_POSTING(36 個測試保護行為);
+#   ZCL_INV_DB / ZCL_INV_ALV 的優先級 1 是 classic enqueue / ALV 的未釋出 API,無法在不改行為下清掉,不選。
+id: "zinv-06"
+title: 清 ZCL_INV_POSTING 的 ATC 優先級 1–2
+tags: [zinv, legacy]
+# 會動共用的 ZINV 物件,所以預設不跑;要用 --tags zinv(或 --tasks)明確選到才跑。作答前讀出、作答後(不論成敗)寫回並比對,
+# 再跑 ZCL_INV_POSTING 基準單元測試 36/36;任何一步失敗就中止整個評測。
+opt_in: true
+allowed_packages: ["$ZINV"]
+timeout_min: 25
+budget_usd: 1.5
+tool_timeout_sec: 180
+restore:
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/includes/testclasses
+restore_verify: { object_url: /sap/bc/adt/oo/classes/zcl_inv_posting, passed: 36 }
+prompt: |
+  請把 ZINV 系統的 class ZCL_INV_POSTING 的 ATC 檢查結果中「優先級 1 和 2」的問題清到 0 筆。
+  不能改變程式行為:ZCL_INV_POSTING 的單元測試要維持全部通過。清完請用 ATC 重跑確認。
+setup: []
+checks:
+  - kind: atc_max
+    object_url: /sap/bc/adt/oo/classes/zcl_inv_posting
+    max: 0
+  - kind: unit_tests
+    object_url: /sap/bc/adt/oo/classes/zcl_inv_posting
+    min_passed: 36
+cleanup: []

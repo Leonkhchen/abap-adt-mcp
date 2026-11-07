@@ -12,7 +12,7 @@
  *   restore?:          [source URL …]     這題可能被修改的共用物件:作答前讀出、作答後(不論成敗)寫回並比對
  *   restore_verify?:   { object_url, passed }   還原後必須跑出 passed/passed 的基準單元測試
  *   setup:   [{ tool, args, allow_error? }]        事前以 MCP 工具準備;另有兩個特殊步驟:
- *     - { tool: patch, args: { object_url, find, replace, all? } }   找到 find 換成 replace 並啟用(注入 bug);找不到、或不是唯一一處(未設 all)就準備失敗
+ *     - { tool: patch, args: { object_url, find, replace, all?, inactive? } }   找到 find 換成 replace 並啟用(注入 bug;inactive: true = 略過語法檢查、不啟用,注入語法錯誤用);找不到、或不是唯一一處(未設 all)就準備失敗
  *     - { tool: expect_unit_tests, args: { object_url, failed_min? } }   確認單元測試確實失敗(預設至少 1 個),確保注入有效
  *   checks:  判定成功的條件(全部通過才算成功)
  *     - { kind: answer_contains, all?: [], any?: [] }                模型最後回答包含字串(不分大小寫)

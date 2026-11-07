@@ -67,6 +67,8 @@ export interface RestoreDeps {
   write(url: string, source: string): Promise<void>;
   /** 跑單元測試,回傳 run_unit_tests 的輸出文字 */
   runUnitTests(url: string): Promise<string>;
+  /** 這個物件現在有沒有 inactive 版本(注入語法錯誤會留下;active 版本相同也要清掉它) */
+  hasInactive?(url: string): Promise<boolean>;
 }
 
 export interface RestoreVerify {
@@ -87,11 +89,13 @@ export async function restoreSources(
   const problems: string[] = [];
   for (const [url, original] of originals) {
     try {
-      // 已經一樣就不重寫(少一次鎖定、啟用)
+      // 已經一樣、而且沒有 inactive 殘留就不重寫(少一次鎖定、啟用)
       const before = await deps.read(url).catch(() => undefined);
-      if (before === undefined || !sameSource(before, original)) await deps.write(url, original);
+      const leftover = deps.hasInactive ? await deps.hasInactive(url).catch(() => false) : false;
+      if (before === undefined || leftover || !sameSource(before, original)) await deps.write(url, original);
       const after = await deps.read(url);
       if (!sameSource(after, original)) problems.push(`${url}:寫回後內容與原始碼不一致`);
+      if (deps.hasInactive && (await deps.hasInactive(url).catch(() => false))) problems.push(`${url}:還原後仍有 inactive 版本`);
     } catch (e) {
       problems.push(`${url}:還原失敗(${e instanceof Error ? e.message : String(e)})`);
     }

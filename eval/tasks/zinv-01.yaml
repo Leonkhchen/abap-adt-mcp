@@ -1,0 +1,29 @@
+# 2026-11-07 手動確認(A4H):
+#   唯讀題;ZCL_INV_POSTING.calc_issue_amt(約第 172 行)與 move_out(出庫)是答案所在,ZINV_manual.md 第 74 行有業務規則。
+id: "zinv-01"
+title: 解釋移動平均成本
+tags: [zinv, legacy]
+# 會動共用的 ZINV 物件,所以預設不跑;要用 --tags zinv(或 --tasks)明確選到才跑。作答前讀出、作答後(不論成敗)寫回並比對,
+# 再跑 ZCL_INV_POSTING 基準單元測試 36/36;任何一步失敗就中止整個評測。
+opt_in: true
+allowed_packages: ["$ZINV"]
+timeout_min: 15
+budget_usd: 1.0
+tool_timeout_sec: 180
+restore:
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/includes/testclasses
+restore_verify: { object_url: /sap/bc/adt/oo/classes/zcl_inv_posting, passed: 36 }
+prompt: |
+  ZINV 進耗存系統(package $ZINV)的出庫金額是怎麼算的?
+  請說明用的是哪個方法、哪個公式,以及「把庫存全部出清」時尾差(小數除不盡的零頭)怎麼處理。
+  只要說明,不要修改任何東西;回答請寫出你根據的 class 與方法名稱。
+setup: []
+checks:
+  - kind: answer_contains
+    all: [calc_issue_amt]
+  - kind: answer_contains
+    any: [尾差, 全部金額, 全數出清, 全部帶走, residue, residual, entire, full issue]
+  - kind: unchanged
+    object_url: /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+cleanup: []

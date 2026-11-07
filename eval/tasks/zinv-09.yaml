@@ -1,0 +1,44 @@
+# 2026-11-07 手動確認(A4H):
+#   注入:receipt_amt 的盤盈平均成本公式 qty * stval / stqty 被換成 qty * stqty / stval(數量與金額對調),
+#   gain_uses_average 等測試會失敗(expect_unit_tests 確認)。題目要求先用探針取得實際變數值,
+#   require_tool_order: probe_set 必須在 write_source 之前出現;沒用探針就算失敗。
+id: "zinv-09"
+title: 探針題:盤盈成本金額錯誤(要先用探針取值再修)
+tags: [zinv, legacy, fix-bug, probe]
+# 會動共用的 ZINV 物件,所以預設不跑;要用 --tags zinv(或 --tasks)明確選到才跑。作答前讀出、作答後(不論成敗)寫回並比對,
+# 再跑 ZCL_INV_POSTING 基準單元測試 36/36;任何一步失敗就中止整個評測。
+opt_in: true
+allowed_packages: ["$ZINV"]
+allow_probes: true
+require_tool_order: [probe_set, write_source]
+timeout_min: 30
+budget_usd: 2.0
+tool_timeout_sec: 180
+restore:
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/includes/testclasses
+restore_verify: { object_url: /sap/bc/adt/oo/classes/zcl_inv_posting, passed: 36 }
+prompt: |
+  ZINV 系統(package $ZINV)的庫存「盤盈」過帳時,沒有輸入單價的情況下帶出來的成本金額不對,ZCL_INV_POSTING 的單元測試有失敗。
+  請不要只看程式碼猜原因:先用探針(probe_set)在你懷疑的那一行取得執行時實際的變數值,根據觀察到的值確認原因,
+  再用 write_source 修正,讓全部單元測試通過。探針用完要清除(probe_delete)。回答請說明探針看到什麼值、怎麼判斷出原因。
+setup:
+  - tool: patch
+    args:
+      object_url: /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+      find: |2
+            rv_amt = ( is_line-qty * ir_stk->stval ) / ir_stk->stqty.
+      replace: |2
+            rv_amt = ( is_line-qty * ir_stk->stqty ) / ir_stk->stval.
+  - tool: expect_unit_tests
+    args: { object_url: /sap/bc/adt/oo/classes/zcl_inv_posting }
+checks:
+  - kind: unit_tests
+    object_url: /sap/bc/adt/oo/classes/zcl_inv_posting
+    min_passed: 36
+  - kind: source_not_contains
+    object_url: /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+    not_contains: ["( is_line-qty * ir_stk->stqty ) / ir_stk->stval"]
+  - kind: answer_contains
+    any: [probe, 探針]
+cleanup: []
