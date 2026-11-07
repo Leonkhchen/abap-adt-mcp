@@ -21,13 +21,15 @@ export function denyMatches(value: string, pattern: string): boolean {
  * 檢查探針位置是否允許;違反時丟出 GuardViolationError。
  * @param objectUrl 物件或 source URI
  * @param packageName 物件所在 package(呼叫端先查好;查不到給空字串)
+ * @param extraNames 也要拿去比對排除清單的名稱:include 所屬的主程式、function group(審查 #2:否則排除 SAPLXXX 擋不住它的 include)
  */
-export function assertProbeAllowed(cfg: AppConfig, objectUrl: string, packageName: string): void {
+export function assertProbeAllowed(cfg: AppConfig, objectUrl: string, packageName: string, extraNames: string[] = []): void {
   const safeUrl = assertAdtUri(objectUrl, cfg);
   const name = objectNameFromUrl(safeUrl);
   const { deny, scope } = cfg.safety.probes;
 
-  const hit = deny.find((p) => denyMatches(name, p) || (packageName && denyMatches(packageName, p)));
+  const names = [name, ...extraNames.map((n) => n.toUpperCase())];
+  const hit = deny.find((p) => names.some((n) => denyMatches(n, p)) || (packageName && denyMatches(packageName, p)));
   if (hit) {
     throw new GuardViolationError(
       `探針位置 ${name}${packageName ? `(package ${packageName.toUpperCase()})` : ""} 在排除清單內(ABAP_MCP_PROBE_DENY 的 ${hit}),拒絕。`
@@ -35,6 +37,10 @@ export function assertProbeAllowed(cfg: AppConfig, objectUrl: string, packageNam
   }
 
   if (scope === "custom") {
+    // 兩份白名單都空 = 沒有任何「自己的程式」可言:拒絕,不要退化成 all(審查 #3)
+    if (cfg.safety.allowedPrefixes.length === 0 && cfg.safety.allowedPackages.length === 0) {
+      throw new GuardViolationError("探針範圍為 custom,但名稱前綴與 package 白名單都是空的,無法判斷哪些是自己的程式,拒絕。");
+    }
     const prefixes = cfg.safety.allowedPrefixes;
     if (prefixes.length > 0 && !prefixes.some((p) => name.startsWith(p))) {
       throw new GuardViolationError(

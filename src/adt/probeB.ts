@@ -124,6 +124,8 @@ export interface EngineInput {
   timeoutSeconds: number;
   /** 在監聽期間代為觸發執行並等結果;省略 = 手動觸發(由使用者自己在 SAP GUI 執行) */
   trigger?: () => Promise<string>;
+  /** 引擎把「立刻中止並清除」的函式交給呼叫端登錄(process 被結束時 finally 跑不到,由 shutdown 呼叫;v0.6 審查 #1) */
+  registerAbort?: (abort: () => Promise<void>) => void;
 }
 
 /** 單次停下最多處理幾次「繼續後又停」,避免異常時無限迴圈 */
@@ -157,6 +159,19 @@ export async function runDebuggerProbes(port: DebugPort, input: EngineInput, dep
   let triggerP: Promise<TriggerOutcome> | undefined;
   let attached = false;
 
+  input.registerAbort?.(async () => {
+    for (const s of states) if (s.bpId && !s.full) await port.deleteBreakpoint(s.bpId).catch(() => undefined);
+    await port.cancelListen().catch(() => undefined);
+    if (attached) {
+      try {
+        await port.continue();
+      } catch {
+        await port.terminate().catch(() => undefined);
+      }
+    }
+    await port.close().catch(() => undefined);
+  });
+
   const allDone = () => states.every((s) => s.full || s.error);
 
   /** 處理一個停住的程式:attach → 讀值 → 自動繼續,直到跑完或不再停下 */
@@ -164,6 +179,7 @@ export async function runDebuggerProbes(port: DebugPort, input: EngineInput, dep
     let reached = (await port.attach(debuggeeId)).reachedBreakpointIds;
     attached = true;
     for (let i = 0; i < MAX_STOPS_PER_DEBUGGEE; i++) {
+      if (i > 0 && deps.now() > deadline) break; // 逾時:交給 finally 讓程式繼續跑完(審查 #6)
       const stack = await port.stack().catch(() => [] as StackFrame[]);
       const hitStates = reached.length
         ? states.filter((s) => s.bpId && reached.includes(s.bpId))

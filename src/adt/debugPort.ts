@@ -102,7 +102,8 @@ export class AdtDebugPort implements DebugPort {
     for (const name of names) {
       try {
         const vars = await this.dbgClient.debuggerVariables([name.toUpperCase()]);
-        const v = vars.find((x) => x.NAME?.toUpperCase() === name.toUpperCase()) ?? vars[0];
+        // 只接受名稱相符的變數:找不到就當讀不到,不退回別的變數(否則會把別的值標成要求的名稱;審查 #4)
+        const v = vars.find((x) => x.NAME?.toUpperCase() === name.toUpperCase());
         if (!v) {
           out.push({ name, value: "", note: "讀不到(名稱不在目前範圍內)" });
           continue;

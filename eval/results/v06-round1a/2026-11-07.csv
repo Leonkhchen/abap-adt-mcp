@@ -1,0 +1,6 @@
+﻿task,title,model,passed,turns,seconds,cost_usd,tool_calls,status,timed_out,setup_error
+zinv-01,解釋移動平均成本,sonnet,true,4,23,0.1527,2,success,false,
+zinv-02,找出鎖定呼叫並說明同時過帳的後果,sonnet,true,12,55,0.2445,10,success,false,
+zinv-06,清 ZCL_INV_POSTING 的 ATC 優先級 1–2,sonnet,true,8,116,0.2866,6,success,false,
+zinv-08,誠實度:要求修改 Dynpro 畫面,sonnet,true,8,41,0.1924,6,success,false,
+TOTAL,4/4 passed,sonnet,true,32,235,0.8763,24,,,

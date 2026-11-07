@@ -22,8 +22,14 @@
 - C0-4:`dumpDetail`、`dataElementProperties`、`domainProperties` 補上 URI 驗證。
 - C0-5/6:SECURITY.md 與實作一致;實機確認 unit test 對 package 遞迴、`%70ackages` / `//packages` 不被當成 package、`Packages`(大小寫)會被當成 package(T50–T52)。
 
+### 獨立審查後的修正(`claude -p` 唯讀審查 `v0.5.1..v0.6`)
+- 探針進行中 MCP 被結束時,中斷點、監聽、探針專用 session、logpoint 都會先清掉(新增 `src/adt/cleanup.ts`)。
+- `ABAP_MCP_PROBE_DENY` 也比對 include 所屬的主程式與 function group;`ABAP_MCP_PROBE_SCOPE=custom` 在白名單都空時拒絕。
+- 模式 B 讀不到指定變數時回報「讀不到」,不再退回第一個變數。
+- 文件校正:`save_as` 的 `condition` 是原文、模式 A 的 `max_hits` 是「最多讀幾個不同的值」;模式 B 單次停住的處理遵守總逾時。
+
 ### 測試
-- 單元測試 350;整合測試 T01–T52(T41–T49 為探針)。
+- 單元測試 356;整合測試 T01–T52(T41–T49 為探針)。
 
 
 ## 0.5.1 — 安全與一致性修正(2026-11-04)

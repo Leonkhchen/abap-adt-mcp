@@ -44,7 +44,7 @@ export function buildProbeFile(name: string, r: ProbeRunRecord, meta: ProbeFileM
     mode_name: r.mode === "dlp" ? "Dynamic Logpoints" : "Debugger snapshot",
     run: { id: r.id, startedAt: r.createdAt, status: r.status, trigger: r.trigger },
     hit_count: r.probes.reduce((a, p) => a + p.hits.length, 0),
-    // 可直接餵回 probe_set 的 definition
+    // 可直接餵回 probe_set 的 definition。注意:condition 是探針條件的原文,若寫了字面值(例如 kunnr = '0000100023')也會存進來(審查 #5)
     definition: {
       probes: r.probes.map((p) => ({
         object_url: p.sourceUrl,

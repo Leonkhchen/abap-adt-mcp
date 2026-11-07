@@ -271,6 +271,8 @@ export interface AdtService {
   runQuery(sql: string, rows: number): Promise<QueryResult>;
   /** 建立 workbench transport request,回傳 TR 編號;refUrl 為相關物件(或 package)的 URI */
   createTransport(refUrl: string, description: string, packageName: string): Promise<string>;
+  /** include 所屬的主程式名稱(大寫);探針排除清單比對用 */
+  mainProgramNames(sourceUrl: string): Promise<string[]>;
   /** Dynamic Logpoints(v0.6 探針模式 A):這個系統有沒有 /sap/bc/adt/dlp 端點(結果快取) */
   dlpAvailable(): Promise<boolean>;
   /** 目前登入帳號的 logpoint 清單 */
@@ -451,6 +453,12 @@ export class RealAdtService implements AdtService {
     const url = this.u(objectUrl);
     const response = await this.guard(() => this.client.httpClient.request(url));
     return packageFromObjectXml(String(response.body ?? ""));
+  }
+
+  async mainProgramNames(sourceUrl: string): Promise<string[]> {
+    const url = this.u(sourceUrl);
+    const mains = await this.guard(() => this.client.mainPrograms(url));
+    return mains.map((m) => String(m["adtcore:name"] ?? "").toUpperCase()).filter(Boolean);
   }
 
   // ───── Dynamic Logpoints(探針模式 A)─────

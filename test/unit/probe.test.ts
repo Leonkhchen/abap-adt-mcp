@@ -750,3 +750,94 @@ describe("探針定義存檔(save_as)", () => {
     await expect(off.listPrompts()).rejects.toThrow();
   });
 });
+
+// ───────────────────────── 獨立審查修正(v0.6 review #1–#4)─────────────────────────
+import { pendingCleanups, registerCleanup, runCleanups } from "../../src/adt/cleanup.js";
+
+describe("審查 #1:process 被結束時清掉進行中的探針", () => {
+  it("registerCleanup / runCleanups:平行執行、單一失敗不影響其他、取消登錄後不再執行", async () => {
+    const ran: string[] = [];
+    const u1 = registerCleanup(async () => void ran.push("a"));
+    registerCleanup(async () => {
+      throw new Error("boom");
+    });
+    registerCleanup(async () => void ran.push("c"));
+    expect(await runCleanups()).toBeGreaterThanOrEqual(3);
+    expect(ran.sort()).toEqual(["a", "c"]);
+    u1();
+    ran.length = 0;
+    await runCleanups();
+    expect(ran).toEqual(["c"]);
+    await runCleanups();
+  });
+
+  it("引擎交出 abort:呼叫它會刪中斷點、取消監聽、關閉 session(模擬監聽中 process 結束)", async () => {
+    const port = fakePort();
+    let abort: (() => Promise<void>) | undefined;
+    const run = runDebuggerProbes(port, { probes: [spec()], timeoutSeconds: 60, trigger: () => new Promise(() => {}), registerAbort: (f) => (abort = f) }, fakeClock().deps);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(abort).toBeTypeOf("function");
+    await abort!();
+    expect(port.deleted).toEqual(["BP-p1"]);
+    expect(port.calls).toContain("cancelListen");
+    expect(port.calls).toContain("close"); // abort 後引擎可能還會重新監聽一次,真實情況下 process 已結束
+    void run.catch(() => undefined);
+  });
+
+  it("probe_set(模式 B)跑完就取消登錄;模式 A 不給 trigger 的 logpoint 在 shutdown 時被移除", async () => {
+    const before = pendingCleanups();
+    const b = await connect(fakeAdt(), cfgOf({ ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV,$TMP", ABAP_MCP_PROBE_MODE: "debugger" }), {
+      portFactory: () => fakePort({ stops: [["BP-p1"]] }),
+      engineDeps: fakeClock().deps,
+    });
+    const rb = await b.call("probe_set", SET_ARGS);
+    expect(rb.isError, rb.text).toBe(false);
+    // 每個 connect 會多一個 store 層的清除登錄(模式 A 用);B 的 per-run abort 不應留下
+    expect(pendingCleanups()).toBe(before + 1);
+
+    const { adt, live } = dlpAdt();
+    const a = await connect(adt, cfgOf({ ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV,$TMP" }));
+    const ra = await a.call("probe_set", { object_url: "/sap/bc/adt/oo/classes/zcl_inv_posting", line: 176, fields: ["iv_qty"] });
+    expect(ra.isError, ra.text).toBe(false);
+    expect(live.size).toBe(1);
+    await runCleanups();
+    expect(live.size).toBe(0);
+  });
+});
+
+describe("審查 #2/#3:排除清單涵蓋 include 的主程式;custom 在白名單為空時拒絕", () => {
+  const INC = "/sap/bc/adt/programs/includes/lhrpayu01/source/main";
+  it("assertProbeAllowed:extraNames 命中排除清單就拒絕", () => {
+    const cfg = cfgOf({ ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_PROBE_DENY: "SAPLHRPAY*" });
+    expect(() => assertProbeAllowed(cfg, INC, "HR")).not.toThrow(); // 只看 include 名稱擋不住(舊行為)
+    expect(() => assertProbeAllowed(cfg, INC, "HR", ["SAPLHRPAY"])).toThrow(/排除清單/);
+  });
+
+  it("probe_set:function group / program include 會查主程式再比對排除清單;查不到主程式的 include 拒絕", async () => {
+    const env = { ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV,$TMP", ABAP_MCP_PROBE_MODE: "dlp", ABAP_MCP_PROBE_DENY: "SAPLHRPAY*" };
+    const { adt, api } = dlpAdt();
+    (api as Record<string, unknown>).mainProgramNames = vi.fn(async () => ["SAPLHRPAY"]);
+    const c = await connect(adt, cfgOf(env));
+    const r = await c.call("probe_set", { object_url: "/sap/bc/adt/programs/includes/lhrpayu01", line: 5, fields: ["x"] });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("排除清單");
+    expect(api.dlpCreate).not.toHaveBeenCalled();
+    // function group:名稱 SAPL<群組> 直接由 URI 推得,不用查 SAP
+    const fg = await c.call("probe_set", { object_url: "/sap/bc/adt/functions/groups/hrpay/includes/lhrpayu01", line: 5, fields: ["x"] });
+    expect(fg.isError).toBe(true);
+    // 查主程式失敗的 program include → fail-closed
+    (api as Record<string, unknown>).mainProgramNames = vi.fn(async () => {
+      throw new Error("404");
+    });
+    const bad = await c.call("probe_set", { object_url: "/sap/bc/adt/programs/includes/lzfoo", line: 5, fields: ["x"] });
+    expect(bad.isError).toBe(true);
+    expect(bad.text).toContain("無法判斷");
+  });
+
+  it("scope=custom 且名稱前綴與 package 白名單都空 → 拒絕(不退化成 all)", () => {
+    const cfg = cfgOf({ ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_PROBE_SCOPE: "custom", ABAP_MCP_ALLOWED_PREFIXES: "", ABAP_MCP_ALLOWED_PACKAGES: "" });
+    if (cfg.safety.allowedPrefixes.length === 0 && cfg.safety.allowedPackages.length === 0) {
+      expect(() => assertProbeAllowed(cfg, "/sap/bc/adt/oo/classes/zcl_x/source/main", "$TMP")).toThrow(/白名單都是空的/);
+    }
+  });
+});

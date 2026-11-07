@@ -14,6 +14,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { AdtService, DlpKeyLog } from "../adt/client.js";
+import { registerCleanup } from "../adt/cleanup.js";
 import { AdtDebugPort } from "../adt/debugPort.js";
 import { baseObjectUrl, isSourceUrl } from "../adt/objectTypes.js";
 import {
@@ -72,7 +73,7 @@ const probeSchema = z.object({
   kind: z.enum(["variables", "stack", "sql"]).optional().describe("variables 記錄變數(預設)/ stack 記錄呼叫堆疊 / sql(只有模式 A 支援)"),
   fields: z.array(z.string()).optional().describe("kind=variables 要記錄的變數或運算式,例如 [\"ls_stock-qty\", \"lv_amt\"]"),
   condition: z.string().optional().describe("選填:條件成立才記錄,例如 ls_stock-qty = 0"),
-  max_hits: z.number().int().positive().optional().describe(`最多記錄幾次(預設 ${DEFAULT_MAX_HITS},上限 ${MAX_MAX_HITS});收滿就移除探針`),
+  max_hits: z.number().int().positive().optional().describe(`最多記錄幾次(預設 ${DEFAULT_MAX_HITS},上限 ${MAX_MAX_HITS});模式 B 收滿就移除中斷點;模式 A 是最多讀幾個不同的值(logpoint 要 probe_delete 或到期才移除)`),
 });
 
 export type ProbeInput = z.infer<typeof probeSchema>;
@@ -220,7 +221,7 @@ export function formatRunSummary(r: ProbeRunRecord): string {
   for (const p of r.probes) {
     out.push(
       `- ${p.id} ${p.location}(${p.kind}${p.fields.length ? `:${p.fields.join(", ")}` : ""}${p.condition ? `;條件 ${p.condition}` : ""}):` +
-        (p.error ? `❌ 中斷點設定失敗:${p.error}` : `命中 ${p.hits.length}/${p.maxHits} 次${p.full ? "(已收滿並移除)" : ""}`)
+        (p.error ? `❌ 中斷點設定失敗:${p.error}` : `命中 ${p.hits.length}/${p.maxHits} 次${p.full ? (r.mode === "dlp" ? "(已讀滿 max_hits 個不同的值)" : "(已收滿並移除)") : ""}`)
     );
   }
   if (r.activeUntil) out.push(`有效到 ${r.activeUntil}。程式執行後用 probe_logs(run_id="${r.id}")讀取,用完請 probe_delete(run_id="${r.id}")移除 logpoint。`);
@@ -305,6 +306,31 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
     const file = writeProbeFile(cfg.safety.probes.dir, name, buildProbeFile(name, rec, meta, { host, client: cfg.sap.client }));
     return `\n📁 探針定義已存成 ${file}(只有位置、變數名稱、命中次數與結論,不含變數值)。`;
   };
+
+  /** 排除清單要比對的額外名稱:include 的主程式、function group(沒有排除清單時不查 SAP) */
+  const extraDenyNames = async (sourceUrl: string): Promise<string[]> => {
+    if (cfg.safety.probes.deny.length === 0) return [];
+    const names: string[] = [];
+    const fg = /\/sap\/bc\/adt\/functions\/groups\/([^/]+)/i.exec(sourceUrl);
+    if (fg) {
+      const g = decodeURIComponent(fg[1]).toUpperCase();
+      names.push(g, `SAPL${g}`);
+    }
+    if (fg || /\/sap\/bc\/adt\/programs\/includes\//i.test(sourceUrl)) {
+      try {
+        names.push(...(await adt.mainProgramNames(sourceUrl)));
+      } catch (e) {
+        if (!fg) throw new GuardViolationError(`無法判斷 include 所屬的主程式(${e instanceof Error ? e.message : String(e)}),排除清單啟用中,為安全起見拒絕。`);
+      }
+    }
+    return names;
+  };
+
+  // MCP 結束時(stdin 關閉 / SIGINT / SIGTERM):移除這個 process 建立、還在 SAP 上啟用的 logpoint(紀錄在記憶體,重開後讀不到了)
+  registerCleanup(async () => {
+    const ids = store.list().flatMap((r) => (r.mode === "dlp" ? r.probes.map((p) => p.dlpId).filter((x): x is string => !!x) : []));
+    await deleteLogpoints(ids);
+  });
 
   /** 建立時回傳解碼後的 id,清單回傳編碼過的 URL:統一成解碼後的 id 才能去重 */
   const dlpKey = (id: string): string => {
@@ -484,7 +510,7 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
           }
 
           // 2. 位置檢查:探針範圍與排除清單(每個探針),觸發物件走寫入的兩道白名單(它會執行程式)
-          for (const p of probes) assertProbeAllowed(cfg, p.sourceUrl, await adt.objectPackage(p.baseUrl));
+          for (const p of probes) assertProbeAllowed(cfg, p.sourceUrl, await adt.objectPackage(p.baseUrl), await extraDenyNames(p.sourceUrl));
           let triggerText: string;
           let run: (() => Promise<string>) | undefined;
           if (trigger.kind === "unit_tests") {
@@ -516,6 +542,10 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
             let triggerOutcome: string | undefined;
             let status: ProbeRunRecord["status"] = "active";
             let hitsBy: ProbeHit[][] = probes.map(() => []);
+            // 進行中被結束:建立到一半 / 正在觸發時 process 結束,finally 跑不到
+            const unregisterRun = registerCleanup(async () => {
+              await deleteLogpoints(states.filter((st) => st.dlpId).map((st) => st.dlpId!));
+            });
             try {
               for (const st of states) {
                 try {
@@ -549,10 +579,11 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
                 notes.push("模式 A 以「第一個變數的不同值」分組:每個不同的值算一筆。");
               }
             } finally {
+              unregisterRun(); // 之後由下面的清除或 store 層的 shutdown 清除接手
               if (run || status === "error") {
                 const errs = await deleteLogpoints(states.filter((st) => st.dlpId).map((st) => st.dlpId!));
                 for (const e of errs) notes.push(`⚠️ 移除 logpoint 失敗,請用 probe_delete 或 Eclipse 清除:${e}`);
-                for (const st of states) if (!errs.some((x) => st.dlpId && x.startsWith(st.dlpId))) st.dlpId = undefined;
+                for (const st of states) if (!errs.some((x) => st.dlpId && x.startsWith(`${st.dlpId}:`))) st.dlpId = undefined;
               }
             }
             if (!run && status === "active") notes.push(`logpoint 在 SAP 上啟用到 ${new Date(Date.now() + minutes * 60_000).toISOString()} 為止(只對 ${adt.username()} 的執行生效)。`);
@@ -596,15 +627,19 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
           }
 
           // 3. 執行(同時只有一個監聽:經寫入佇列)
+          let unregister: (() => void) | undefined;
           const result = await runDebuggerProbes(
             portFactory(),
             {
+              registerAbort: (abort) => {
+                unregister = registerCleanup(abort);
+              },
               probes: probes.map<ProbeSpec>((p) => ({ id: p.id, objectUrl: p.sourceUrl, line: p.line, kind: p.kind as "variables" | "stack", variables: p.fields, condition: p.condition, maxHits: p.maxHits })),
               timeoutSeconds,
               trigger: run,
             },
             engineDeps
-          );
+          ).finally(() => unregister?.());
           const rec = store.add({
             mode: "debugger",
             createdAt: startedAt,

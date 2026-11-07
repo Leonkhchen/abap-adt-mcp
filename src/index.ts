@@ -10,6 +10,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { RealAdtService } from "./adt/client.js";
 import { loadConfig, warnIfPasswordUnquoted } from "./config.js";
 import { installShutdown } from "./lifecycle.js";
+import { runCleanups } from "./adt/cleanup.js";
 import { AuditLogger } from "./safety/audit.js";
 import { registerTools } from "./tools/registry.js";
 import { VERSION } from "./version.js";
@@ -33,7 +34,8 @@ async function main() {
   // 4. 啟動 stdio transport;結束時(stdin 關閉 / SIGINT / SIGTERM)登出所有 ADT client,
   //    否則 SAP 端的 HTTP session 要等逾時才釋放(C0-10)
   const transport = new StdioServerTransport();
-  installShutdown(adt, { signals: process, stdin: process.stdin, exit: (code) => process.exit(code) });
+  // 先清掉進行中的探針(中斷點、監聽、logpoint),再登出 ADT 工作階段
+  installShutdown({ close: async () => { await runCleanups(); await adt.close?.(); } }, { signals: process, stdin: process.stdin, exit: (code) => process.exit(code) });
   await server.connect(transport);
 
   console.error(
