@@ -7,6 +7,7 @@ export const USAGE = `用法:npx tsx eval/run.ts [選項]
   --matrix              確認要跑多模型矩陣(--model 超過一個時必須加)
   --tasks <01,07,…>     只跑指定題目(預設:全部、但不含需明確選取的題組)
   --tags <zinv,…>       只跑帶這些 tag 的題目(任一符合);ZINV 題組要用 --tags zinv 才會跑
+  --probes              讓模型可以用探針工具(ABAP_MCP_ALLOW_PROBES=true);標了 allow_probes 的題目不用加
   --dry-run             不呼叫模型:只驗證事前準備、判定與清除
   --timeout-min <分>    每題逾時(預設 20)
   --budget <USD>        每題費用上限(預設 3)
@@ -14,7 +15,7 @@ export const USAGE = `用法:npx tsx eval/run.ts [選項]
   --help                顯示說明後結束(不連 SAP、不呼叫模型)`;
 
 const VALUE_OPTS = new Set(["model", "tasks", "tags", "timeout-min", "budget", "out"]);
-const FLAG_OPTS = new Set(["dry-run", "help", "matrix"]);
+const FLAG_OPTS = new Set(["dry-run", "help", "matrix", "probes"]);
 
 /** 嚴格解析參數:未知選項或缺值一律報錯,不會「忽略後照跑」 */
 export function parseArgs(argv: string[]): { flags: Set<string>; values: Map<string, string> } {

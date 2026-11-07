@@ -47,6 +47,7 @@ describe("評測執行器(F2)", () => {
       costUsd: 0.1234,
       toolCalls: 3,
       toolCallsByName: { read_source: 2, run_class: 1 },
+      toolOrder: ["read_source", "read_source", "run_class"],
     });
     expect(parseStreamJson("").status).toBe("no_result");
   });
@@ -595,5 +596,43 @@ describe("Z1-4 evalEnv 與還原失敗的報表警告", () => {
     expect(md).toContain("還原失敗:ZCL_INV_POSTING:寫回失敗");
     const clean = renderMarkdown({ startedAt: new Date("2026-11-06T00:00:00Z"), stamp: "s", dryRun: false, models: ["sonnet"], results: [result()] });
     expect(clean).not.toContain("ZINV 基準可能已損壞");
+  });
+});
+
+// ───────────────────────── Z2 探針題:allow_probes / require_tool_order / --probes ─────────────────────────
+import { checkToolOrder } from "../../eval/lib/tasks.js";
+
+describe("探針評測支援", () => {
+  it("checkToolOrder:都出現且第一次出現的順序正確才通過", () => {
+    const req = ["probe_set", "write_source"];
+    expect(checkToolOrder(["read_source", "probe_set", "probe_logs", "write_source"], req)).toBeUndefined();
+    expect(checkToolOrder(["probe_set", "write_source", "probe_set"], req)).toBeUndefined(); // 以第一次出現為準
+    expect(checkToolOrder(["read_source", "write_source"], req)).toMatch(/沒有呼叫 probe_set/);
+    expect(checkToolOrder(["write_source", "probe_set"], req)).toMatch(/出現得太早/);
+    expect(checkToolOrder(["probe_set"], req)).toMatch(/沒有呼叫 write_source/);
+  });
+
+  it("parseTask 讀 allow_probes 與 require_tool_order;預設關閉", () => {
+    const base = "id: x\ntitle: t\nprompt: p\nchecks: [{kind: answer_contains, all: [a]}]\n";
+    expect(parseTask(base, "a.yaml", "X").allowProbes).toBe(false);
+    const t = parseTask(base + "allow_probes: true\nrequire_tool_order: [probe_set, write_source]\n", "a.yaml", "X");
+    expect(t.allowProbes).toBe(true);
+    expect(t.requireToolOrder).toEqual(["probe_set", "write_source"]);
+    expect(() => parseTask(base + "require_tool_order: []\n", "a.yaml", "X")).toThrow(/require_tool_order/);
+  });
+
+  it("evalEnv:只有 allow_probes 或 --probes 才開 ABAP_MCP_ALLOW_PROBES,不改 .env 的設定", () => {
+    const base = { ABAP_MCP_ALLOW_PROBES: "false" } as NodeJS.ProcessEnv;
+    expect(evalEnv(base, { allowedPackages: undefined, allowProbes: false }).ABAP_MCP_ALLOW_PROBES).toBe("false");
+    expect(evalEnv(base, { allowedPackages: undefined, allowProbes: true }).ABAP_MCP_ALLOW_PROBES).toBe("true");
+    expect(evalEnv(base, { allowedPackages: undefined, allowProbes: false }, true).ABAP_MCP_ALLOW_PROBES).toBe("true");
+    expect(base.ABAP_MCP_ALLOW_PROBES).toBe("false");
+  });
+
+  it("parseArgs 接受 --probes;parseStreamJson 回傳工具呼叫順序(不含 ToolSearch)", () => {
+    expect(parseArgs(["--probes", "--dry-run"]).flags.has("probes")).toBe(true);
+    const line = (name: string) => JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name }] } });
+    const r = parseStreamJson([line("ToolSearch"), line("mcp__abap-a4h__read_source"), line("mcp__abap-a4h__probe_set"), line("mcp__abap-a4h__write_source")].join("\n"));
+    expect(r.toolOrder).toEqual(["read_source", "probe_set", "write_source"]);
   });
 });

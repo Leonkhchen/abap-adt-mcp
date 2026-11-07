@@ -15,7 +15,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 import { createHarness, evalEnv } from "./lib/harness.js";
-import { loadTasks, selectTasks, type EvalTask } from "./lib/tasks.js";
+import { checkToolOrder, loadTasks, selectTasks, type EvalTask } from "./lib/tasks.js";
 import { USAGE, parseArgs } from "./lib/args.js";
 import { ADAPTERS, parseModelSpecs, type ModelSpec } from "./lib/adapters.js";
 import { writeReports, type TaskResult } from "./lib/report.js";
@@ -28,10 +28,11 @@ interface RunOpts {
   budget: number;
   logDir: string;
   suffix: string;
+  probes: boolean;
 }
 
 async function runTask(task: EvalTask, spec: ModelSpec, opts: RunOpts): Promise<TaskResult> {
-  const h = await createHarness(evalEnv(process.env, task));
+  const h = await createHarness(evalEnv(process.env, task, opts.probes));
   const result: TaskResult = { task: task.id, title: task.title, model: opts.dryRun ? "dry-run" : spec.label, passed: false, details: [], cleanup: [], suffix: opts.suffix };
   try {
     try {
@@ -41,6 +42,7 @@ async function runTask(task: EvalTask, spec: ModelSpec, opts: RunOpts): Promise<
       return result;
     }
     let answer = "";
+    let orderProblem = false;
     if (!opts.dryRun) {
       const run = await ADAPTERS[spec.adapter].run({
         prompt: task.prompt,
@@ -53,6 +55,7 @@ async function runTask(task: EvalTask, spec: ModelSpec, opts: RunOpts): Promise<
           ABAP_MCP_SYSTEM_ROLE: "dev",
           ABAP_MCP_READONLY: "false",
           ABAP_MCP_ALLOW_DATA_PREVIEW: "true",
+          ABAP_MCP_ALLOW_PROBES: h.cfg.safety.probes.enabled ? "true" : "false",
           ABAP_MCP_ALLOWED_PREFIXES: h.cfg.safety.allowedPrefixes.join(","),
           ABAP_MCP_ALLOWED_PACKAGES: h.cfg.safety.allowedPackages.join(","),
           ABAP_MCP_AUDIT_LOG: "",
@@ -67,10 +70,17 @@ async function runTask(task: EvalTask, spec: ModelSpec, opts: RunOpts): Promise<
       answer = run.answer;
       const { answer: _a, ...rest } = run;
       result.run = { ...rest, answerPreview: run.answer.slice(0, 500) };
+      if (task.requireToolOrder) {
+        const p = checkToolOrder(run.toolOrder, task.requireToolOrder);
+        if (p) {
+          result.details.push(p);
+          orderProblem = true;
+        }
+      }
       if (run.timedOut) result.details.push(`逾時(${Math.round(opts.timeoutMs / 60_000)} 分鐘)`);
     }
     const c = await h.check(task, answer);
-    result.passed = c.passed && !result.run?.timedOut;
+    result.passed = c.passed && !result.run?.timedOut && !orderProblem;
     result.details.push(...c.details);
     return result;
   } finally {
@@ -130,7 +140,7 @@ async function main() {
       const task = loadTasks(taskDir, suffix, [t.id])[0];
       const t0 = Date.now();
       console.log(`▶ ${task.id} ${task.title}(${dryRun ? "dry-run" : spec.label},尾碼 ${suffix})`);
-      const r = await runTask(task, spec, { dryRun, timeoutMs, budget, logDir, suffix });
+      const r = await runTask(task, spec, { dryRun, timeoutMs, budget, logDir, suffix, probes: parsed.flags.has("probes") });
       r.wallSeconds = Math.round((Date.now() - t0) / 1000);
       results.push(r);
       const cost = r.run ? ` $${r.run.costUsd.toFixed(4)}、${r.run.turns} 回合、${r.run.toolCalls} 次工具` : "";

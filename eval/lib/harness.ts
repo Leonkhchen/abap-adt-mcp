@@ -41,10 +41,12 @@ export interface Harness {
 }
 
 /** 評測用的設定:可讀寫、開啟 data_preview(第 7 題),其餘沿用 .env / 環境變數 */
-export function evalEnv(base: NodeJS.ProcessEnv = process.env, task?: Pick<EvalTask, "allowedPackages">): NodeJS.ProcessEnv {
+export function evalEnv(base: NodeJS.ProcessEnv = process.env, task?: Pick<EvalTask, "allowedPackages" | "allowProbes">, probes = false): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base, ABAP_MCP_READONLY: "false", ABAP_MCP_SYSTEM_ROLE: "dev", ABAP_MCP_ALLOW_DATA_PREVIEW: "true" };
   // ZINV 題:只開 $ZINV 的寫入範圍(這題才開,原本的題目不受影響)
   if (task?.allowedPackages?.length) env.ABAP_MCP_ALLOWED_PACKAGES = task.allowedPackages.join(",");
+  // 探針工具預設關閉:題目標了 allow_probes 或命令列帶 --probes 才開(只影響這個 MCP 設定,不動 .env)
+  if (task?.allowProbes || probes) env.ABAP_MCP_ALLOW_PROBES = "true";
   return env;
 }
 

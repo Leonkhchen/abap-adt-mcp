@@ -6,6 +6,8 @@
  *   tags?:             [zinv, legacy …]   `--tags` 篩選用
  *   opt_in?:           true   預設不跑;要用 --tags / --tasks 明確選到才跑(會動共用物件的題組用)
  *   allowed_packages?: [$ZINV]            這題的 MCP 設定 ABAP_MCP_ALLOWED_PACKAGES(沒寫就用 .env / 預設,舊題不受影響)
+ *   allow_probes?:     true   這題的 MCP 設定開啟探針工具(ABAP_MCP_ALLOW_PROBES);其他題用 --probes 一次打開
+ *   require_tool_order?: [probe_set, write_source]   模型的工具呼叫要依這個順序(各取第一次出現)都出現過;例如「先用探針取值再修」
  *   timeout_min? / budget_usd? / tool_timeout_sec?   這題的逾時、費用上限、MCP 工具逾時(大檔案讀取較慢時調高)
  *   restore?:          [source URL …]     這題可能被修改的共用物件:作答前讀出、作答後(不論成敗)寫回並比對
  *   restore_verify?:   { object_url, passed }   還原後必須跑出 passed/passed 的基準單元測試
@@ -55,11 +57,25 @@ export interface EvalTask {
   tags: string[];
   optIn: boolean;
   allowedPackages?: string[];
+  allowProbes: boolean;
+  requireToolOrder?: string[];
   timeoutMin?: number;
   budgetUsd?: number;
   toolTimeoutSec?: number;
   restore: string[];
   restoreVerify?: { object_url: string; passed: number };
+}
+
+/** 工具呼叫順序檢查:required 的每個工具都要出現過,而且第一次出現的先後符合 required 的順序;回傳問題(沒問題回 undefined) */
+export function checkToolOrder(order: string[], required: string[]): string | undefined {
+  let last = -1;
+  for (const t of required) {
+    const i = order.indexOf(t);
+    if (i < 0) return `模型沒有呼叫 ${t}(要求的順序:${required.join(" → ")})`;
+    if (i < last) return `${t} 出現得太早:要求的順序是 ${required.join(" → ")},實際第一次呼叫順序是 ${required.map((x) => `${x}@${order.indexOf(x) + 1}`).join("、")}`;
+    last = i;
+  }
+  return undefined;
 }
 
 /** 名稱佔位符:6 碼英數(大寫版給物件名稱、小寫版給 URI) */
@@ -163,6 +179,8 @@ export function parseTask(text: string, file: string, sfx: string): EvalTask {
     tags: strList("tags") ?? [],
     optIn: raw.opt_in === true,
     allowedPackages: strList("allowed_packages"),
+    allowProbes: raw.allow_probes === true,
+    requireToolOrder: strList("require_tool_order"),
     timeoutMin: posNum("timeout_min"),
     budgetUsd: posNum("budget_usd"),
     toolTimeoutSec: posNum("tool_timeout_sec"),
