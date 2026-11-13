@@ -159,19 +159,51 @@ export interface ProbeRunRecord {
   triggerInput?: unknown;
   triggerOutcome?: string;
   timeoutSeconds: number;
-  probes: { id: string; location: string; sourceUrl: string; line: number; kind: string; fields: string[]; condition?: string; maxHits: number; hits: ProbeHit[]; full: boolean; error?: string; dlpId?: string }[];
+  probes: { id: string; location: string; sourceUrl: string; line: number; kind: string; fields: string[]; condition?: string; maxHits: number; hits: ProbeHit[]; full: boolean; error?: string; dlpId?: string; /** 模式 B:SAP 上的中斷點沒有確認刪除 */ bpLeftover?: boolean }[];
   notes: string[];
+}
+
+/** 建立時回傳解碼後的 id,清單回傳編碼過的 URL:統一成解碼後的 id 才能比對與去重 */
+export function dlpKey(id: string): string {
+  const raw = id.replace(/^\/sap\/bc\/adt\/dlp\/logpoints\//, "");
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
 }
 
 export class ProbeStore {
   private runs: ProbeRunRecord[] = [];
   private counter = 0;
+  /** 已被淘汰的執行編號(歷史紀錄有容量上限) */
+  private evicted = new Set<string>();
+  /**
+   * SAP 上仍啟用中的 logpoint(v0.6 第二次審查 P2-3):與有容量上限的歷史紀錄分開登錄,
+   * 保留到確認刪除(或已不存在);淘汰歷史紀錄不影響它,shutdown 與 probe_delete 都從這裡清。
+   */
+  private live = new Map<string, string>();
 
   add(r: Omit<ProbeRunRecord, "id">): ProbeRunRecord {
     const rec = { ...r, id: `run-${++this.counter}` };
     this.runs.push(rec);
-    while (this.runs.length > MAX_STORED_RUNS) this.runs.shift();
+    while (this.runs.length > MAX_STORED_RUNS) {
+      const old = this.runs.shift();
+      if (old) this.evicted.add(old.id);
+    }
     return rec;
+  }
+  wasEvicted(id: string): boolean {
+    return this.evicted.has(id);
+  }
+  trackLive(id: string): void {
+    this.live.set(dlpKey(id), id);
+  }
+  untrackLive(id: string): void {
+    this.live.delete(dlpKey(id));
+  }
+  liveIds(): string[] {
+    return [...this.live.values()];
   }
   list(): ProbeRunRecord[] {
     return [...this.runs];
@@ -215,13 +247,13 @@ export function formatHit(h: ProbeHit): string {
 
 export function formatRunSummary(r: ProbeRunRecord): string {
   const out = [
-    `${r.status === "completed" || r.status === "all_full" || r.status === "active" ? "✅" : r.status === "timeout" ? "⏱️" : "❌"} 探針執行 ${r.id}(模式 ${r.mode === "dlp" ? "A:Dynamic Logpoints" : "B:debugger 快照"}):${STATUS_TEXT[r.status]}`,
+    `${r.probes.some((p) => p.bpLeftover) ? "⚠️" : r.status === "completed" || r.status === "all_full" || r.status === "active" ? "✅" : r.status === "timeout" ? "⏱️" : "❌"} 探針執行 ${r.id}(模式 ${r.mode === "dlp" ? "A:Dynamic Logpoints" : "B:debugger 快照"}):${STATUS_TEXT[r.status]}`,
     `觸發:${r.trigger}${r.triggerOutcome ? `;結果:${r.triggerOutcome}` : ""}`,
   ];
   for (const p of r.probes) {
     out.push(
       `- ${p.id} ${p.location}(${p.kind}${p.fields.length ? `:${p.fields.join(", ")}` : ""}${p.condition ? `;條件 ${p.condition}` : ""}):` +
-        (p.error ? `❌ 中斷點設定失敗:${p.error}` : `命中 ${p.hits.length}/${p.maxHits} 次${p.full ? (r.mode === "dlp" ? "(已讀滿 max_hits 個不同的值)" : "(已收滿並移除)") : ""}`)
+        (p.error ? `❌ 中斷點設定失敗:${p.error}` : `命中 ${p.hits.length}/${p.maxHits} 次${p.bpLeftover ? "  ⚠️ SAP 上的中斷點沒有確認刪除(見下方說明)" : p.full ? (r.mode === "dlp" ? "(已讀滿 max_hits 個不同的值)" : "(已收滿並移除)") : ""}`)
     );
   }
   if (r.activeUntil) out.push(`有效到 ${r.activeUntil}。程式執行後用 probe_logs(run_id="${r.id}")讀取,用完請 probe_delete(run_id="${r.id}")移除 logpoint。`);
@@ -327,29 +359,21 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
   };
 
   // MCP 結束時(stdin 關閉 / SIGINT / SIGTERM):移除這個 process 建立、還在 SAP 上啟用的 logpoint(紀錄在記憶體,重開後讀不到了)
+  // 從「仍啟用的 logpoint 登錄」清,不依賴會被淘汰的歷史紀錄(第二次審查 P2-3)
   registerCleanup(async () => {
-    const ids = store.list().flatMap((r) => (r.mode === "dlp" ? r.probes.map((p) => p.dlpId).filter((x): x is string => !!x) : []));
-    await deleteLogpoints(ids);
+    await deleteLogpoints(store.liveIds());
   });
-
-  /** 建立時回傳解碼後的 id,清單回傳編碼過的 URL:統一成解碼後的 id 才能去重 */
-  const dlpKey = (id: string): string => {
-    const raw = id.replace(/^\/sap\/bc\/adt\/dlp\/logpoints\//, "");
-    try {
-      return decodeURIComponent(raw);
-    } catch {
-      return raw;
-    }
-  };
 
   const deleteLogpoints = async (ids: string[]): Promise<string[]> => {
     const errs: string[] = [];
     for (const id of [...new Map(ids.map((i) => [dlpKey(i), i])).values()]) {
       try {
         await adt.dlpDelete(id);
+        store.untrackLive(id);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        if (!/does not exist|not found|404/i.test(msg)) errs.push(`${id}:${msg}`); // 已逾期或被刪掉 = 目的已達成
+        if (/does not exist|not found|404/i.test(msg)) store.untrackLive(id); // 已逾期或被刪掉 = 目的已達成
+        else errs.push(`${id}:${msg}`);
       }
     }
     return errs;
@@ -558,6 +582,7 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
                     description: DLP_TAG,
                     minutes,
                   });
+                  store.trackLive(st.dlpId); // 登錄「SAP 上仍活著」的 logpoint,與會被淘汰的歷史紀錄分開(P2-3)
                 } catch (e) {
                   st.error = e instanceof Error ? e.message : String(e);
                 }
@@ -660,6 +685,7 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
               hits: s.hits,
               full: s.full,
               error: s.error,
+              bpLeftover: !!(s.bpId && !s.bpDeleted),
             })),
             notes: result.notes,
           });
@@ -705,11 +731,18 @@ export function registerProbeTools(server: McpServer, adt: AdtService, cfg: AppC
       writes.run(async () => {
         try {
           if (!!run_id === !!all) throw new GuardViolationError("run_id 與 all 必須擇一提供。");
-          // 模式 A:先移除 SAP 上的 logpoint(all 時連同先前 MCP process 留下、描述有 abap-adt-mcp 標記的)
+          // 紀錄已被淘汰(只保留最近 MAX_STORED_RUNS 筆):對應不到它的 logpoint,明說並提示用 all=true,不假裝成功
+          if (run_id && !store.get(run_id) && store.wasEvicted(run_id)) {
+            throw new GuardViolationError(
+              `${run_id} 的紀錄已被淘汰(只保留最近 ${MAX_STORED_RUNS} 筆),無法對應它的 logpoint。若 SAP 上還有這次建立的 logpoint,請用 probe_delete(all=true) 清除(也會清掉先前留下、帶 ${DLP_TAG} 標記的)。`
+            );
+          }
+          // 模式 A:先移除 SAP 上的 logpoint(all 時連同「仍啟用的登錄」與先前 MCP process 留下、描述有 abap-adt-mcp 標記的)
           const errs: string[] = [];
           let removed = 0;
           const dlpRuns = (all ? store.list() : [store.get(run_id!)]).filter((r): r is ProbeRunRecord => !!r && r.mode === "dlp");
           const ids = dlpRuns.flatMap((r) => r.probes.map((p) => p.dlpId).filter((x): x is string => !!x));
+          if (all) for (const id of store.liveIds()) if (!ids.some((i) => dlpKey(i) === dlpKey(id))) ids.push(id);
           if (all && (await adt.dlpAvailable().catch(() => false))) {
             for (const e of await adt.dlpList()) if (e.description.startsWith(DLP_TAG) && !ids.some((i) => dlpKey(i) === dlpKey(e.location))) ids.push(e.location);
           }

@@ -26,10 +26,15 @@
 - 探針進行中 MCP 被結束時,中斷點、監聽、探針專用 session、logpoint 都會先清掉(新增 `src/adt/cleanup.ts`)。
 - `ABAP_MCP_PROBE_DENY` 也比對 include 所屬的主程式與 function group;`ABAP_MCP_PROBE_SCOPE=custom` 在白名單都空時拒絕。
 - 模式 B 讀不到指定變數時回報「讀不到」,不再退回第一個變數。
-- 文件校正:`save_as` 的 `condition` 是原文、模式 A 的 `max_hits` 是「最多讀幾個不同的值」;模式 B 單次停住的處理遵守總逾時。
+- 文件校正:`save_as` 的 `condition` 是原文、模式 A 的 `max_hits` 是「最多讀幾個不同的值」。
+
+### 第二次審查後的修正(`v06review.md`,3 項 P2)
+- **模式 B 收滿 `max_hits` 時刪除中斷點失敗**:「收滿」與「SAP 上的中斷點已確認刪除」分開記錄(`bpDeleted`)。刪除失敗不再被吞掉:`finally` 與 shutdown abort 會重試所有尚未確認刪除的中斷點(最多 3 輪);仍失敗就在結果與 notes 明確警告(摘要不再寫「已收滿並移除」),請手動清除。
+- **模式 B 總逾時涵蓋停駐處理**:`attach` / `stack` / `variables` / `continue` 每個請求都受剩餘期限約束;逾時就停止收值(之後不再對 port 發請求,避免與清理競爭同一個 session),狀態為 `timeout`,再進入清理。清理的每個請求有 8 秒上限、整體有 30 秒上限(超過就不再重試刪除,仍會嘗試登出)。引擎計時器改為 `unref`。
+- **模式 A 仍啟用的 logpoint 不會因歷史紀錄淘汰而遺失**:「SAP 上仍活著的 logpoint id」與最多 20 筆的歷史紀錄分開登錄,保留到確認刪除(或已不存在)。shutdown 清理與 `probe_delete(all=true)` 都從這份登錄清;`probe_delete(run_id)` 遇到已被淘汰的紀錄會明說並提示用 `all=true`。
 
 ### 測試
-- 單元測試 356;整合測試 T01–T52(T41–T49 為探針)。
+- 單元測試 364;整合測試 T01–T52(T41–T49 為探針)。
 
 
 ## 0.5.1 — 安全與一致性修正(2026-11-04)

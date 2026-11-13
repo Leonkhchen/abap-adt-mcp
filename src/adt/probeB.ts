@@ -60,6 +60,10 @@ export interface ProbeState {
   error?: string;
   /** 已收滿 max_hits */
   full: boolean;
+  /** SAP 上的中斷點已確認刪除(收滿 ≠ 已刪除;沒有確認就不可宣稱已移除) */
+  bpDeleted?: boolean;
+  /** 最後一次刪除失敗的原因 */
+  bpDeleteError?: string;
 }
 
 export interface BreakpointRequest {
@@ -98,13 +102,19 @@ export interface EngineDeps {
   /** 總逾時計時器:ms 毫秒後完成(單元測試可控制「逾時」或「永不逾時」) */
   timer(ms: number): Promise<void>;
   now(): number;
+  /** 清理階段單一請求的上限計時器(沒給就用真的計時器;單元測試可控制) */
+  cleanupTimer?(ms: number): Promise<void>;
   /** 開始監聽後,等多久再觸發執行(讓 SAP 端先登記好監聽) */
   warmupMs: number;
 }
 
 export const realDeps: EngineDeps = {
   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
-  timer: (ms) => new Promise((r) => setTimeout(r, ms)),
+  // unref:計時器不該讓 process 多活到逾時(結束時 shutdown 不用等它)
+  timer: (ms) =>
+    new Promise((r) => {
+      setTimeout(r, ms).unref?.();
+    }),
   now: () => Date.now(),
   warmupMs: 1500,
 };
@@ -140,12 +150,28 @@ export const ZERO_HIT_NOTE =
   "命中 0 次。可能原因:程式沒有執行到該行、該行不是可執行的陳述式、條件從未成立," +
   "或程式在 update task / 背景 RFC / 背景作業中執行(一般 debugger 監聽不會在那裡停下來)。";
 
+/** 清理時每個 ADT 請求最多等多久;整個清理階段的總上限(超過就不再重試刪除,仍會嘗試登出) */
+const CLEANUP_STEP_MS = 8000;
+const CLEANUP_TOTAL_MS = 30_000;
+/** finally / abort 刪除中斷點最多試幾次(收滿當下另外試 1 次;持續失敗就在結果裡明確警告,不宣稱已移除) */
+export const DELETE_ATTEMPTS = 3;
+
+/** 停駐處理超過總逾時(或被 abort):handleStop 之後不可再對 port 發任何請求 */
+class DeadlineError extends Error {
+  constructor() {
+    super("探針總逾時");
+  }
+}
+
+const EXPIRED_NOTE = "處理停駐的程式時已超過總逾時,已停止收值並進入清理(讓程式繼續跑完或終止)。";
+
 export async function runDebuggerProbes(port: DebugPort, input: EngineInput, deps: EngineDeps = realDeps): Promise<EngineResult> {
   const states: ProbeState[] = input.probes.map((spec) => ({ spec, hits: [], full: false }));
   const notes: string[] = [];
   let status: EngineStatus = "completed";
   let triggerOutcome: string | undefined;
   const deadline = deps.now() + input.timeoutSeconds * 1000;
+  const stepTimer = deps.cleanupTimer ?? realDeps.timer;
 
   type ListenOutcome = { debuggee?: { debuggeeId: string }; error?: string };
   type TriggerOutcome = { ok: boolean; text: string };
@@ -158,53 +184,138 @@ export async function runDebuggerProbes(port: DebugPort, input: EngineInput, dep
   let listenP: Promise<ListenOutcome> | undefined;
   let triggerP: Promise<TriggerOutcome> | undefined;
   let attached = false;
+  /** 逾時或被 abort 之後為 true:handleStop 不再使用 port,避免與清理競爭同一個 session */
+  let halted = false;
+  let cleanupStart = 0;
+  const cleanupOver = () => deps.now() - cleanupStart > CLEANUP_TOTAL_MS;
+
+  /** 清理用:單一請求有上限,逾時或失敗都不丟例外 */
+  const step = <T>(fn: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false; error: string }> => {
+    const p = Promise.resolve().then(fn);
+    return Promise.race([
+      p.then(
+        (value) => ({ ok: true as const, value }),
+        (e) => ({ ok: false as const, error: errMsg(e) })
+      ),
+      stepTimer(CLEANUP_STEP_MS).then(() => ({ ok: false as const, error: `逾時(${CLEANUP_STEP_MS / 1000} 秒)` })),
+    ]);
+  };
+
+  /** 刪一個中斷點;成功才記為已刪除(收滿 ≠ 已刪除:SAP 上的中斷點要確認刪掉才算) */
+  const tryDelete = async (s: ProbeState): Promise<boolean> => {
+    if (!s.bpId || s.bpDeleted) return true;
+    const r = await step(() => port.deleteBreakpoint(s.bpId!));
+    if (r.ok) {
+      s.bpDeleted = true;
+      s.bpDeleteError = undefined;
+      return true;
+    }
+    s.bpDeleteError = r.error;
+    return false;
+  };
+
+  /** 重試刪除所有尚未確認刪除的中斷點(最多 DELETE_ATTEMPTS 輪) */
+  const deleteAll = async (): Promise<void> => {
+    for (let attempt = 0; attempt < DELETE_ATTEMPTS; attempt++) {
+      const pending = states.filter((s) => s.bpId && !s.bpDeleted);
+      if (pending.length === 0) return;
+      if (attempt > 0) {
+        if (cleanupOver()) return;
+        await deps.sleep(200);
+      }
+      for (const s of pending) await tryDelete(s);
+    }
+  };
+
+  /** 讓停住的程式繼續跑完;繼續失敗就終止 */
+  const releaseDebuggee = async (): Promise<void> => {
+    if (!attached) return;
+    const c = await step(() => port.continue());
+    if (!c.ok) await step(() => port.terminate());
+    attached = false;
+  };
 
   input.registerAbort?.(async () => {
-    for (const s of states) if (s.bpId && !s.full) await port.deleteBreakpoint(s.bpId).catch(() => undefined);
-    await port.cancelListen().catch(() => undefined);
-    if (attached) {
-      try {
-        await port.continue();
-      } catch {
-        await port.terminate().catch(() => undefined);
-      }
-    }
-    await port.close().catch(() => undefined);
+    halted = true;
+    cleanupStart = deps.now();
+    await deleteAll();
+    await step(() => port.cancelListen());
+    await releaseDebuggee();
+    await step(() => port.close());
   });
 
   const allDone = () => states.every((s) => s.full || s.error);
 
-  /** 處理一個停住的程式:attach → 讀值 → 自動繼續,直到跑完或不再停下 */
-  const handleStop = async (debuggeeId: string) => {
-    let reached = (await port.attach(debuggeeId)).reachedBreakpointIds;
-    attached = true;
-    for (let i = 0; i < MAX_STOPS_PER_DEBUGGEE; i++) {
-      if (i > 0 && deps.now() > deadline) break; // 逾時:交給 finally 讓程式繼續跑完(審查 #6)
-      const stack = await port.stack().catch(() => [] as StackFrame[]);
-      const hitStates = reached.length
-        ? states.filter((s) => s.bpId && reached.includes(s.bpId))
-        : // SAP 沒告知中斷點編號時,退而用最上層堆疊的行號對應
-          states.filter((s) => s.bpId && stack[0] && stack[0].line === s.spec.line);
-      for (const s of hitStates) {
-        if (s.full) continue;
-        const hit: ProbeHit = { n: s.hits.length + 1, at: new Date(deps.now()).toISOString() };
-        if (s.spec.kind === "stack") hit.stack = stack.slice(0, MAX_STACK_FRAMES);
-        else hit.variables = await port.variables(s.spec.variables).catch((e) => s.spec.variables.map((name) => ({ name, value: "", note: `讀取失敗:${errMsg(e)}` })));
-        s.hits.push(hit);
-        if (s.hits.length >= s.spec.maxHits) {
-          s.full = true;
-          // 收滿就刪掉自己的中斷點,程式之後不再為它停下來
-          if (s.bpId) await port.deleteBreakpoint(s.bpId).catch(() => undefined);
+  /**
+   * 處理一個停住的程式:attach → 讀值 → 自動繼續,直到跑完或不再停下。
+   * 每個 ADT 請求都受剩餘期限約束:逾時就丟 DeadlineError、設 halted,之後不再碰 port(卡住的請求放著,清理另走獨立上限)。
+   * 回傳 true = 因逾時中止(呼叫端要停止收值、進入清理)。
+   */
+  const handleStop = async (debuggeeId: string): Promise<boolean> => {
+    const expired = deps.timer(Math.max(0, deadline - deps.now())).then(() => "expired" as const);
+    const call = async <T>(fn: () => Promise<T>): Promise<T> => {
+      if (halted) throw new DeadlineError();
+      const p = Promise.resolve().then(fn);
+      p.catch(() => undefined); // 逾時後這個請求才失敗也不能變成 unhandled rejection
+      const r = await Promise.race([p.then((v) => ({ v })), expired.then(() => undefined)]);
+      if (halted || r === undefined) {
+        halted = true;
+        throw new DeadlineError();
+      }
+      return r.v;
+    };
+    try {
+      attached = true; // 先當作已接上:attach 卡住逾時時,清理仍會嘗試繼續 / 終止
+      let reached: string[];
+      try {
+        reached = (await call(() => port.attach(debuggeeId))).reachedBreakpointIds;
+      } catch (e) {
+        if (!(e instanceof DeadlineError)) attached = false;
+        throw e;
+      }
+      for (let i = 0; i < MAX_STOPS_PER_DEBUGGEE; i++) {
+        if (i > 0 && deps.now() >= deadline) throw new DeadlineError();
+        const stack = await call(() => port.stack()).catch((e) => {
+          if (e instanceof DeadlineError) throw e;
+          return [] as StackFrame[];
+        });
+        const hitStates = reached.length
+          ? states.filter((s) => s.bpId && reached.includes(s.bpId))
+          : // SAP 沒告知中斷點編號時,退而用最上層堆疊的行號對應
+            states.filter((s) => s.bpId && stack[0] && stack[0].line === s.spec.line);
+        for (const s of hitStates) {
+          if (s.full) continue;
+          const hit: ProbeHit = { n: s.hits.length + 1, at: new Date(deps.now()).toISOString() };
+          if (s.spec.kind === "stack") hit.stack = stack.slice(0, MAX_STACK_FRAMES);
+          else {
+            hit.variables = await call(() => port.variables(s.spec.variables)).catch((e) => {
+              if (e instanceof DeadlineError) throw e;
+              return s.spec.variables.map((name) => ({ name, value: "", note: `讀取失敗:${errMsg(e)}` }));
+            });
+          }
+          s.hits.push(hit);
+          if (s.hits.length >= s.spec.maxHits) {
+            s.full = true;
+            // 收滿就刪掉自己的中斷點,程式之後不再為它停下來;失敗不影響已收到的值,但會留給 finally 重試並在結果警告
+            if (s.bpId) await tryDelete(s);
+          }
         }
+        const next = await call(() => port.continue());
+        if (next.ended || next.reachedBreakpointIds.length === 0) {
+          attached = false;
+          return false;
+        }
+        reached = next.reachedBreakpointIds;
       }
-      const next = await port.continue();
-      if (next.ended || next.reachedBreakpointIds.length === 0) {
-        attached = false;
-        return;
+      notes.push(`同一次執行停下超過 ${MAX_STOPS_PER_DEBUGGEE} 次,已強制結束處理。`);
+      return false;
+    } catch (e) {
+      if (e instanceof DeadlineError) {
+        halted = true;
+        return true;
       }
-      reached = next.reachedBreakpointIds;
+      throw e;
     }
-    notes.push(`同一次執行停下超過 ${MAX_STOPS_PER_DEBUGGEE} 次,已強制結束處理。`);
   };
 
   try {
@@ -262,13 +373,23 @@ export async function runDebuggerProbes(port: DebugPort, input: EngineInput, dep
           notes.push(`觸發執行失敗:${winner.r.text}`);
           // 程式在斷點前就出錯也可能已經停過;看一眼有沒有等待處理的停駐
           const late = await Promise.race([listenP, deps.sleep(300).then(() => undefined)]);
-          if (late?.debuggee) await handleStop(late.debuggee.debuggeeId).catch((e) => notes.push(`處理停駐時出錯:${errMsg(e)}`));
+          if (late?.debuggee) {
+            const expired = await handleStop(late.debuggee.debuggeeId).catch((e) => {
+              notes.push(`處理停駐時出錯:${errMsg(e)}`);
+              return false;
+            });
+            if (expired) notes.push(EXPIRED_NOTE);
+          }
           break;
         }
         // 觸發的程式已跑完;給監聽 300ms 看有沒有最後一個停駐還沒處理
         const late = await Promise.race([listenP, deps.sleep(300).then(() => undefined)]);
         if (late?.debuggee) {
-          await handleStop(late.debuggee.debuggeeId);
+          if (await handleStop(late.debuggee.debuggeeId)) {
+            status = "timeout";
+            notes.push(EXPIRED_NOTE);
+            break;
+          }
           listenP = startListen();
           continue;
         }
@@ -287,7 +408,11 @@ export async function runDebuggerProbes(port: DebugPort, input: EngineInput, dep
         listenP = startListen();
         continue;
       }
-      await handleStop(r.debuggee.debuggeeId);
+      if (await handleStop(r.debuggee.debuggeeId)) {
+        status = "timeout";
+        notes.push(EXPIRED_NOTE);
+        break;
+      }
       listenP = allDone() ? undefined : startListen();
       if (!listenP) {
         status = "all_full";
@@ -299,38 +424,37 @@ export async function runDebuggerProbes(port: DebugPort, input: EngineInput, dep
     status = "error";
     notes.push(`探針執行中出錯:${errMsg(e)}`);
   } finally {
-    // 4. 清除(不論成敗):刪中斷點 → 關閉監聽 → 讓停住的程式跑完或終止 → 等觸發結束 → 登出
-    for (const s of states) {
-      if (s.bpId && !s.full) await port.deleteBreakpoint(s.bpId).catch(() => undefined);
-    }
-    await port.cancelListen().catch(() => undefined);
+    // 4. 清除(不論成敗;每個請求與整體都有上限):刪中斷點(重試)→ 關閉監聽 → 讓停住的程式跑完或終止 → 等觸發結束 → 登出
+    halted = true;
+    cleanupStart = deps.now();
+    await deleteAll();
+    await step(() => port.cancelListen());
     if (listenP) {
       const late = await Promise.race([listenP, deps.sleep(3000).then(() => undefined)]);
       if (late?.debuggee && !attached) {
         // 取消監聽的同時剛好有程式停下:不讓它停在那裡
-        try {
-          await port.attach(late.debuggee.debuggeeId);
-          attached = true;
-        } catch {
-          /* 接不上就交給 session 關閉 */
-        }
+        const a = await step(() => port.attach(late.debuggee!.debuggeeId));
+        if (a.ok) attached = true; // 接不上就交給 session 關閉
       }
     }
-    if (attached) {
-      try {
-        await port.continue();
-      } catch {
-        await port.terminate().catch(() => undefined);
-      }
-    }
+    await releaseDebuggee();
     if (triggerP) {
       const t = await Promise.race([triggerP, deps.sleep(8000).then(() => undefined)]);
       if (t) triggerOutcome ??= t.text;
       else notes.push("觸發的執行在清除時仍未結束(已放手,session 關閉後會終止)。");
     }
-    await port.close().catch(() => undefined);
+    await step(() => port.close());
   }
 
+  // 中斷點沒有確認刪除就不可宣稱已移除:明確警告(外部中斷點在 SAP 上屬於使用者,關閉 session 不保證會消失)
+  for (const s of states) {
+    if (s.bpId && !s.bpDeleted) {
+      notes.push(
+        `⚠️ 探針 ${s.spec.id} 的中斷點(${s.bpId})沒有成功刪除${s.bpDeleteError ? `:${s.bpDeleteError}` : ""}。` +
+          "請在 Eclipse 的 Breakpoints 視圖或 SAP GUI 清除,否則同帳號之後的執行仍會停在那裡。"
+      );
+    }
+  }
   if (states.some((s) => s.bpId && s.hits.length === 0) && status !== "error") notes.push(ZERO_HIT_NOTE);
   return { status, probes: states, triggerOutcome, notes };
 }

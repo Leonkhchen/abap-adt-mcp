@@ -67,15 +67,19 @@ function fakeClock(startMs = 1_000_000, opts: { timesOut?: boolean } = {}) {
  * 假 DebugPort:`stops` 是依序出現的「停駐」,每個停駐是一串連續停下的中斷點(同一次執行,continue 後又碰到下一個)。
  * listen() 每次回傳下一個停駐;沒有了就一直等(直到 cancelListen)。
  */
-function fakePort(o: { stops?: string[][]; bpErrors?: Record<string, string>; variablesFor?: (names: string[]) => { name: string; value: string }[]; failContinue?: boolean; listenError?: string } = {}) {
+function fakePort(o: { stops?: string[][]; bpErrors?: Record<string, string>; variablesFor?: (names: string[]) => { name: string; value: string }[]; failContinue?: boolean; listenError?: string; deleteFailures?: number; hangStack?: boolean } = {}) {
+  let deleteFailuresLeft = o.deleteFailures ?? 0;
+  let releaseStack: () => void = () => undefined;
+  const stackGate = new Promise<void>((r) => (releaseStack = r));
   const calls: string[] = [];
   const stops = [...(o.stops ?? [])];
   let resolveListen: ((v: { debuggeeId: string } | undefined) => void) | undefined;
   let current: string[] = [];
   let attachedNow = false;
   const bpIds = new Map<string, string>(); // clientId → bp id
-  const port: DebugPort & { calls: string[]; deleted: string[]; attachedNow: () => boolean } = {
+  const port: DebugPort & { calls: string[]; deleted: string[]; attachedNow: () => boolean; releaseStack: () => void } = {
     calls,
+    releaseStack: () => releaseStack(),
     deleted: [],
     attachedNow: () => attachedNow,
     async setBreakpoints(reqs: BreakpointRequest[]): Promise<BreakpointResult[]> {
@@ -89,6 +93,10 @@ function fakePort(o: { stops?: string[][]; bpErrors?: Record<string, string>; va
     },
     async deleteBreakpoint(id) {
       calls.push(`deleteBreakpoint:${id}`);
+      if (deleteFailuresLeft > 0) {
+        deleteFailuresLeft--;
+        throw new Error("delete failed");
+      }
       port.deleted.push(id);
     },
     listen() {
@@ -113,6 +121,8 @@ function fakePort(o: { stops?: string[][]; bpErrors?: Record<string, string>; va
       return { reachedBreakpointIds: current.length ? [current[0]] : [] };
     },
     async stack() {
+      calls.push("stack");
+      if (o.hangStack) await stackGate;
       return [{ program: "ZCL_INV_POSTING=====CP", include: "ZCL_INV_POSTING=====CM00A", line: 173, event: "METHOD CALC_ISSUE_AMT" }];
     },
     async variables(names) {
@@ -839,5 +849,158 @@ describe("審查 #2/#3:排除清單涵蓋 include 的主程式;custom 在白名�
     if (cfg.safety.allowedPrefixes.length === 0 && cfg.safety.allowedPackages.length === 0) {
       expect(() => assertProbeAllowed(cfg, "/sap/bc/adt/oo/classes/zcl_x/source/main", "$TMP")).toThrow(/白名單都是空的/);
     }
+  });
+});
+
+// ───────────────────────── 第二次審查(v06review.md)P2-1 / P2-2 / P2-3 ─────────────────────────
+import { DELETE_ATTEMPTS } from "../../src/adt/probeB.js";
+import { formatRunSummary } from "../../src/tools/probeTools.js";
+
+describe("P2-1:收滿後刪除中斷點失敗 → finally 重試、不宣稱已移除", () => {
+  const run = (port: ReturnType<typeof fakePort>) =>
+    runDebuggerProbes(port, { probes: [spec({ maxHits: 1 })], timeoutSeconds: 60, trigger: () => new Promise(() => {}) }, fakeClock().deps);
+
+  it("持續失敗:收滿當下試 1 次 + finally 重試 DELETE_ATTEMPTS 次;結果警告、bpDeleted 不為 true", async () => {
+    const port = fakePort({ stops: [["BP-p1"]], deleteFailures: Infinity });
+    const r = await run(port);
+    expect(r.status).toBe("all_full");
+    expect(r.probes[0].full).toBe(true);
+    expect(r.probes[0].bpDeleted).toBeFalsy();
+    expect(port.calls.filter((c) => c === "deleteBreakpoint:BP-p1")).toHaveLength(1 + DELETE_ATTEMPTS);
+    expect(r.notes.join("\n")).toMatch(/BP-p1.*沒有成功刪除.*delete failed/);
+    expect(port.calls[port.calls.length - 1]).toBe("close"); // 失敗也照樣清理完、登出
+    // 摘要不能說「已收滿並移除」
+    const text = formatRunSummary({
+      id: "run-1",
+      mode: "debugger",
+      createdAt: "t",
+      status: r.status,
+      trigger: "x",
+      timeoutSeconds: 60,
+      notes: r.notes,
+      probes: [{ id: "p1", location: "L", sourceUrl: URL_MAIN, line: 173, kind: "variables", fields: ["iv_qty"], maxHits: 1, hits: r.probes[0].hits, full: true, bpLeftover: true }],
+    });
+    expect(text).not.toContain("已收滿並移除");
+    expect(text).toContain("沒有確認刪除");
+    expect(text.startsWith("⚠️")).toBe(true);
+  });
+
+  it("收滿當下失敗、finally 重試成功:正常(已刪除、沒有警告、不重複刪)", async () => {
+    const port = fakePort({ stops: [["BP-p1"]], deleteFailures: 1 });
+    const r = await run(port);
+    expect(r.probes[0].bpDeleted).toBe(true);
+    expect(port.calls.filter((c) => c === "deleteBreakpoint:BP-p1")).toHaveLength(2); // 1 次失敗 + 1 次重試成功
+    expect(r.notes.join("\n")).not.toContain("沒有成功刪除");
+    expect(port.deleted).toEqual(["BP-p1"]);
+  });
+
+  it("abort(shutdown)也重試尚未確認刪除的中斷點", async () => {
+    const port = fakePort({ deleteFailures: 1 });
+    let abort: (() => Promise<void>) | undefined;
+    void runDebuggerProbes(port, { probes: [spec()], timeoutSeconds: 60, trigger: () => new Promise(() => {}), registerAbort: (f) => (abort = f) }, fakeClock().deps).catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 20));
+    await abort!();
+    expect(port.deleted).toEqual(["BP-p1"]); // 第 1 次失敗、第 2 次成功
+  });
+});
+
+describe("P2-2:總逾時涵蓋停駐處理(handleStop)", () => {
+  /** 可控制的計時器:所有 deps.timer 先掛著,測試一次放行 = 期限到 */
+  function controlledDeps() {
+    const base = fakeClock().deps;
+    const fire: (() => void)[] = [];
+    const deps: EngineDeps = { ...base, timer: () => new Promise<void>((r) => fire.push(r)) };
+    return { deps, expire: () => fire.splice(0).forEach((f) => f()) };
+  }
+  const waitFor = async (cond: () => boolean) => {
+    for (let i = 0; i < 200 && !cond(); i++) await new Promise((r) => setTimeout(r, 5));
+    expect(cond()).toBe(true);
+  };
+
+  it("stack() 卡住:期限到就返回 timeout、進入清理;卡住的請求之後釋放也不再有新的 port 呼叫", async () => {
+    const port = fakePort({ stops: [["BP-p1"]], hangStack: true });
+    const { deps, expire } = controlledDeps();
+    const p = runDebuggerProbes(port, { probes: [spec()], timeoutSeconds: 60, trigger: () => new Promise(() => {}) }, deps);
+    let done = false;
+    void p.then(() => (done = true));
+    await waitFor(() => port.calls.includes("stack"));
+    expect(done).toBe(false); // 卡在 stack(),還沒到期限
+    expire(); // 期限到
+    const r = await p;
+    expect(r.status).toBe("timeout");
+    expect(r.notes.join("\n")).toContain("超過總逾時");
+    // 清理:刪中斷點 → 繼續(或終止)→ 關閉
+    expect(port.calls).toContain("deleteBreakpoint:BP-p1");
+    expect(port.calls.includes("continue") || port.calls.includes("terminate")).toBe(true);
+    expect(port.calls[port.calls.length - 1]).toBe("close");
+    // 放開卡住的請求:handleStop 不得再對 port 發任何請求(不讀變數、不再 continue / stack)
+    const n = port.calls.length;
+    port.releaseStack();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(port.calls.length).toBe(n);
+    expect(port.calls.some((c) => c.startsWith("variables:"))).toBe(false);
+    expect(r.probes[0].hits).toHaveLength(0);
+  });
+
+  it("清理本身有獨立上限:close() 卡住也會返回(不無限等)", async () => {
+    const port = fakePort({ stops: [["BP-p1"]] });
+    (port as { close: () => Promise<void> }).close = () => new Promise(() => {});
+    const stepFire: (() => void)[] = [];
+    const deps: EngineDeps = { ...fakeClock().deps, cleanupTimer: () => new Promise<void>((r) => stepFire.push(r)) };
+    const p = runDebuggerProbes(port, { probes: [spec({ maxHits: 1 })], timeoutSeconds: 60, trigger: async () => "ok" }, deps);
+    // 讓所有清理步驟的上限計時器陸續到期(close 一直卡住)
+    for (let i = 0; i < 60; i++) {
+      stepFire.splice(0).forEach((f) => f());
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    const r = await Promise.race([p, new Promise<"hung">((res) => setTimeout(() => res("hung"), 500))]);
+    expect(r).not.toBe("hung");
+  });
+});
+
+describe("P2-3:仍啟用的 logpoint 登錄與歷史紀錄分開", () => {
+  const env = { ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV,$TMP", ABAP_MCP_PROBE_MODE: "dlp" };
+  const manual = { object_url: "/sap/bc/adt/oo/classes/zcl_inv_posting", line: 176, fields: ["iv_qty"] };
+  const trig = { ...manual, trigger: SET_ARGS.trigger };
+
+  async function setup() {
+    const { adt, live } = dlpAdt();
+    const c = await connect(adt, cfgOf(env));
+    expect((await c.call("probe_set", manual)).isError).toBe(false); // run-1:手動模式,logpoint 保持啟用
+    expect(live.size).toBe(1);
+    for (let i = 0; i < 20; i++) expect((await c.call("probe_set", trig)).isError).toBe(false); // 再 20 筆已完成:run-1 被淘汰
+    return { c, live };
+  }
+
+  it("ProbeStore:淘汰歷史紀錄不影響 live 登錄;確認刪除後才移除登錄(編碼後的 URL 也對得上)", () => {
+    const store = new ProbeStore();
+    const base = { mode: "dlp" as const, createdAt: "t", status: "active" as const, trigger: "x", timeoutSeconds: 0, probes: [], notes: [] };
+    store.add(base);
+    store.trackLive("ZCL_X=====CP/INC/5/%_ABC");
+    for (let i = 0; i < 20; i++) store.add({ ...base, status: "completed" });
+    expect(store.get("run-1")).toBeUndefined();
+    expect(store.wasEvicted("run-1")).toBe(true);
+    expect(store.liveIds()).toEqual(["ZCL_X=====CP/INC/5/%_ABC"]);
+    store.untrackLive("/sap/bc/adt/dlp/logpoints/ZCL_X%3d%3d%3d%3d%3dCP/INC/5/%25_ABC");
+    expect(store.liveIds()).toEqual([]);
+  });
+
+  it("run-1 被淘汰後,shutdown 清理(runCleanups)仍會刪掉那個 logpoint", async () => {
+    const { live } = await setup();
+    expect(live.size).toBe(1);
+    await runCleanups();
+    expect(live.size).toBe(0);
+  });
+
+  it("run-1 被淘汰後,probe_delete(all=true) 仍會刪掉它;probe_delete(run_id) 說明紀錄已淘汰並提示 all=true", async () => {
+    const { c, live } = await setup();
+    const one = await c.call("probe_delete", { run_id: "run-1" });
+    expect(one.isError).toBe(true);
+    expect(one.text).toContain("已被淘汰");
+    expect(one.text).toContain("all=true");
+    expect(live.size).toBe(1); // 沒有假裝刪掉
+    const all = await c.call("probe_delete", { all: true });
+    expect(all.isError, all.text).toBe(false);
+    expect(live.size).toBe(0);
   });
 });
