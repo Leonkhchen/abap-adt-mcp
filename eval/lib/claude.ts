@@ -22,6 +22,8 @@ export interface RunResult {
   costUsd: number;
   toolCalls: number;
   toolCallsByName: Record<string, number>;
+  /** 工具呼叫的先後順序(每次呼叫一筆,不含 ToolSearch) */
+  toolOrder: string[];
   /** 逾時被終止 */
   timedOut: boolean;
   /** 原始 stream-json 輸出存放處 */
@@ -48,6 +50,7 @@ export function writeMcpConfig(repoDir: string, env: Record<string, string>): st
 export function parseStreamJson(text: string): Omit<RunResult, "timedOut" | "logFile"> {
   let result: Record<string, unknown> | undefined;
   const byName: Record<string, number> = {};
+  const order: string[] = [];
   for (const line of text.replace(/^﻿/, "").split(/\r?\n/)) {
     if (!line.trim().startsWith("{")) continue;
     let m: Record<string, unknown>;
@@ -63,6 +66,7 @@ export function parseStreamJson(text: string): Omit<RunResult, "timedOut" | "log
         if (c.type === "tool_use" && c.name && c.name !== "ToolSearch") {
           const n = c.name.replace(`mcp__${MCP_SERVER_NAME}__`, "");
           byName[n] = (byName[n] ?? 0) + 1;
+          order.push(n);
         }
       }
     }
@@ -76,6 +80,7 @@ export function parseStreamJson(text: string): Omit<RunResult, "timedOut" | "log
     costUsd: Number(result?.total_cost_usd ?? 0),
     toolCalls: Object.values(byName).reduce((a, b) => a + b, 0),
     toolCallsByName: byName,
+    toolOrder: order,
   };
 }
 

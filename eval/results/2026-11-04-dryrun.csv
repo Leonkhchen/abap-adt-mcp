@@ -1,0 +1,10 @@
+﻿task,title,model,passed,turns,seconds,cost_usd,tool_calls,status,timed_out,setup_error
+01,讀懂並解釋 /DMO/ class,dry-run,false,,0,,,dry-run,,
+02,修語法錯誤,dry-run,false,,6,,,dry-run,,
+03,新建 class + ABAP Unit 全綠,dry-run,false,,2,,,dry-run,,
+04,修短傾印,dry-run,false,,12,,,dry-run,,
+05,ATC 變乾淨,dry-run,false,,20,,,dry-run,,
+06,從 Z 表產生 RAP BO,dry-run,false,,7,,,dry-run,,
+07,data_preview 統計問題,dry-run,false,,0,,,dry-run,,
+08,where_used 找呼叫處並改名,dry-run,false,,12,,,dry-run,,
+TOTAL,0/8 passed,dry-run,false,0,59,0.0000,0,,,

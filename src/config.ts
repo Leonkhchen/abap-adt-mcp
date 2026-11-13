@@ -85,6 +85,18 @@ const ConfigSchema = z.object({
    * 不預設開放 Z* / Y*:能寫入的 AI 可以自建 Z CDS view 包住任意表(見 docs/SECURITY.md)
    */
   ABAP_MCP_DATA_PREVIEW_TABLES: z.string().optional().default("/DMO/*"),
+  /** 除錯探針(probe_*):false(預設)時 4 個工具完全不註冊;prod 一律不註冊。開啟前請先閱讀 docs/SECURITY.md */
+  ABAP_MCP_ALLOW_PROBES: boolEnv(false),
+  /** 探針模式:auto(有 Dynamic Logpoints 就用,否則 debugger 快照)/ dlp / debugger */
+  ABAP_MCP_PROBE_MODE: z.enum(["auto", "dlp", "debugger"]).optional().default("auto"),
+  /** 探針位置範圍:all(含標準程式)/ custom(只限寫入白名單) */
+  ABAP_MCP_PROBE_SCOPE: z.enum(["all", "custom"]).optional().default("all"),
+  /** 不讓探針碰的物件或 package(逗號分隔,* 結尾為前綴) */
+  ABAP_MCP_PROBE_DENY: z.string().optional().default(""),
+  /** 探針定義存檔目錄(probe_set / probe_logs 的 save_as);相對路徑以 MCP 的工作目錄為準 */
+  ABAP_MCP_PROBES_DIR: z.string().optional().default("probes"),
+  /** 同時有效的探針上限(模式 A) */
+  ABAP_MCP_MAX_PROBES: z.coerce.number().int().positive().optional().default(5),
 });
 
 export type AppConfig = {
@@ -109,6 +121,17 @@ export type AppConfig = {
     allowDataPreview: boolean;
     /** data_preview 可讀的表/view 白名單;* 結尾為前綴比對(皆為大寫) */
     dataPreviewTables: string[];
+    /** 除錯探針設定(prod 強制關閉) */
+    probes: {
+      enabled: boolean;
+      mode: "auto" | "dlp" | "debugger";
+      scope: "all" | "custom";
+      /** 排除清單(大寫,* 結尾為前綴) */
+      deny: string[];
+      maxProbes: number;
+      /** save_as 的存檔目錄 */
+      dir: string;
+    };
   };
 };
 
@@ -163,6 +186,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxSourceLines: c.ABAP_MCP_MAX_SOURCE_LINES,
       allowDataPreview: c.ABAP_MCP_ALLOW_DATA_PREVIEW,
       dataPreviewTables: splitList(c.ABAP_MCP_DATA_PREVIEW_TABLES),
+      probes: {
+        // prod 一律不註冊探針工具(只在自己的 Trial / 開發系統使用)
+        enabled: c.ABAP_MCP_ALLOW_PROBES && c.ABAP_MCP_SYSTEM_ROLE !== "prod",
+        mode: c.ABAP_MCP_PROBE_MODE,
+        scope: c.ABAP_MCP_PROBE_SCOPE,
+        deny: splitList(c.ABAP_MCP_PROBE_DENY),
+        maxProbes: c.ABAP_MCP_MAX_PROBES,
+        dir: c.ABAP_MCP_PROBES_DIR,
+      },
     },
   };
 }

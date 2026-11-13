@@ -20,6 +20,8 @@ export interface TaskResult {
   suffix: string;
   /** 含事前準備、判定與清除的總耗時 */
   wallSeconds?: number;
+  /** 共用物件還原失敗:ZINV 基準可能已損壞,整個評測在這題之後中止 */
+  baselineBroken?: string;
 }
 
 export interface ReportInput {
@@ -28,6 +30,12 @@ export interface ReportInput {
   dryRun: boolean;
   models: string[];
   results: TaskResult[];
+}
+
+/** 報表最上方的警告:有任何一題還原失敗就要標出來 */
+export function baselineWarning(results: TaskResult[]): string | undefined {
+  const broken = results.find((r) => r.baselineBroken);
+  return broken ? `ZINV 基準可能已損壞,請用 baseline zip 還原(第 ${broken.task} 題之後的題目沒有執行):${broken.baselineBroken}` : undefined;
 }
 
 interface Totals {
@@ -75,6 +83,8 @@ export function renderMarkdown(input: ReportInput): string {
   const title = (id: string) => results.find((r) => r.task === id)?.title ?? "";
   const lines: string[] = [];
   lines.push(`# abap-adt-mcp 評測結果 ${input.startedAt.toISOString().slice(0, 10)}`, "");
+  const warn = baselineWarning(results);
+  if (warn) lines.push(`> ⚠️ **${esc(warn)}**`, "");
   lines.push(`- 開始:${input.startedAt.toISOString()}`);
   lines.push(`- 模型:${models.join(", ")}${input.dryRun ? "(dry-run:未呼叫模型,只驗證準備/判定/清除)" : ""}`);
   const grand = results.reduce((a, r) => a + (r.run?.costUsd ?? 0), 0);
@@ -92,7 +102,7 @@ export function renderMarkdown(input: ReportInput): string {
   });
   lines.push(`| **總計** | ${tot.join(" | ")} |`, "");
 
-  const problems = results.filter((r) => !r.passed || r.cleanup.some((c) => c.startsWith("❌")));
+  const problems = results.filter((r) => !r.passed || r.baselineBroken || r.cleanup.some((c) => c.startsWith("❌")));
   if (problems.length > 0) {
     lines.push("## 失敗與清除問題", "");
     for (const r of problems) {
@@ -100,6 +110,7 @@ export function renderMarkdown(input: ReportInput): string {
       if (r.setupError) lines.push(`- 事前準備失敗:${esc(r.setupError)}`);
       if (r.run && r.run.status !== "success") lines.push(`- 結束狀態:${r.run.status}`);
       for (const d of r.details) lines.push(`- ${esc(d)}`);
+      if (r.baselineBroken) lines.push(`- 還原失敗:${esc(r.baselineBroken)}`);
       for (const c of r.cleanup.filter((x) => x.startsWith("❌"))) lines.push(`- ${esc(c)}`);
       lines.push("");
     }

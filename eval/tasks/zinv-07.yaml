@@ -1,0 +1,33 @@
+# 2026-11-07 手動確認(A4H):
+#   規格寫「過帳日不可是未來日期」,但現有測試的預設過帳日是 20261115(以今天 2026-11-07 來看是未來),
+#   加上 sy-datum 比較會讓既有測試依賴執行當天日期(11-15 之後又會變),所以改成不依賴系統日期的日期規則:憑證日期(bldat)不可晚於過帳日(budat)。
+#   start_doc 已收 iv_bldat / iv_budat;既有測試不給 bldat(預設等於 budat),不會受影響。基準 36 個測試;完成後至少 37 個。
+id: "zinv-07"
+title: 新增業務規則:憑證日期不可晚於過帳日
+tags: [zinv, legacy]
+# 會動共用的 ZINV 物件,所以預設不跑;要用 --tags zinv(或 --tasks)明確選到才跑。作答前讀出、作答後(不論成敗)寫回並比對,
+# 再跑 ZCL_INV_POSTING 基準單元測試 36/36;任何一步失敗就中止整個評測。
+opt_in: true
+allowed_packages: ["$ZINV"]
+timeout_min: 30
+budget_usd: 2.0
+tool_timeout_sec: 180
+restore:
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/includes/testclasses
+restore_verify: { object_url: /sap/bc/adt/oo/classes/zcl_inv_posting, passed: 36 }
+prompt: |
+  請在 ZINV 系統的 ZCL_INV_POSTING 新增一條業務規則:憑證日期(bldat)不可以晚於過帳日(budat);
+  違反時要拒絕過帳(用 zcx_inv=>raise 丟例外,訊息編號請選一個還沒被使用的)。
+  並補單元測試驗證這條規則。全部單元測試要通過。回答請說明你修改了哪些方法。
+setup: []
+checks:
+  - kind: unit_tests
+    object_url: /sap/bc/adt/oo/classes/zcl_inv_posting
+    min_passed: 37
+  - kind: source_contains
+    object_url: /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+    contains: [bldat]
+  - kind: answer_contains
+    any: [start_doc, post]
+cleanup: []

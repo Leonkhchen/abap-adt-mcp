@@ -22,6 +22,8 @@ export interface AgentRunInput {
   repoDir: string;
   timeoutMs: number;
   budgetUsd?: number;
+  /** MCP 工具逾時(秒),經環境變數 MCP_TOOL_TIMEOUT 傳給 claude;大檔案讀取較慢的題目調高 */
+  toolTimeoutSec?: number;
   logFile: string;
 }
 
@@ -48,7 +50,11 @@ export const claudeAdapter: AgentAdapter = {
         prompt: `${i.prompt}\n(只使用 ${MCP_SERVER_NAME} 這個 MCP server 的工具。)`,
         model: i.model,
         mcpConfig,
-        env: { ...process.env, SAP_PASSWORD: i.password },
+        env: {
+          ...process.env,
+          SAP_PASSWORD: i.password,
+          ...(i.toolTimeoutSec ? { MCP_TOOL_TIMEOUT: String(Math.round(i.toolTimeoutSec * 1000)) } : {}),
+        },
         timeoutMs: i.timeoutMs,
         maxBudgetUsd: i.budgetUsd,
         logFile: i.logFile,

@@ -1,0 +1,41 @@
+# 2026-11-07 手動確認(A4H):
+#   注入:calc_issue_amt 全數出清分支改成 rv_amt = trunc( iv_stval ),出清時小數被截掉、帳面留下尾差。
+#   (原本想直接拿掉出清分支,但 A4H 手動確認 36 個測試仍全過 = 測試沒覆蓋該分支,注入無效,所以改成截斷小數。)
+#   expect_unit_tests 在準備階段確認至少 1 個測試失敗(基準 36/36)。
+id: "zinv-03"
+title: 修出庫成本計算的 bug
+tags: [zinv, legacy, fix-bug]
+# 會動共用的 ZINV 物件,所以預設不跑;要用 --tags zinv(或 --tasks)明確選到才跑。作答前讀出、作答後(不論成敗)寫回並比對,
+# 再跑 ZCL_INV_POSTING 基準單元測試 36/36;任何一步失敗就中止整個評測。
+opt_in: true
+allowed_packages: ["$ZINV"]
+timeout_min: 25
+budget_usd: 1.5
+tool_timeout_sec: 180
+restore:
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/includes/testclasses
+restore_verify: { object_url: /sap/bc/adt/oo/classes/zcl_inv_posting, passed: 36 }
+prompt: |
+  ZINV 系統(package $ZINV)出庫過帳後,帳面金額對不起來,ZCL_INV_POSTING 的單元測試有失敗。
+  請找出原因並修正,讓全部單元測試通過。修正時不要刪除或改弱任何測試。
+setup:
+  - tool: patch
+    args:
+      object_url: /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+      find: |2
+            IF iv_qty = iv_stqty.
+              rv_amt = iv_stval.
+      replace: |2
+            IF iv_qty = iv_stqty.
+              rv_amt = trunc( iv_stval ).
+  - tool: expect_unit_tests
+    args: { object_url: /sap/bc/adt/oo/classes/zcl_inv_posting }
+checks:
+  - kind: unit_tests
+    object_url: /sap/bc/adt/oo/classes/zcl_inv_posting
+    min_passed: 36
+  - kind: source_not_contains
+    object_url: /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+    not_contains: ["rv_amt = trunc( iv_stval )"]
+cleanup: []

@@ -75,7 +75,7 @@ ABAP_MCP_ALLOWED_PACKAGES=$TMP,ZFI_*
 - `run_unit_tests` 會在 SAP 上執行測試程式碼,因此與 `run_class` 一樣**唯讀模式(含 prod)不註冊**。它只執行宣告為 `RISK LEVEL HARMLESS`、`DURATION SHORT/MEDIUM` 的測試類別(不跑 DANGEROUS / CRITICAL),但 RISK LEVEL 是測試類別自己的宣告,不保證測試不寫資料,所以不能當作唯讀的依據(v0.3.1 起)
 - `create_object` 在建立前呼叫 SAP 的名稱檢查;非 `$` 開頭的 package 必須給 transport;`create_transport` 只在 `SYSTEM_ROLE=dev` 且非唯讀時註冊
 
-- **URI 驗證(v0.5.1)**:abap-adt-api 的 HTTP request 會附上 SAP Basic 認證與 cookie,而 axios 遇到絕對 URL 會直接改送該主機。因此 `src/safety/uri.ts` 的 `assertAdtUri` 是所有「使用者給的 URI」的必經關卡(`RealAdtService` 每個吃 URI 的方法 + 各工具入口);物件名稱護欄也改用驗證後的路徑取名,避免 `…/cl_std/../zsafe_x` 名稱檢查過了、實際指向別處。redirect 限同 origin(`restrictRedirectsToBaseOrigin`)
+- **URI 驗證(v0.5.1)**:abap-adt-api 的 HTTP request 會附上 SAP Basic 認證與 cookie,而 axios 遇到絕對 URL 會直接改送該主機。因此 `src/safety/uri.ts` 的 `assertAdtUri` 是所有「使用者給的 URI」的必經關卡(`RealAdtService` 每個吃 URI 的方法 + 各工具入口;v0.6 C0-4 補上原本漏掉的 `dump_detail` 的 dump_id、DDIC 的 `dataElementProperties` / `domainProperties`)。**不經 `assertAdtUri` 的只有「名稱」類參數**(`search_objects` 查詢字串、`ddicElement`、`tableContents`、`runQuery`、`nodeContents`、`runClass`、`rapPublish`、`odataV4Service`):它們不是 URI,由 abap-adt-api 以 query string 編碼,或本專案以 `encodeURIComponent` 組成路徑,無法改變 request 的主機;物件名稱護欄也改用驗證後的路徑取名,避免 `…/cl_std/../zsafe_x` 名稱檢查過了、實際指向別處。redirect 限同 origin(`restrictRedirectsToBaseOrigin`;這項依賴 abap-adt-api 的內部結構,若無法安裝限制,啟動時只在 stderr 印警告並繼續,所以主要防線仍是 `assertAdtUri`)
 - `run_unit_tests` 的白名單(v0.5.1):單一物件 = `assertWriteAllowed` + `assertPackageAllowed(objectPackage)`;package 模式 = package 白名單 + package 內每個 class / program / function group 的名稱前綴 + 子 package 白名單,列出所有被擋的項目後整批拒絕;每次呼叫寫 audit
 
 ### 3-4. 401 斷路
@@ -120,9 +120,25 @@ ST22 短傾印的完整內容常超過 1 MB,其中 **Selected Variables** 章節
 - **push 會把 SAP 上的程式碼送到外部 Git 服務**,屬於資料外洩路徑,而且需要 Git 帳號憑證,本專案不應持有。
 - 兩者都難以還原,也不適合在 AI 沒有人監看時執行。請在 abapGit 介面由人確認差異後操作。
 
+### 3-9. 除錯探針(`probe_set` 等,預設關閉)
+
+探針會在 SAP 上記錄**程式執行當下的資料**。標準程式(例如銷售、財務)處理的是真實業務資料,探針讀到的值可能包含客戶、價格、金額。風險與對策:
+
+- **預設關閉**(`ABAP_MCP_ALLOW_PROBES=true` 才註冊);`ABAP_MCP_SYSTEM_ROLE=prod` **一律不註冊**;唯讀模式只有 `probe_list` / `probe_logs`(讀紀錄),不能設探針或清除。
+- **只對 MCP 登入帳號自己的執行生效**:模式 A 的 logpoint 啟用對象只有該帳號;模式 B 是該帳號的外部中斷點,只會停住這個帳號的 session。工具不提供替別人設探針的參數。
+- **範圍與排除清單**:`ABAP_MCP_PROBE_SCOPE=custom` 時只能埋在通過名稱前綴與 package 白名單的自己的程式;`ABAP_MCP_PROBE_DENY` 命中的位置一律拒絕(例如薪資、HR 相關程式)。排除清單比對物件名稱、package,以及 include 所屬的主程式與 function group(`SAPL<群組>`;查不到 program include 的主程式時拒絕)。`custom` 在名稱前綴與 package 白名單都被設成空時一律拒絕,不會退化成 `all`。預設 `all` 允許標準程式,連共用系統時請改 `custom` 並設排除清單。限制:deny 比對的是名稱與 package,其他種類物件(例如 class 的本地 include)以物件本身為準。
+- **觸發會執行程式**:`trigger` 的 `run_unit_tests` / `run_class` 對象要通過名稱前綴與 package 兩道白名單(與直接呼叫這兩個工具相同);`manual` 由使用者自己操作。
+- **到期與上限**:模式 A 的 logpoint 預設 15 分鐘到期(最長 24 小時),同時有效上限 `ABAP_MCP_MAX_PROBES`(預設 5,只算 MCP 自己建立、描述帶 `abap-adt-mcp` 的);模式 B 的 `max_hits` 收滿就移除中斷點,有總逾時,`finally` 一定刪中斷點、取消監聽、讓停住的程式繼續跑完(失敗則終止)、登出 session。總逾時涵蓋「程式停住後的處理」(每個 ADT 請求都受剩餘期限約束,逾時即停止收值再清理),清理的每個請求有 8 秒、整體有 30 秒上限。**刪除中斷點失敗**(例如暫時性網路錯誤)會重試最多 3 輪,仍失敗則結果明確警告「中斷點沒有確認刪除」而不是宣稱已移除——外部中斷點屬於使用者,關閉 session 不保證它會消失,請到 Eclipse 的 Breakpoints 視圖或 SAP GUI 手動清除。`probe_delete all=true` 也會清掉先前 MCP process 留下、帶標記的 logpoint,不動別人(Eclipse)建的。仍啟用中的 logpoint 另有獨立登錄(不受「最多保留 20 筆歷史紀錄」淘汰影響),shutdown 與 `all=true` 都從這份登錄清;單獨用 `run_id` 清一個已被淘汰紀錄的執行會被拒絕並提示改用 `all=true`。
+- **值只存在記憶體**:命中紀錄只存在 MCP process 的記憶體(最多 20 次執行),`probe_delete` 清除;`probe_logs` 輸出上限 100 筆、20,000 字元。**audit 不記變數值**,只記位置、模式、觸發方式與命中次數。
+- **`save_as` 存檔不含任何命中時讀到的值**:只存位置、變數名稱、條件、命中次數、目的與結論;注意 `condition` 是原文,若條件裡寫了字面值(例如 `kunnr = '0000100023'`)也會存進去,請避免;名稱只接受英數字、`_`、`-`,檔案一律落在探針目錄內,不能含路徑。結論欄由 AI 或人填,請勿寫入業務資料。
+- **模式 B 的副作用**:監聽期間 debugger 會短暫停住該帳號的執行,並占用一個 dialog work process 的長輪詢;同一帳號同時只允許一個 debugger 監聽,與 Eclipse 的 debug 視角會衝突(工具先檢查,有衝突就拒絕,不搶)。已知限制:update task、背景 RFC、背景作業裡的程式碼不會停下來。
+- **MCP 在探針進行中被結束**(stdin 關閉 / SIGINT / SIGTERM):shutdown 會先刪除進行中的中斷點、取消監聽、讓停住的程式繼續、關閉探針專用 session,並移除這個 process 建立的 logpoint,再登出;若 process 被強制終止(SIGKILL、當機),模式 B 的中斷點與監聽、模式 A 的 logpoint 要等逾時或到期(最長 24 小時),可用 `probe_delete all=true`(下次啟動後)或 Eclipse 清除。
+- **URI 驗證**:探針的 `object_url` 與 trigger 的 URI 都先過 `assertAdtUri`(v0.5.1 S1)。
+- **已實測範圍**:A4H(ABAP Platform 2025)的 class。report / include 與標準程式的探針、模式 B 的手動觸發尚未實機驗證;舊版系統是否支援(有沒有 Dynamic Logpoints、debugger API 行為)留待跨版本驗證。
+
 ### 4. Audit log
 
-設定 `ABAP_MCP_AUDIT_LOG=/path/audit.jsonl` 後,每筆寫入、啟用(含 `activate_objects` 批次啟用的每個物件)、建立物件(`create_object`)、為語法檢查先建立空的測試 include(`create_test_include`)、執行(`run_class`)、建立 transport(`create_transport`)、資料查詢(`data_preview`,只記 SQL 與筆數)、RAP 產生(`rap_generate`,每個物件一筆)操作記錄一行 JSON:
+設定 `ABAP_MCP_AUDIT_LOG=/path/audit.jsonl` 後,每筆寫入、啟用(含 `activate_objects` 批次啟用的每個物件)、建立物件(`create_object`)、為語法檢查先建立空的測試 include(`create_test_include`)、執行(`run_class`)、建立 transport(`create_transport`)、設定與清除探針(`probe_set` / `probe_delete`,不含變數值)、資料查詢(`data_preview`,只記 SQL 與筆數)、RAP 產生(`rap_generate`,每個物件一筆)操作記錄一行 JSON:
 
 ```json
 {"timestamp":"2026-06-12T08:00:00.000Z","action":"write_source","objectUrl":"/sap/bc/adt/oo/classes/zcl_demo","objectName":"ZCL_DEMO","transport":"DEVK900123","summary":"行數 120 → 135(約 +18 / -3)","success":true}

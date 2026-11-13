@@ -1,0 +1,32 @@
+# 2026-11-07 手動確認(A4H):
+#   唯讀題;ENQUEUE_EZINV_STOCK 只在 ZCL_INV_DB 的 zif_inv_db~lock_stock(第 19 行)與 lock_all(第 36 行)呼叫;
+#   foreign_lock(sy-subrc=1)→ zcx_inv 訊息 011,ZCL_INV_POSTING.post 捕捉後 rollback + unlock_all。
+id: "zinv-02"
+title: 找出鎖定呼叫並說明同時過帳的後果
+tags: [zinv, legacy]
+# 會動共用的 ZINV 物件,所以預設不跑;要用 --tags zinv(或 --tasks)明確選到才跑。作答前讀出、作答後(不論成敗)寫回並比對,
+# 再跑 ZCL_INV_POSTING 基準單元測試 36/36;任何一步失敗就中止整個評測。
+opt_in: true
+allowed_packages: ["$ZINV"]
+timeout_min: 15
+budget_usd: 1.0
+tool_timeout_sec: 180
+restore:
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/includes/testclasses
+restore_verify: { object_url: /sap/bc/adt/oo/classes/zcl_inv_posting, passed: 36 }
+prompt: |
+  ZINV 系統裡,哪些地方呼叫了 ENQUEUE_EZINV_STOCK(Lock Object EZINV_STOCK 的鎖定函式)?
+  請列出所有呼叫的位置(class 與方法),並說明:兩個使用者同時對「同一個倉庫、同一個料號」過帳時會發生什麼事,
+  後到的人會看到什麼、系統會做什麼清理。只要說明,不要修改任何東西。
+setup: []
+checks:
+  - kind: answer_contains
+    all: [ZCL_INV_DB]
+  - kind: answer_contains
+    any: [foreign_lock, "011", 鎖定失敗, 被鎖定, 已被鎖, locked, rollback]
+  - kind: unchanged
+    object_url: /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+  - kind: unchanged
+    object_url: /sap/bc/adt/oo/classes/zcl_inv_db/source/main
+cleanup: []

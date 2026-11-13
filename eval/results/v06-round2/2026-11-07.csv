@@ -1,0 +1,5 @@
+﻿task,title,model,passed,turns,seconds,cost_usd,tool_calls,status,timed_out,setup_error
+zinv-03,修出庫成本計算的 bug,sonnet,true,7,64,0.2805,5,success,false,
+zinv-05,修 ZCL_INV_PERIOD 的語法錯誤,sonnet,true,7,46,0.2168,5,success,false,
+zinv-09,探針題:盤盈成本金額錯誤(要先用探針取值再修),sonnet,true,11,69,0.3139,8,success,false,
+TOTAL,3/3 passed,sonnet,true,25,179,0.8112,18,,,

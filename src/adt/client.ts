@@ -27,6 +27,7 @@ import {
 import * as https from "node:https";
 import type { AppConfig } from "../config.js";
 import { assertAdtUri } from "../safety/uri.js";
+import { logoutClient, releaseStateful } from "./session.js";
 import { AuthCircuitOpenError, hasHttpStatus, isAuthFailure } from "./errors.js";
 import { activationBody, parseActivationResponse } from "./activation.js";
 import {
@@ -137,8 +138,39 @@ export interface NewObjectSpec {
 }
 
 /** MCP 工具層所依賴的 ADT 操作介面(僅暴露 MVP 需要的方法) */
+/** Dynamic Logpoints:清單項目 */
+export interface DlpEntry {
+  location: string;
+  description: string;
+  sourceUri: string;
+  executions: number;
+  activeUntil: string;
+  state: string;
+}
+
+export interface DlpCreateInput {
+  /** 要埋探針的 source URI(class:/oo/classes/x/source/main 或 includes/…;程式:/programs/programs/x/source/main) */
+  sourceUrl: string;
+  line: number;
+  kind: "variables" | "stack" | "sql";
+  fields: string[];
+  condition?: string;
+  description: string;
+  minutes: number;
+}
+
+/** 一個 key(第一個變數的不同值)的紀錄 */
+export interface DlpKeyLog {
+  key: string;
+  calls: number;
+  lastCall: string;
+  fields: { name: string; values: string[] }[];
+}
+
 export interface AdtService {
   login(): Promise<void>;
+  /** 登出所有 ADT client、釋放 SAP 端的 HTTP session(MCP server 結束時呼叫;可重複呼叫) */
+  close?(): Promise<void>;
   /** 每次都實際對 SAP 發一次請求(不依賴快取的登入狀態),回傳耗時 */
   ping(): Promise<{ elapsedMs: number }>;
   searchObject(query: string, objType?: string, max?: number): Promise<SearchResult[]>;
@@ -239,6 +271,17 @@ export interface AdtService {
   runQuery(sql: string, rows: number): Promise<QueryResult>;
   /** 建立 workbench transport request,回傳 TR 編號;refUrl 為相關物件(或 package)的 URI */
   createTransport(refUrl: string, description: string, packageName: string): Promise<string>;
+  /** include 所屬的主程式名稱(大寫);探針排除清單比對用 */
+  mainProgramNames(sourceUrl: string): Promise<string[]>;
+  /** Dynamic Logpoints(v0.6 探針模式 A):這個系統有沒有 /sap/bc/adt/dlp 端點(結果快取) */
+  dlpAvailable(): Promise<boolean>;
+  /** 目前登入帳號的 logpoint 清單 */
+  dlpList(): Promise<DlpEntry[]>;
+  /** 建立並啟用一個 logpoint,回傳 SAP 的 logpoint 位置 id */
+  dlpCreate(input: DlpCreateInput): Promise<string>;
+  dlpDelete(location: string): Promise<void>;
+  /** 先把記憶體裡的 log 轉進資料庫,再讀最多 maxKeys 個不同 key 的紀錄 */
+  dlpRead(location: string, maxKeys: number): Promise<DlpKeyLog[]>;
   /** 取得目前登入的使用者帳號 */
   username(): string;
   /** 取得系統 base URL(供診斷訊息使用) */
@@ -293,6 +336,18 @@ export function restrictRedirectsToBaseOrigin(client: ADTClient, baseUrl: string
 export const MAX_AUTH_FAILURES = 2;
 
 /**
+ * 建立一個連 SAP 的 ADTClient(帶 TLS 設定,redirect 限同 origin)。
+ * 每個 ADTClient 在 SAP 端是一個獨立的 HTTP session(SM04 看得到),用完要登出(見 adt/session.ts)。
+ */
+export function createAdtClient(cfg: AppConfig): ADTClient {
+  const c = new ADTClient(cfg.sap.url, cfg.sap.user, cfg.sap.password, cfg.sap.client, cfg.sap.language, adtClientOptions(cfg));
+  if (!restrictRedirectsToBaseOrigin(c, cfg.sap.url)) {
+    console.error("[abap-adt-mcp] 警告:無法限制 redirect 為同 origin(abap-adt-api 內部結構與預期不同)。");
+  }
+  return c;
+}
+
+/**
  * 真實實作:包裝 abap-adt-api 的 ADTClient。
  *
  * 用兩個 ADTClient(兩個獨立的 SAP session):
@@ -313,20 +368,7 @@ export class RealAdtService implements AdtService {
    * @param lockClient 選填:注入鎖定/寫入用的 ADTClient;只注入 client 時兩者共用
    */
   constructor(private cfg: AppConfig, client?: ADTClient, lockClient?: ADTClient) {
-    const create = () => {
-      const c = new ADTClient(
-        cfg.sap.url,
-        cfg.sap.user,
-        cfg.sap.password,
-        cfg.sap.client,
-        cfg.sap.language,
-        adtClientOptions(cfg)
-      );
-      if (!restrictRedirectsToBaseOrigin(c, cfg.sap.url)) {
-        console.error("[abap-adt-mcp] 警告:無法限制 redirect 為同 origin(abap-adt-api 內部結構與預期不同)。");
-      }
-      return c;
-    };
+    const create = () => createAdtClient(cfg);
     this.client = client ?? create();
     this.lockClient = lockClient ?? (client ? client : create());
   }
@@ -413,6 +455,104 @@ export class RealAdtService implements AdtService {
     return packageFromObjectXml(String(response.body ?? ""));
   }
 
+  async mainProgramNames(sourceUrl: string): Promise<string[]> {
+    const url = this.u(sourceUrl);
+    const mains = await this.guard(() => this.client.mainPrograms(url));
+    return mains.map((m) => String(m["adtcore:name"] ?? "").toUpperCase()).filter(Boolean);
+  }
+
+  // ───── Dynamic Logpoints(探針模式 A)─────
+  private dlpAvail?: boolean;
+
+  async dlpAvailable(): Promise<boolean> {
+    if (this.dlpAvail !== undefined) return this.dlpAvail;
+    const d = await this.guard(() => this.client.adtDiscovery());
+    this.dlpAvail = JSON.stringify(d).includes("/sap/bc/adt/dlp/logpoints");
+    return this.dlpAvail;
+  }
+
+  async dlpList(): Promise<DlpEntry[]> {
+    const list = await this.guard(() => this.client.logpoints(this.cfg.sap.user));
+    return list.map((l) => ({
+      location: l.links.find((x) => x.rel === "self")?.href ?? "",
+      description: l.definition.description ?? "",
+      sourceUri: l.location.includePosition.uri,
+      executions: Number(l.summary.executions ?? 0),
+      activeUntil: l.activation.activeUntil,
+      state: l.activation.state,
+    }));
+  }
+
+  async dlpCreate(i: DlpCreateInput): Promise<string> {
+    const src = this.u(i.sourceUrl);
+    const m = /^\/sap\/bc\/adt\/oo\/classes\/([^/]+)/.exec(src);
+    let includePosition: { uri: string; type: string; name: string; parentUri?: string };
+    let mainProgram: { uri: string; type: string; name: string };
+    const at = `${src}#start=${i.line},0`;
+    if (m) {
+      const name = decodeURIComponent(m[1]).toUpperCase();
+      const pool = `${name.padEnd(30, "=")}CP`;
+      includePosition = { uri: at, type: "CLAS/I", name, parentUri: `/sap/bc/adt/oo/classes/${m[1]}` };
+      mainProgram = { uri: `/sap/bc/adt/programs/programs/${pool.toLowerCase()}`, type: "PROG/P", name: pool };
+    } else {
+      const p = /^\/sap\/bc\/adt\/programs\/(programs|includes)\/([^/]+)/.exec(src);
+      if (!p) throw new Error("Dynamic Logpoints 目前只支援 class 與程式(report / include);其他物件類型請用 debugger 快照模式(ABAP_MCP_PROBE_MODE=debugger)。");
+      const name = decodeURIComponent(p[2]).toUpperCase();
+      includePosition = { uri: at, type: p[1] === "programs" ? "PROG/P" : "PROG/I", name };
+      if (p[1] === "programs") mainProgram = { uri: `/sap/bc/adt/programs/programs/${p[2]}`, type: "PROG/P", name };
+      else {
+        const mains = await this.guard(() => this.client.mainPrograms(src));
+        const first = mains[0];
+        if (!first) throw new Error(`找不到 include ${name} 的主程式,無法設定 logpoint。`);
+        mainProgram = { uri: first["adtcore:uri"], type: first["adtcore:type"], name: first["adtcore:name"] };
+      }
+    }
+    const common = { description: i.description, condition: i.condition };
+    const definition = this.client.createLogPointDefinition(
+      i.kind === "stack"
+        ? { type: "StackTrace", ...common }
+        : i.kind === "sql"
+          ? { type: "SqlTrace", stack: "Off", ...common }
+          : { type: "UserDefined", subKey: i.fields[0], fields: i.fields.join(" "), ...common }
+    );
+    const id = await this.guard(() =>
+      this.client.createLogpoint({
+        location: { includePosition, mainProgram },
+        definition,
+        activation: {
+          state: "A",
+          activatedBy: this.cfg.sap.user,
+          activeSince: new Date().toISOString(),
+          activeUntil: new Date(Date.now() + i.minutes * 60_000).toISOString(),
+          users: [this.cfg.sap.user],
+        },
+      })
+    );
+    if (!id) throw new Error("SAP 沒有回傳 logpoint 位置。");
+    return id;
+  }
+
+  async dlpDelete(location: string): Promise<void> {
+    await this.guard(() => this.client.deleteLogpoint(location));
+  }
+
+  async dlpRead(location: string, maxKeys: number): Promise<DlpKeyLog[]> {
+    // 命中紀錄先在 SAP 的共用記憶體,讀取前要轉進資料庫(Eclipse 的 Refresh 做的同一件事)
+    await this.guard(() => this.client.getLogServers()).catch(() => undefined);
+    const keys = await this.guard(() => this.client.getLogKeys(location, maxKeys));
+    const out: DlpKeyLog[] = [];
+    for (const k of keys.slice(0, maxKeys)) {
+      const logs = await this.guard(() => this.client.getLogPointLogs(location, k));
+      out.push({
+        key: String(k.value),
+        calls: Number(k.calls ?? 0),
+        lastCall: k.lastCall,
+        fields: logs.fields.map((f) => ({ name: f.name, values: f.values.map((v) => String(v.value)) })),
+      });
+    }
+    return out;
+  }
+
   async getObjectSource(sourceUrl: string) {
     const url = this.u(sourceUrl);
     return this.guard(() => this.client.getObjectSource(url));
@@ -447,22 +587,23 @@ export class RealAdtService implements AdtService {
       } catch (e) {
         // 鎖定失敗必須恢復 stateless:abap-adt-api 在 stateful 模式下不會自動重登,
         // 若停在 stateful,之後 session 失效時所有呼叫都無法恢復
-        this.endStatefulSession();
+        await releaseStateful(this.lockClient);
         throw e;
       }
     });
   }
 
+  private closed = false;
+
   /**
-   * 回到 stateless,並丟掉 stateful 期間 SAP 發的 sap-contextid cookie。
-   * A4H 實測:解鎖後若保留 sap-contextid,之後任何一次 SAP 端例外(例如讀取尚未建立的 include)
-   * 會結束那個 context,此後所有請求都帶著失效的 context id 而回 400,且無法自行恢復。
+   * 登出 client 與 lockClient(C0-10):MCP server 結束、評測與測試收尾時呼叫。
+   * 只呼叫一次有效;兩個 client 是同一個(測試注入)時只登出一次;登出失敗不丟例外。
    */
-  private endStatefulSession(): void {
-    this.lockClient.stateful = session_types.stateless;
-    // AdtHTTP.cookie 在型別上是 private,執行期為 Map<cookie 名稱, 值>
-    const jar = (this.lockClient.httpClient as unknown as { cookie?: Map<string, string> }).cookie;
-    jar?.delete("sap-contextid");
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    const clients = new Set<ADTClient>([this.client, this.lockClient]);
+    await Promise.all([...clients].map((c) => logoutClient(c)));
   }
 
   async createTestInclude(className: string, lockHandle: string, transport?: string) {
@@ -474,8 +615,11 @@ export class RealAdtService implements AdtService {
       const url = this.u(objectUrl);
       await this.guard(() => this.lockClient.unLock(url, lockHandle));
     } finally {
-      // 無論解鎖成敗(含斷路)都恢復 stateless,釋放後端資源並保留自動重登能力
-      this.endStatefulSession();
+      // 無論解鎖成敗(含斷路)都結束 stateful session(C0-10):
+      // 通知 SAP 放掉 context(釋放 extended memory)、回到 stateless、丟掉失效的 sap-contextid。
+      // A4H 實測:解鎖後若保留 sap-contextid,之後任何一次 SAP 端例外(例如讀取尚未建立的 include)
+      // 會結束那個 context,此後所有請求都帶著失效的 context id 而回 400,且無法自行恢復
+      await releaseStateful(this.lockClient);
     }
   }
 
@@ -828,7 +972,8 @@ export class RealAdtService implements AdtService {
   }
 
   async dumpDetail(dumpId: string) {
-    const id = normalizeDumpId(dumpId);
+    // normalizeDumpId 只管格式;URI 安全(編碼的 ..、//)統一再過 assertAdtUri
+    const id = this.u(normalizeDumpId(dumpId));
     const xml = await this.guard(() =>
       this.client.httpClient.request(id, { headers: { Accept: "application/vnd.sap.adt.runtime.dump.v1+xml" } })
     );
@@ -845,11 +990,13 @@ export class RealAdtService implements AdtService {
     return this.guard(() => this.client.ddicElement(name));
   }
 
-  async dataElementProperties(url: string) {
+  async dataElementProperties(rawUrl: string) {
+    const url = this.u(rawUrl);
     return this.guard(() => this.client.getDataElementProperties(url)) as Promise<DdicTypeProperties>;
   }
 
-  async domainProperties(url: string) {
+  async domainProperties(rawUrl: string) {
+    const url = this.u(rawUrl);
     return this.guard(() => this.client.getDomainProperties(url)) as Promise<DdicTypeProperties>;
   }
 

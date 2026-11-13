@@ -14,7 +14,7 @@
  *
  * 連線設定沿用 SAP_URL / SAP_USER / SAP_PASSWORD / SAP_CLIENT（見 .env.example）。
  */
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, onTestFinished } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -23,7 +23,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ADTClient, session_types } from "abap-adt-api";
 import { loadConfig, type AppConfig } from "../../src/config.js";
-import { RealAdtService } from "../../src/adt/client.js";
+import { RealAdtService, createAdtClient } from "../../src/adt/client.js";
+import { logoutClient, releaseStateful } from "../../src/adt/session.js";
 import { AuditLogger } from "../../src/safety/audit.js";
 import { registerTools } from "../../src/tools/registry.js";
 import { VERSION } from "../../src/version.js";
@@ -40,7 +41,8 @@ type ToolResult = { text: string; isError: boolean };
 async function startServer(env: NodeJS.ProcessEnv, auditPath = "") {
   const cfg = loadConfig(env);
   const server = new McpServer({ name: "abap-adt-mcp-it", version: VERSION });
-  registerTools(server, new RealAdtService(cfg), cfg, new AuditLogger(auditPath));
+  const adt = new RealAdtService(cfg);
+  registerTools(server, adt, cfg, new AuditLogger(auditPath));
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
   await server.connect(serverT);
   const client = new Client({ name: "it-client", version: "1.0.0" });
@@ -53,7 +55,16 @@ async function startServer(env: NodeJS.ProcessEnv, auditPath = "") {
     };
     return { text: r.content.map((c) => c.text ?? "").join("\n"), isError: !!r.isError };
   };
-  return { cfg, client, call, close: () => client.close() };
+  // C0-10:close 要登出 RealAdtService 的兩個 ADTClient,否則 SAP 端的 HTTP session 要等逾時才釋放
+  return {
+    cfg,
+    client,
+    call,
+    close: async () => {
+      await client.close();
+      await adt.close();
+    },
+  };
 }
 
 function classSource(name: string, marker: string) {
@@ -160,7 +171,8 @@ describe.skipIf(!RUN_WRITE)("寫入工具（A4H，$TMP 暫存物件）", () => {
     } catch (e) {
       console.error(`清除暫存物件 ${name} 失敗，請在 SE80 / Eclipse 手動刪除：${String(e)}`);
     } finally {
-      raw.stateful = session_types.stateless;
+      await releaseStateful(raw);
+      await logoutClient(raw);
       await s?.close();
     }
   }, 60_000);
@@ -219,7 +231,7 @@ describe.skipIf(!RUN_WRITE)("寫入工具（A4H，$TMP 暫存物件）", () => {
       const lock = await raw.lock(objUrl);
       await raw.unLock(objUrl, lock.LOCK_HANDLE);
     } finally {
-      raw.stateful = session_types.stateless;
+      await releaseStateful(raw);
     }
   }, 60_000);
 
@@ -324,9 +336,10 @@ describe.skipIf(!RUN_WRITE)("v0.3 開發循環工具（A4H，$TMP 暫存物件�
           console.error(`清除暫存物件 ${u} 失敗,請在 Eclipse 的 $TMP 手動刪除:${msg}`);
         }
       } finally {
-        raw.stateful = session_types.stateless;
+        await releaseStateful(raw);
       }
     }
+    await logoutClient(raw);
     await s?.close();
   }, 300_000);
 
@@ -459,9 +472,10 @@ describe.skipIf(!RUN_WRITE)("v0.4 診斷與資料工具（A4H，$TMP 暫存物�
           console.error(`清除暫存物件 ${u} 失敗,請在 Eclipse 的 $TMP 手動刪除:${String(e)}`);
         }
       } finally {
-        raw.stateful = session_types.stateless;
+        await releaseStateful(raw);
       }
     }
+    await logoutClient(raw);
     await s?.close();
   }, 300_000);
 
@@ -583,7 +597,7 @@ describe.skipIf(!RUN_WRITE)("v0.4 診斷與資料工具（A4H，$TMP 暫存物�
       const lock = await raw.lock(url(REV));
       await raw.unLock(url(REV), lock.LOCK_HANDLE);
     } finally {
-      raw.stateful = session_types.stateless;
+      await releaseStateful(raw);
     }
   }, 300_000);
 });
@@ -676,7 +690,7 @@ describe.skipIf(!RUN_WRITE)("v0.5 TABL 與 RAP 產生器(A4H,$TMP 暫存物件)"
         await c.unLock(u, lock.LOCK_HANDLE).catch(() => undefined);
       }
     } finally {
-      c.stateful = session_types.stateless;
+      await releaseStateful(c);
     }
   }
 
@@ -727,6 +741,8 @@ describe.skipIf(!RUN_WRITE)("v0.5 TABL 與 RAP 產生器(A4H,$TMP 暫存物件)"
         if (await stillThere(o.uri)) console.error(`清除暫存物件 ${o.uri} 失敗,請在 Eclipse 的 $TMP 手動刪除:${sapError(e)}`);
       }
     }
+    await logoutClient(c);
+    await logoutClient(raw);
     await s?.close();
   }, 600_000);
 
@@ -746,6 +762,7 @@ describe.skipIf(!RUN_WRITE)("v0.5 TABL 與 RAP 產生器(A4H,$TMP 暫存物件)"
 
   it("T32 rap_generate 預設只預覽:列出物件與 binding,系統裡沒有建立任何物件", async () => {
     const svc = new RealAdtService(s.cfg);
+    onTestFinished(() => svc.close());
     const links = await svc.rapGeneratorLinks(tableUri);
     expect(links, "A4H 應有 ui-service 產生器").toBeDefined();
     planned = (await svc.rapPreview(links!, tableUri, "$TMP")).objects;
@@ -860,9 +877,10 @@ describe.skipIf(!RUN_WRITE)("v0.5.1 安全與一致性修正（A4H，$TMP 暫存
           console.error(`清除暫存物件 ${u} 失敗,請在 Eclipse 的 $TMP 手動刪除:${String(e)}`);
         }
       } finally {
-        raw.stateful = session_types.stateless;
+        await releaseStateful(raw);
       }
     }
+    await logoutClient(raw);
     await s?.close();
   }, 300_000);
 
@@ -907,6 +925,7 @@ describe.skipIf(!RUN_WRITE)("v0.5.1 安全與一致性修正（A4H，$TMP 暫存
 
   it("T40 鎖定後再比對(R3):讀取之後、鎖定之前由第二個 ADT session 改動 → 被擋下,且鎖已釋放", async () => {
     const real = new RealAdtService(s.cfg);
+    onTestFinished(() => real.close());
     const objectUrl = url(C40);
     const sourceUrl = `${objectUrl}/source/main`;
     const v1 = mainSrc(C40, "V1");
@@ -923,7 +942,7 @@ describe.skipIf(!RUN_WRITE)("v0.5.1 安全與一致性修正（A4H，$TMP 暫存
         await raw.setObjectSource(sourceUrl, mainSrc(C40, "OTHER_SESSION"), l.LOCK_HANDLE);
         await raw.unLock(u, l.LOCK_HANDLE);
       } finally {
-        raw.stateful = session_types.stateless;
+        await releaseStateful(raw);
       }
       return real.lock(u);
     };
@@ -942,7 +961,284 @@ describe.skipIf(!RUN_WRITE)("v0.5.1 安全與一致性修正（A4H，$TMP 暫存
       const l = await raw.lock(objectUrl);
       await raw.unLock(objectUrl, l.LOCK_HANDLE);
     } finally {
-      raw.stateful = session_types.stateless;
+      await releaseStateful(raw);
     }
   }, 600_000);
+});
+
+// ───────────────────────────── v0.6 C0-6：R2 實機確認（T50–T52，暫存 package + class）─────────────────────────────
+// 2026-11-06 實測結論(A4H,ABAP Platform 2025):
+//  1. SAP 的 unit test run 對 package URI 會遞迴執行子 package 的測試(父 package 直屬 0 個 class 也跑得到子 package 的測試)
+//  2. /sap/bc/adt/%70ackages/… 與 /sap/bc/adt//packages/… 不會被 SAP 當成 package(回 0 個測試類別)
+//  3. /sap/bc/adt/Packages/… (大小寫不同)會被當成 package 執行 → 本專案的 package URI 檢查必須不分大小寫(目前有 i 旗標)
+describe.skipIf(!RUN_WRITE)("v0.6 C0-6 R2 實機確認（A4H，暫存 package）", () => {
+  const sfx = Date.now().toString(36).toUpperCase().slice(-6);
+  const PARENT = `$ZMCP_R2P_${sfx}`;
+  const CHILD = `$ZMCP_R2C_${sfx}`;
+  const CLS = `ZCL_MCP_R2_${sfx}`;
+  const pkgUrl = (n: string) => `/sap/bc/adt/packages/${encodeURIComponent(n.toLowerCase())}`;
+  const clsUrl = `/sap/bc/adt/oo/classes/${CLS.toLowerCase()}`;
+  const flags = { harmless: true, dangerous: false, critical: false, short: true, medium: true, long: false };
+  const mainSrc = [
+    `CLASS ${CLS.toLowerCase()} DEFINITION PUBLIC FINAL CREATE PUBLIC.`,
+    `  PUBLIC SECTION.`,
+    `    METHODS dummy.`,
+    `ENDCLASS.`,
+    ``,
+    `CLASS ${CLS.toLowerCase()} IMPLEMENTATION.`,
+    `  METHOD dummy.`,
+    `  ENDMETHOD.`,
+    `ENDCLASS.`,
+  ].join("\n");
+  const testSrc = [
+    `CLASS ltc_r2 DEFINITION FINAL FOR TESTING DURATION SHORT RISK LEVEL HARMLESS.`,
+    `  PRIVATE SECTION.`,
+    `    METHODS green FOR TESTING.`,
+    `ENDCLASS.`,
+    ``,
+    `CLASS ltc_r2 IMPLEMENTATION.`,
+    `  METHOD green.`,
+    `    cl_abap_unit_assert=>assert_equals( act = 1 exp = 1 ).`,
+    `  ENDMETHOD.`,
+    `ENDCLASS.`,
+  ].join("\n");
+
+  let s: Awaited<ReturnType<typeof startServer>>; // 兩個 package 都在白名單
+  let sParentOnly: Awaited<ReturnType<typeof startServer>>; // 只有父 package 在白名單
+  let raw: ADTClient;
+
+  const mkPackage = (name: string, parent: string) =>
+    raw.createObject({
+      objtype: "DEVC/K",
+      name,
+      parentName: parent,
+      parentPath: parent ? pkgUrl(parent) : "/sap/bc/adt/packages",
+      description: "abap-adt-mcp IT R2",
+      responsible: s.cfg.sap.user.toUpperCase(),
+      swcomp: "LOCAL",
+      packagetype: "development",
+      transportLayer: "",
+    } as never);
+
+  const unitRun = async (uri: string) => {
+    const r = (await raw.unitTestRun(uri, flags)) as unknown as { "adtcore:name"?: string }[];
+    return r.length;
+  };
+
+  beforeAll(async () => {
+    const base = { ...process.env, ABAP_MCP_READONLY: "false", ABAP_MCP_SYSTEM_ROLE: "dev", ABAP_MCP_ALLOWED_PREFIXES: "Z,Y,$" };
+    s = await startServer({ ...base, ABAP_MCP_ALLOWED_PACKAGES: `${PARENT},${CHILD}` });
+    sParentOnly = await startServer({ ...base, ABAP_MCP_ALLOWED_PACKAGES: PARENT });
+    raw = new ADTClient(s.cfg.sap.url, s.cfg.sap.user, s.cfg.sap.password, s.cfg.sap.client, s.cfg.sap.language);
+    await raw.login();
+    await mkPackage(PARENT, "");
+    await mkPackage(CHILD, PARENT);
+    let r = await s.call("create_object", { object_type: "CLAS/OC", name: CLS, package_name: CHILD, description: "abap-adt-mcp IT R2" });
+    if (r.isError) throw new Error(r.text);
+    r = await s.call("write_source", { object_url: clsUrl, new_source: mainSrc, activate: true });
+    if (r.isError) throw new Error(r.text);
+    r = await s.call("write_source", { object_url: `${clsUrl}/includes/testclasses`, new_source: testSrc, expected_current_source: "", activate: true });
+    if (r.isError) throw new Error(r.text);
+  }, 600_000);
+
+  afterAll(async () => {
+    // 由內而外:class → 子 package → 父 package
+    for (const u of [clsUrl, pkgUrl(CHILD), pkgUrl(PARENT)]) {
+      try {
+        raw.stateful = session_types.stateful;
+        const lock = await raw.lock(u);
+        await raw.deleteObject(u, lock.LOCK_HANDLE);
+      } catch (e) {
+        if (!/does not exist|not found|404/i.test(String(e))) {
+          console.error(`清除暫存物件 ${u} 失敗,請在 Eclipse 手動刪除:${String(e)}`);
+        }
+      } finally {
+        await releaseStateful(raw);
+      }
+    }
+    await logoutClient(raw);
+    await s?.close();
+    await sParentOnly?.close();
+  }, 600_000);
+
+  it("T50 SAP 對 package 遞迴執行子 package 的測試;工具對父 package 要求子 package 也在白名單", async () => {
+    // SAP 行為:父 package 直屬 0 個 class,仍跑得到子 package 的測試
+    expect(await unitRun(pkgUrl(CHILD))).toBeGreaterThanOrEqual(1);
+    expect(await unitRun(pkgUrl(PARENT))).toBeGreaterThanOrEqual(1);
+    // 工具:兩個 package 都在白名單 → 執行
+    const ok = await s.call("run_unit_tests", { package_name: PARENT });
+    expect(ok.isError, ok.text).toBe(false);
+    expect(ok.text).toContain("1 個測試方法,1 通過,0 失敗");
+    // 子 package 不在白名單 → 整批拒絕(否則會透過遞迴跑到白名單外的測試)
+    const denied = await sParentOnly.call("run_unit_tests", { package_name: PARENT });
+    expect(denied.isError, denied.text).toBe(true);
+    expect(denied.text).toContain("白名單");
+  }, 600_000);
+
+  it("T51 變形 package URI:SAP 對 %70ackages、//packages 不執行測試,Packages(大小寫)會執行;工具一律拒絕", async () => {
+    const enc = encodeURIComponent(CHILD.toLowerCase());
+    // SAP 行為(記錄用):前兩種不被當成 package → 0;大小寫不同仍被當成 package → ≥1
+    expect(await unitRun(`/sap/bc/adt/%70ackages/${enc}`)).toBe(0);
+    expect(await unitRun(`/sap/bc/adt//packages/${enc}`)).toBe(0);
+    expect(await unitRun(`/sap/bc/adt/Packages/${enc}`)).toBeGreaterThanOrEqual(1);
+    // 工具:object_url 不接受任何 package 形式的 URI(sParentOnly 的白名單沒有 CHILD,若沒擋下就會是別的錯誤訊息)
+    for (const u of [`/sap/bc/adt/packages/${enc}`, `/sap/bc/adt/Packages/${enc}`, `/sap/bc/adt/%70ackages/${enc}`, `/sap/bc/adt//packages/${enc}`]) {
+      const r = await sParentOnly.call("run_unit_tests", { object_url: u });
+      expect(r.isError, u).toBe(true);
+      expect(r.text, u).toContain("package_name");
+    }
+  }, 600_000);
+
+  it("T52 暫存 package 與 class 建立正確(對照組):class 在子 package、單一 class 可執行", async () => {
+    const r = await s.call("run_unit_tests", { object_url: clsUrl });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("1 個測試方法,1 通過,0 失敗");
+    const pkg = await s.call("browse_package", { package_name: CHILD });
+    expect(pkg.text).toContain(CLS);
+  }, 600_000);
+});
+
+// ───────────────────────────── v0.6 P-B：探針模式 B（debugger 快照，T46–T49）─────────────────────────────
+// 前提:A4H 的 $ZINV 在 ZINV baseline 狀態(ZCL_INV_POSTING 第 176 行在 calc_issue_amt 內,單元測試會經過)。
+// 每個測試只用 DEVELOPER 帳號、逾時 ≤ 60 秒;結束後工具自己刪中斷點、取消監聽、登出。
+describe.skipIf(!RUN_WRITE)("v0.6 探針模式 B（A4H，$ZINV 的 ZCL_INV_POSTING）", () => {
+  const POSTING = "/sap/bc/adt/oo/classes/zcl_inv_posting";
+  const base = { ...process.env, ABAP_MCP_READONLY: "false", ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_PROBE_MODE: "debugger", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV,$TMP" };
+  let s: Awaited<ReturnType<typeof startServer>>;
+  beforeAll(async () => {
+    s = await startServer(base);
+  }, 60_000);
+  afterAll(async () => s?.close());
+
+  const trigger = { tool: "run_unit_tests", object_url: POSTING };
+
+  it("T46 命中中斷點 → 記錄變數 → 自動繼續,單元測試照常跑完", async () => {
+    const r = await s.call("probe_set", { object_url: POSTING, line: 176, fields: ["iv_qty", "iv_stqty", "iv_stval"], max_hits: 2, trigger, timeout_seconds: 60 });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("36 個測試方法,36 通過,0 失敗");
+    expect(r.text).toMatch(/命中 [12]\/2 次/);
+    const id = /(run-\d+)/.exec(r.text)![1];
+    const logs = await s.call("probe_logs", { run_id: id });
+    expect(logs.text).toContain("iv_stqty = 10");
+    expect(logs.text).toContain("iv_stval = 1000");
+    await s.call("probe_delete", { run_id: id });
+  }, 120_000);
+
+  it("T47 max_hits=1:收滿即停止記錄,執行仍正常結束", async () => {
+    const r = await s.call("probe_set", { object_url: POSTING, line: 176, fields: ["iv_qty"], max_hits: 1, trigger, timeout_seconds: 60 });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("命中 1/1 次");
+    expect(r.text).toContain("36 通過");
+  }, 120_000);
+
+  it("T48 沒人觸發 → 逾時;之後立刻再跑一次仍成功(沒有殘留的監聽或中斷點)", async () => {
+    const t = await s.call("probe_set", { object_url: POSTING, line: 176, fields: ["iv_qty"], trigger: { manual: true }, timeout_seconds: 10 });
+    expect(t.isError, t.text).toBe(false);
+    expect(t.text).toContain("逾時");
+    const again = await s.call("probe_set", { object_url: POSTING, line: 176, fields: ["iv_qty"], max_hits: 1, trigger, timeout_seconds: 60 });
+    expect(again.isError, again.text).toBe(false);
+    expect(again.text).toContain("命中 1/1 次");
+  }, 180_000);
+
+  it("T49 scope=custom:SAP 標準物件被拒絕,且不連 debugger", async () => {
+    const c = await startServer({ ...base, ABAP_MCP_PROBE_SCOPE: "custom" });
+    try {
+      const r = await c.call("probe_set", { object_url: STD_CLASS, line: 10, fields: ["x"], trigger: { manual: true }, timeout_seconds: 10 });
+      expect(r.isError, r.text).toBe(true);
+      expect(r.text).toMatch(/custom|自訂|範圍/);
+    } finally {
+      await c.close();
+    }
+  }, 60_000);
+});
+
+// ───────────────────────────── v0.6 P-A：探針模式 A（Dynamic Logpoints，T41–T45）─────────────────────────────
+// 前提同 T46:$ZINV 在 baseline。每個測試結束前確認 SAP 上沒有留下帶 abap-adt-mcp 標記的 logpoint。
+describe.skipIf(!RUN_WRITE)("v0.6 探針模式 A（A4H，Dynamic Logpoints）", () => {
+  const POSTING = "/sap/bc/adt/oo/classes/zcl_inv_posting";
+  const env = { ...process.env, ABAP_MCP_READONLY: "false", ABAP_MCP_ALLOW_PROBES: "true", ABAP_MCP_PROBE_MODE: "dlp", ABAP_MCP_ALLOWED_PACKAGES: "$ZINV,$TMP" };
+  let s: Awaited<ReturnType<typeof startServer>>;
+  beforeAll(async () => {
+    s = await startServer(env);
+  }, 60_000);
+  afterAll(async () => {
+    await s?.call("probe_delete", { all: true }).catch(() => undefined);
+    await s?.close();
+  });
+
+  /** 直接問 SAP:這個帳號底下還有幾個 MCP 建立的 logpoint */
+  async function leftovers(): Promise<number> {
+    const c = createAdtClient(s.cfg);
+    try {
+      await c.login();
+      return (await c.logpoints(s.cfg.sap.user)).filter((l) => (l.definition.description ?? "").startsWith("abap-adt-mcp")).length;
+    } finally {
+      await logoutClient(c, 5000);
+    }
+  }
+  const trigger = { tool: "run_unit_tests", object_url: POSTING };
+  const vars = { object_url: POSTING, line: 176, fields: ["iv_qty", "iv_stqty", "iv_stval"], max_hits: 10 };
+
+  it("T41 trigger=run_unit_tests:logpoint 記到不同的值與次數,讀完自動移除", async () => {
+    const r = await s.call("probe_set", { ...vars, trigger });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("模式 A");
+    expect(r.text).toContain("36 通過");
+    const id = /(run-\d+)/.exec(r.text)![1];
+    const logs = await s.call("probe_logs", { run_id: id });
+    expect(logs.text).toContain("iv_stqty = 10");
+    expect(logs.text).toContain("iv_stval = 1000");
+    expect(logs.text).toMatch(/共執行 \d+ 次/);
+    expect(await leftovers()).toBe(0);
+  }, 180_000);
+
+  it("T42 不給 trigger:logpoint 保持啟用,另外執行後 probe_logs 讀到;probe_delete 後 SAP 上沒有殘留", async () => {
+    const r = await s.call("probe_set", { ...vars, duration_minutes: 5 });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("探針已啟用");
+    expect(await leftovers()).toBe(1);
+    const id = /(run-\d+)/.exec(r.text)![1];
+    const t = await s.call("run_unit_tests", { object_url: POSTING });
+    expect(t.isError, t.text).toBe(false);
+    const logs = await s.call("probe_logs", { run_id: id });
+    expect(logs.text).toContain("iv_stqty = 10");
+    const d = await s.call("probe_delete", { run_id: id });
+    expect(d.isError, d.text).toBe(false);
+    expect(await leftovers()).toBe(0);
+  }, 180_000);
+
+  it("T43 kind=stack:記錄呼叫堆疊", async () => {
+    const r = await s.call("probe_set", { object_url: POSTING, line: 176, kind: "stack", max_hits: 3, trigger });
+    expect(r.isError, r.text).toBe(false);
+    const id = /(run-\d+)/.exec(r.text)![1];
+    const logs = await s.call("probe_logs", { run_id: id });
+    expect(logs.text).toMatch(/命中 [1-9]/);
+    expect(await leftovers()).toBe(0);
+  }, 180_000);
+
+  it("T44 condition:只記條件成立的值", async () => {
+    const r = await s.call("probe_set", { ...vars, condition: "iv_qty = 2", trigger });
+    expect(r.isError, r.text).toBe(false);
+    const id = /(run-\d+)/.exec(r.text)![1];
+    const logs = await s.call("probe_logs", { run_id: id });
+    expect(logs.text).toContain("iv_qty = 2");
+    expect(logs.text).not.toMatch(/iv_qty = 1\s/);
+    expect(await leftovers()).toBe(0);
+  }, 180_000);
+
+  it("T45 probe_delete all 清掉殘留;超過 ABAP_MCP_MAX_PROBES 被拒", async () => {
+    const small = await startServer({ ...env, ABAP_MCP_MAX_PROBES: "1" });
+    try {
+      expect((await small.call("probe_set", vars)).isError).toBe(false);
+      const over = await small.call("probe_set", vars);
+      expect(over.isError).toBe(true);
+      expect(over.text).toContain("上限");
+      expect(await leftovers()).toBe(1);
+      const d = await small.call("probe_delete", { all: true });
+      expect(d.isError, d.text).toBe(false);
+      expect(await leftovers()).toBe(0);
+    } finally {
+      await small.close();
+    }
+  }, 180_000);
 });

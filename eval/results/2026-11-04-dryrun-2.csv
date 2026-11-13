@@ -1,0 +1,11 @@
+﻿task,title,model,passed,turns,seconds,cost_usd,tool_calls,status,timed_out,setup_error
+01,讀懂並解釋 /DMO/ class,dry-run,false,,0,,,dry-run,,
+02,修語法錯誤,dry-run,false,,6,,,dry-run,,
+03,新建 class + ABAP Unit 全綠,dry-run,false,,0,,,dry-run,,
+04,修短傾印,dry-run,false,,12,,,dry-run,,
+05,ATC 變乾淨,dry-run,false,,22,,,dry-run,,
+06,從 Z 表產生 RAP BO,dry-run,false,,8,,,dry-run,,
+07,data_preview 統計問題,dry-run,false,,0,,,dry-run,,
+08,where_used 找呼叫處並改名,dry-run,false,,0,,,dry-run,,"第 08 題事前準備失敗(create_object):❌ SAP 伺服器錯誤(503):Request failed with status code 503 / ERR_BAD_RESPONSE
+💡 建議:若等了數分鐘才出現,多半是 SAP 端處理逾時:例如 where-used 查詢整個標準物件(結果太多,請改查特定方法)、或系統剛啟動後第一次執行 ATC / 啟用 CDS(稍後重試通常就會成功)。其他情況可在 SAP 的 ST22 查看 dump。"
+TOTAL,0/8 passed,dry-run,false,0,48,0.0000,0,,,

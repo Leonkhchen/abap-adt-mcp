@@ -1,0 +1,31 @@
+# 2026-11-07 手動確認(A4H):
+#   check_wh(約第 416 行)已實作「停用倉庫不可過帳」(訊息 003);現有測試只有 unknown_wh_rejected(不存在的倉庫)。
+#   測試替身 ltd_db 的 mt_wh 只有 W1、W2(都啟用),所以要補一個停用倉庫才測得到。
+#   基準 36 個測試;完成後至少 37 個。
+id: "zinv-04"
+title: 為停用倉庫規則補單元測試
+tags: [zinv, legacy]
+# 會動共用的 ZINV 物件,所以預設不跑;要用 --tags zinv(或 --tasks)明確選到才跑。作答前讀出、作答後(不論成敗)寫回並比對,
+# 再跑 ZCL_INV_POSTING 基準單元測試 36/36;任何一步失敗就中止整個評測。
+opt_in: true
+allowed_packages: ["$ZINV"]
+timeout_min: 25
+budget_usd: 1.5
+tool_timeout_sec: 180
+restore:
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+  - /sap/bc/adt/oo/classes/zcl_inv_posting/includes/testclasses
+restore_verify: { object_url: /sap/bc/adt/oo/classes/zcl_inv_posting, passed: 36 }
+prompt: |
+  ZINV 系統的 ZCL_INV_POSTING 有一條業務規則:停用的倉庫不可以過帳(程式已實作)。
+  但現有 36 個單元測試只測了「不存在的倉庫」,沒有測「存在但已停用的倉庫」。
+  請在測試 include 補上這個測試(測試用的資料替身裡沒有停用的倉庫,需要自己加),並讓全部測試通過。
+  不要修改 ZCL_INV_POSTING 的主程式。
+setup: []
+checks:
+  - kind: unit_tests
+    object_url: /sap/bc/adt/oo/classes/zcl_inv_posting
+    min_passed: 37
+  - kind: unchanged
+    object_url: /sap/bc/adt/oo/classes/zcl_inv_posting/source/main
+cleanup: []

@@ -18,7 +18,7 @@ import {
   objectNameFromUrl,
   GuardViolationError,
 } from "../../src/safety/guards.js";
-import { lockedWrite, ConcurrentModificationError } from "../../src/workflows/lockedWrite.js";
+import { lockedWrite, ConcurrentModificationError, clearKnownTemplates } from "../../src/workflows/lockedWrite.js";
 import { translateAdtError, AuthCircuitOpenError } from "../../src/adt/errors.js";
 import { diffSummary } from "../../src/safety/audit.js";
 import * as https from "node:https";
@@ -148,6 +148,8 @@ function fakeAdtClient(overrides: Record<string, unknown> = {}) {
     searchObject: vi.fn(async () => []),
     lock: vi.fn(async () => ({ LOCK_HANDLE: "LH-1" })),
     unLock: vi.fn(async () => {}),
+    dropSession: vi.fn(async () => {}),
+    logout: vi.fn(async () => {}),
     ...overrides,
   };
   return fake;
@@ -204,7 +206,7 @@ describe("ping", () => {
   it("ping_system 顯示版本,且版本取自 package.json(E2;v0.3 起為 0.3.0)", async () => {
     const pkg = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8"));
     expect(VERSION).toBe(pkg.version);
-    expect(VERSION).toBe("0.5.1");
+    expect(VERSION).toBe("0.6.0");
     const call = await connectTools(mockAdt());
     const r = await call("ping_system");
     expect(r.text).toContain(`版本:${VERSION}`);
@@ -2091,6 +2093,20 @@ describe("S1 AdtService 層:任何 request 之前就拒絕", () => {
     }
   });
 
+  it("C0-4:dumpDetail 與 DDIC 屬性方法也在送出前拒絕(含編碼的路徑穿越)", async () => {
+    const fake = fakeAdtClient({ getDataElementProperties: vi.fn(), getDomainProperties: vi.fn() });
+    const adt = realAdt(fake);
+    await expect(adt.dumpDetail("/sap/bc/adt/runtime/dump/%2e%2e/%2e%2e/oo/classes/zx")).rejects.toThrow(GuardViolationError);
+    await expect(adt.dumpDetail("/sap/bc/adt/runtime/dump/a%2f%2e%2e%2fb")).rejects.toThrow(GuardViolationError);
+    for (const bad of ["https://outside.example.invalid/x", "/sap/bc/adt/ddic/dataelements/%2e%2e/x", "//outside.example.invalid/x"]) {
+      await expect(adt.dataElementProperties(bad)).rejects.toThrow(GuardViolationError);
+      await expect(adt.domainProperties(bad)).rejects.toThrow(GuardViolationError);
+    }
+    expect(fake.httpClient.request).not.toHaveBeenCalled();
+    expect(fake.getDataElementProperties).not.toHaveBeenCalled();
+    expect(fake.getDomainProperties).not.toHaveBeenCalled();
+  });
+
   it("正常同系統 ADT URI 可通過並取得 package", async () => {
     const fake = fakeAdtClient();
     fake.httpClient.request.mockResolvedValueOnce({ status: 200, body: '<x><adtcore:packageRef adtcore:name="$TMP"/></x>' } as never);
@@ -2336,20 +2352,71 @@ describe("C2 新建測試 include + expected_current_source 為空字串", () =>
 
 // ───────────────────────── v0.5.1 獨立審查(claude -p)P2 修正 ─────────────────────────
 
-describe("review P2-3 include 已存在(僅範本)+ expected 空字串(語法錯誤後重試)", () => {
+describe("review P2-3 / C0-1 include 已存在(僅範本)+ expected 空字串(語法錯誤後重試)", () => {
   const INC = "/sap/bc/adt/oo/classes/zcl_x/includes/testclasses";
-  it("目前只有範本註解 → 視為空基準、成功寫入", async () => {
+  const TEMPLATE = "* SAP test include template";
+  const SYNTAX_ERR = [{ severity: "E", line: 1, text: "boom", offset: 0, uri: "" }] as never;
+
+  /** include 先不存在;createTestInclude 之後內容是 content(可被測試改動) */
+  function stateful() {
+    const st = { created: false, content: TEMPLATE };
+    const read = vi.fn(async () => {
+      if (!st.created) throw Object.assign(new Error("ZCL_X does not have any inactive version"), { status: 404 });
+      return st.content;
+    });
+    return {
+      st,
+      read,
+      overrides: {
+        getObjectSource: read,
+        getSourceInLock: vi.fn(async () => read()),
+        createTestInclude: vi.fn(async () => { st.created = true; }),
+        setObjectSource: vi.fn(async (_u: string, src: string) => { st.content = src; }),
+      },
+    };
+  }
+
+  it("真實流程:第一次語法錯誤(include 已建立)→ 第二次用 \"\" 重試成功", async () => {
+    clearKnownTemplates();
+    const { overrides } = stateful();
+    const adt = mockAdt({ ...overrides, syntaxCheck: vi.fn().mockResolvedValueOnce(SYNTAX_ERR).mockResolvedValue([]) });
+    const call = await connectTools(adt);
+    const first = await call("write_source", { object_url: INC, new_source: "bad", expected_current_source: "" });
+    expect(first.text).toContain("語法錯誤");
+    expect(adt.createTestInclude).toHaveBeenCalledTimes(1);
+    const second = await call("write_source", { object_url: INC, new_source: "CLASS ltc DEFINITION. ENDCLASS.", expected_current_source: "" });
+    expect(second.isError).toBe(false);
+    expect(adt.createTestInclude).toHaveBeenCalledTimes(1);
+    expect(adt.setObjectSource).toHaveBeenCalledTimes(1);
+  });
+
+  it("N3:include 已存在、只含註解,但不是本工具建立的(沒有記錄)→ 視為衝突、不寫入", async () => {
+    clearKnownTemplates();
     const adt = mockAdt({
       getObjectSource: vi.fn(async () => "* SAP test include template\n\n"),
       getSourceInLock: vi.fn(async () => "* SAP test include template\n\n"),
     });
     const call = await connectTools(adt);
-    const r = await call("write_source", { object_url: INC, new_source: "CLASS ltc DEFINITION. ENDCLASS.", expected_current_source: "" });
-    expect(r.isError).toBe(false);
+    const r = await call("write_source", { object_url: INC, new_source: "x", expected_current_source: "" });
+    expect(r.isError).toBe(true);
     expect(adt.createTestInclude).not.toHaveBeenCalled();
-    expect(adt.setObjectSource).toHaveBeenCalledTimes(1);
+    expect(adt.setObjectSource).not.toHaveBeenCalled();
   });
+
+  it("N3:本工具建立後,別人把內容改成另一段註解 → 與記錄不同,視為衝突", async () => {
+    clearKnownTemplates();
+    const { st, overrides } = stateful();
+    const adt = mockAdt({ ...overrides, syntaxCheck: vi.fn().mockResolvedValueOnce(SYNTAX_ERR).mockResolvedValue([]) });
+    const call = await connectTools(adt);
+    await call("write_source", { object_url: INC, new_source: "bad", expected_current_source: "" });
+    st.content = "* someone else's notes";
+    const r = await call("write_source", { object_url: INC, new_source: "x", expected_current_source: "" });
+    expect(r.isError).toBe(true);
+    expect(adt.setObjectSource).not.toHaveBeenCalled();
+  });
+
   it("目前已有實際程式碼 → 仍視為衝突、不寫入", async () => {
+    clearKnownTemplates();
     const adt = mockAdt({
       getObjectSource: vi.fn(async () => "CLASS ltc DEFINITION. ENDCLASS."),
       getSourceInLock: vi.fn(async () => "CLASS ltc DEFINITION. ENDCLASS."),
@@ -2358,6 +2425,59 @@ describe("review P2-3 include 已存在(僅範本)+ expected 空字串(語法錯
     const r = await call("write_source", { object_url: INC, new_source: "x", expected_current_source: "" });
     expect(r.isError).toBe(true);
     expect(adt.setObjectSource).not.toHaveBeenCalled();
+  });
+
+  it("N2:範本在解鎖之前、同一個鎖定 session 內讀取", async () => {
+    clearKnownTemplates();
+    const { overrides } = stateful();
+    const adt = mockAdt(overrides);
+    const call = await connectTools(adt);
+    await call("write_source", { object_url: INC, new_source: "CLASS ltc DEFINITION. ENDCLASS.", expected_current_source: "" });
+    const create = (adt.createTestInclude as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    const inLock = (adt.getSourceInLock as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    const unlock = (adt.unLock as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    expect(create).toBeLessThan(inLock);
+    expect(inLock).toBeLessThan(unlock);
+  });
+
+  it("N2:建立與讀取之間被別人寫入實際程式碼 → 中止、不當基準、已解鎖", async () => {
+    clearKnownTemplates();
+    const { st, overrides } = stateful();
+    const adt = mockAdt({
+      ...overrides,
+      createTestInclude: vi.fn(async () => { st.created = true; st.content = "CLASS other DEFINITION. ENDCLASS."; }),
+    });
+    const call = await connectTools(adt);
+    const r = await call("write_source", { object_url: INC, new_source: "x", expected_current_source: "" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("不一致");
+    expect(adt.setObjectSource).not.toHaveBeenCalled();
+    expect(adt.unLock).toHaveBeenCalled();
+  });
+
+  it("C0-2/N4:建立成功後讀取範本失敗 → create_test_include 的 audit 仍有紀錄", async () => {
+    clearKnownTemplates();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "abap-mcp-n4-"));
+    const auditPath = path.join(dir, "audit.jsonl");
+    try {
+      const { overrides } = stateful();
+      const adt = mockAdt({ ...overrides, getSourceInLock: vi.fn(async () => { throw new Error("read boom"); }) });
+      const server = new McpServer({ name: "unit", version: "0" });
+      registerTools(server, adt, makeConfig(), new AuditLogger(auditPath));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "c", version: "0" });
+      await client.connect(clientT);
+      const r = (await client.callTool({ name: "write_source", arguments: { object_url: INC, new_source: "x", expected_current_source: "" } })) as { isError?: boolean };
+      expect(r.isError).toBe(true);
+      expect(adt.createTestInclude).toHaveBeenCalledTimes(1);
+      expect(adt.unLock).toHaveBeenCalled();
+      const entries = fs.readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(entries.some((e) => e.action === "create_test_include" && e.success)).toBe(true);
+      expect(entries.some((e) => e.action === "write_source" && e.success === false && String(e.error).includes("read boom"))).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -2410,5 +2530,193 @@ describe("review P2-1/P2-2/P2-4", () => {
 
   it("P2-4 objectNameFromUrl 忽略 #fragment", () => {
     expect(objectNameFromUrl("/sap/bc/adt/oo/classes/cl_std#/zsafe_x")).toBe("CL_STD");
+  });
+});
+
+// ───────────────────────── v0.6 C0-10:ADT 工作階段收尾(stateful 流程與 client 生命週期)─────────────────────────
+
+import { releaseStateful, logoutClient } from "../../src/adt/session.js";
+import { installShutdown } from "../../src/lifecycle.js";
+
+describe("C0-10 stateful 流程結束一定通知 SAP 結束 session(dropSession)", () => {
+  const OBJ = "/sap/bc/adt/oo/classes/zcl_x";
+  const SRC = `${OBJ}/source/main`;
+
+  /** 假 client:記錄 dropSession 被呼叫時 sap-contextid 還在不在(必須先通知 SAP,再丟 cookie) */
+  function statefulFake(overrides: Record<string, unknown> = {}) {
+    const cookie = new Map([["SAP_SESSIONID_A4H_001", "s"], ["sap-contextid", "c"]]);
+    const seen: { contextAtDrop: boolean[] } = { contextAtDrop: [] };
+    const fake = fakeAdtClient({
+      httpClient: { request: vi.fn(async () => ({ status: 200 })), cookie },
+      dropSession: vi.fn(async () => {
+        seen.contextAtDrop.push(cookie.has("sap-contextid"));
+      }),
+      getObjectSource: vi.fn(async () => "old"),
+      setObjectSource: vi.fn(async () => {}),
+      ...overrides,
+    });
+    return { fake, cookie, seen };
+  }
+
+  it("lock → unLock 成功:dropSession 恰好 1 次、已回 stateless、sap-contextid 已丟;dropSession 時 context 還在", async () => {
+    const { fake, cookie, seen } = statefulFake();
+    const adt = realAdt(fake);
+    const l = await adt.lock(OBJ);
+    expect(fake.stateful).toBe(session_types.stateful);
+    await adt.unLock(OBJ, l.LOCK_HANDLE);
+    expect(fake.dropSession).toHaveBeenCalledTimes(1);
+    expect(seen.contextAtDrop).toEqual([true]);
+    expect(fake.stateful).toBe(session_types.stateless);
+    expect(cookie.has("sap-contextid")).toBe(false);
+    expect(cookie.has("SAP_SESSIONID_A4H_001")).toBe(true);
+  });
+
+  it("unLock 失敗:仍然 dropSession,且原本的錯誤照丟", async () => {
+    const { fake, cookie } = statefulFake({ unLock: vi.fn(async () => { throw new Error("unlock boom"); }) });
+    const adt = realAdt(fake);
+    const l = await adt.lock(OBJ);
+    await expect(adt.unLock(OBJ, l.LOCK_HANDLE)).rejects.toThrow("unlock boom");
+    expect(fake.dropSession).toHaveBeenCalledTimes(1);
+    expect(fake.stateful).toBe(session_types.stateless);
+    expect(cookie.has("sap-contextid")).toBe(false);
+  });
+
+  it("lock 失敗:仍然 dropSession(不能停在 stateful),錯誤照丟", async () => {
+    const { fake } = statefulFake({ lock: vi.fn(async () => { throw new Error("locked by OTHER"); }) });
+    const adt = realAdt(fake);
+    await expect(adt.lock(OBJ)).rejects.toThrow("locked by OTHER");
+    expect(fake.dropSession).toHaveBeenCalledTimes(1);
+    expect(fake.stateful).toBe(session_types.stateless);
+  });
+
+  it("dropSession 本身失敗(SAP 端 context 已結束,回 400)→ 不丟例外、cookie 仍被清掉", async () => {
+    const { fake, cookie } = statefulFake({ dropSession: vi.fn(async () => { throw new Error("Request failed with status code 400"); }) });
+    const adt = realAdt(fake);
+    const l = await adt.lock(OBJ);
+    await expect(adt.unLock(OBJ, l.LOCK_HANDLE)).resolves.toBeUndefined();
+    expect(fake.stateful).toBe(session_types.stateless);
+    expect(cookie.has("sap-contextid")).toBe(false);
+  });
+
+  it("lockedWrite 成功路徑:一次寫入 → 一次 dropSession", async () => {
+    const { fake } = statefulFake();
+    await lockedWrite(realAdt(fake), { objectUrl: OBJ, sourceUrl: SRC, newSource: "new" });
+    expect(fake.lock).toHaveBeenCalledTimes(1);
+    expect(fake.unLock).toHaveBeenCalledTimes(1);
+    expect(fake.dropSession).toHaveBeenCalledTimes(1);
+    expect(fake.stateful).toBe(session_types.stateless);
+  });
+
+  it("lockedWrite 失敗路徑(寫入丟例外):仍 unLock + dropSession 各 1 次", async () => {
+    const { fake } = statefulFake({ setObjectSource: vi.fn(async () => { throw new Error("write boom"); }) });
+    await expect(lockedWrite(realAdt(fake), { objectUrl: OBJ, sourceUrl: SRC, newSource: "new" })).rejects.toThrow("write boom");
+    expect(fake.unLock).toHaveBeenCalledTimes(1);
+    expect(fake.dropSession).toHaveBeenCalledTimes(1);
+    expect(fake.stateful).toBe(session_types.stateless);
+  });
+
+  it("lockedWrite 並行衝突(鎖定前就中止):沒有鎖定也不需要收尾,不多送請求", async () => {
+    const { fake } = statefulFake({ getObjectSource: vi.fn(async () => "someone else") });
+    await expect(
+      lockedWrite(realAdt(fake), { objectUrl: OBJ, sourceUrl: SRC, newSource: "new", expectedCurrentSource: "mine" })
+    ).rejects.toBeInstanceOf(ConcurrentModificationError);
+    expect(fake.lock).not.toHaveBeenCalled();
+    expect(fake.dropSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("C0-10 releaseStateful / logoutClient", () => {
+  it("dropSession 卡住時不會卡住收尾(逾時後照樣回 stateless、丟 cookie)", async () => {
+    const cookie = new Map([["sap-contextid", "c"]]);
+    const fake = fakeAdtClient({ httpClient: { cookie }, dropSession: vi.fn(() => new Promise(() => {})) });
+    fake.stateful = session_types.stateful;
+    await releaseStateful(fake as unknown as ADTClient, 20);
+    expect(fake.stateful).toBe(session_types.stateless);
+    expect(cookie.size).toBe(0);
+  });
+
+  it("logoutClient:已登入才登出;沒登入不送請求;登出失敗或卡住都不丟例外", async () => {
+    const a = fakeAdtClient();
+    await logoutClient(a as unknown as ADTClient);
+    expect(a.logout).toHaveBeenCalledTimes(1);
+
+    const b = fakeAdtClient({ loggedin: false });
+    await logoutClient(b as unknown as ADTClient);
+    expect(b.logout).not.toHaveBeenCalled();
+
+    const c = fakeAdtClient({ logout: vi.fn(async () => { throw new Error("boom"); }) });
+    await expect(logoutClient(c as unknown as ADTClient)).resolves.toBeUndefined();
+
+    const d = fakeAdtClient({ logout: vi.fn(() => new Promise(() => {})) });
+    await expect(logoutClient(d as unknown as ADTClient, 20)).resolves.toBeUndefined();
+  });
+});
+
+describe("C0-10 RealAdtService.close()", () => {
+  it("client 與 lockClient 各登出一次;重複呼叫不再送請求", async () => {
+    const a = fakeAdtClient();
+    const b = fakeAdtClient();
+    const adt = new RealAdtService(makeConfig(), a as unknown as ADTClient, b as unknown as ADTClient);
+    await adt.close();
+    await adt.close();
+    expect(a.logout).toHaveBeenCalledTimes(1);
+    expect(b.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it("兩個是同一個 client 時只登出一次", async () => {
+    const a = fakeAdtClient();
+    const adt = new RealAdtService(makeConfig(), a as unknown as ADTClient);
+    await adt.close();
+    expect(a.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it("其中一個登出失敗 → 另一個仍登出,close 不丟例外", async () => {
+    const a = fakeAdtClient({ logout: vi.fn(async () => { throw new Error("boom"); }) });
+    const b = fakeAdtClient();
+    const adt = new RealAdtService(makeConfig(), a as unknown as ADTClient, b as unknown as ADTClient);
+    await expect(adt.close()).resolves.toBeUndefined();
+    expect(b.logout).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("C0-10 MCP server 結束時登出(installShutdown)", () => {
+  function setup(close: () => Promise<void>, timeoutMs = 50) {
+    const handlers: Record<string, () => void> = {};
+    const reg = (prefix: string) => ({ on: (ev: string, fn: () => void) => { handlers[`${prefix}:${ev}`] = fn; } });
+    const exit = vi.fn();
+    const adt = { close: vi.fn(close) };
+    const run = installShutdown(adt, { signals: reg("sig"), stdin: reg("stdin"), exit, log: () => {}, timeoutMs });
+    return { handlers, exit, adt, run };
+  }
+
+  it.each([["sig:SIGINT"], ["sig:SIGTERM"], ["stdin:end"], ["stdin:close"]])("%s → close 一次、exit(0)", async (key) => {
+    const { handlers, exit, adt, run } = setup(async () => {});
+    handlers[key]();
+    await run("again");
+    expect(adt.close).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  it("stdin 關閉又收到 SIGTERM:只登出一次、只 exit 一次", async () => {
+    const { handlers, exit, adt, run } = setup(async () => {});
+    handlers["stdin:end"]();
+    handlers["sig:SIGTERM"]();
+    await run("again");
+    expect(adt.close).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledTimes(1);
+  });
+
+  it("登出卡住 → 逾時後仍然結束 process", async () => {
+    const { handlers, exit, run } = setup(() => new Promise(() => {}), 20);
+    handlers["sig:SIGINT"]();
+    await run("again");
+    expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  it("登出丟例外 → 仍然結束 process", async () => {
+    const { handlers, exit, run } = setup(async () => { throw new Error("boom"); });
+    handlers["sig:SIGTERM"]();
+    await run("again");
+    expect(exit).toHaveBeenCalledWith(0);
   });
 });

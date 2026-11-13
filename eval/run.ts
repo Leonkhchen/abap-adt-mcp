@@ -15,7 +15,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 import { createHarness, evalEnv } from "./lib/harness.js";
-import { loadTasks, type EvalTask } from "./lib/tasks.js";
+import { checkToolOrder, loadTasks, selectTasks, type EvalTask } from "./lib/tasks.js";
 import { USAGE, parseArgs } from "./lib/args.js";
 import { ADAPTERS, parseModelSpecs, type ModelSpec } from "./lib/adapters.js";
 import { writeReports, type TaskResult } from "./lib/report.js";
@@ -28,19 +28,21 @@ interface RunOpts {
   budget: number;
   logDir: string;
   suffix: string;
+  probes: boolean;
 }
 
 async function runTask(task: EvalTask, spec: ModelSpec, opts: RunOpts): Promise<TaskResult> {
-  const h = await createHarness(evalEnv());
+  const h = await createHarness(evalEnv(process.env, task, opts.probes));
   const result: TaskResult = { task: task.id, title: task.title, model: opts.dryRun ? "dry-run" : spec.label, passed: false, details: [], cleanup: [], suffix: opts.suffix };
   try {
     try {
-      await h.setup(task);
+      await h.setup(task, { restoreDir: path.join(opts.logDir, "restore") });
     } catch (e) {
       result.setupError = e instanceof Error ? e.message : String(e);
       return result;
     }
     let answer = "";
+    let orderProblem = false;
     if (!opts.dryRun) {
       const run = await ADAPTERS[spec.adapter].run({
         prompt: task.prompt,
@@ -53,27 +55,42 @@ async function runTask(task: EvalTask, spec: ModelSpec, opts: RunOpts): Promise<
           ABAP_MCP_SYSTEM_ROLE: "dev",
           ABAP_MCP_READONLY: "false",
           ABAP_MCP_ALLOW_DATA_PREVIEW: "true",
+          ABAP_MCP_ALLOW_PROBES: h.cfg.safety.probes.enabled ? "true" : "false",
           ABAP_MCP_ALLOWED_PREFIXES: h.cfg.safety.allowedPrefixes.join(","),
           ABAP_MCP_ALLOWED_PACKAGES: h.cfg.safety.allowedPackages.join(","),
           ABAP_MCP_AUDIT_LOG: "",
         },
         password: h.cfg.sap.password,
         repoDir: REPO,
-        timeoutMs: opts.timeoutMs,
-        budgetUsd: opts.budget,
+        timeoutMs: task.timeoutMin ? task.timeoutMin * 60_000 : opts.timeoutMs,
+        budgetUsd: task.budgetUsd ?? opts.budget,
+        toolTimeoutSec: task.toolTimeoutSec,
         logFile: path.join(opts.logDir, `${task.id}-${spec.label.replace(/[^A-Za-z0-9._-]/g, "_")}.jsonl`),
       });
       answer = run.answer;
       const { answer: _a, ...rest } = run;
       result.run = { ...rest, answerPreview: run.answer.slice(0, 500) };
+      if (task.requireToolOrder) {
+        const p = checkToolOrder(run.toolOrder, task.requireToolOrder);
+        if (p) {
+          result.details.push(p);
+          orderProblem = true;
+        }
+      }
       if (run.timedOut) result.details.push(`逾時(${Math.round(opts.timeoutMs / 60_000)} 分鐘)`);
     }
     const c = await h.check(task, answer);
-    result.passed = c.passed && !result.run?.timedOut;
+    result.passed = c.passed && !result.run?.timedOut && !orderProblem;
     result.details.push(...c.details);
     return result;
   } finally {
     result.cleanup = await h.cleanup(task).catch((e) => [`❌ 清除時出錯:${String(e)}`]);
+    // 共用物件還原(不論成敗、不經模型、不計費用);失敗代表基準可能壞了,由呼叫端中止整個評測
+    const restoreProblems = await h.restore(task).catch((e) => [`還原時出錯:${e instanceof Error ? e.message : String(e)}`]);
+    if (restoreProblems.length > 0) {
+      result.baselineBroken = restoreProblems.join(";");
+      result.cleanup.push(`❌ 還原失敗:${result.baselineBroken}`);
+    }
     await h.close();
   }
 }
@@ -100,6 +117,7 @@ async function main() {
   const dryRun = parsed.flags.has("dry-run");
   if (dryRun) specs = specs.slice(0, 1); // dry-run 不呼叫模型,只跑一輪
   const ids = v.get("tasks")?.split(",").map((s) => s.trim()).filter(Boolean);
+  const tags = v.get("tags")?.split(",").map((s) => s.trim()).filter(Boolean);
   const timeoutMs = Number(v.get("timeout-min") ?? "20") * 60_000;
   const budget = Number(v.get("budget") ?? "3");
   const outDir = path.resolve(v.get("out") ?? path.join(REPO, "eval", "results"));
@@ -110,22 +128,30 @@ async function main() {
   const logDir = path.join(outDir, "logs", stamp);
   fs.mkdirSync(logDir, { recursive: true });
   const taskDir = path.join(REPO, "eval", "tasks");
-  const tasks = loadTasks(taskDir, "XXXXXX", ids);
+  const tasks = selectTasks(loadTasks(taskDir, "XXXXXX", ids, tags), { explicit: !!(ids?.length || tags?.length) });
+  if (tasks.length === 0) throw new Error("沒有符合的題目(--tasks / --tags 都沒選到;需明確選取的題組要加 --tags)");
   const results: TaskResult[] = [];
+  let aborted = false;
   for (const spec of specs) {
     for (const t of tasks) {
+      if (aborted) break;
       // 每題重新載入、換一組名稱尾碼,避免與上一題或上一次殘留衝突
       const suffix = randomBytes(3).toString("hex").toUpperCase();
       const task = loadTasks(taskDir, suffix, [t.id])[0];
       const t0 = Date.now();
       console.log(`▶ ${task.id} ${task.title}(${dryRun ? "dry-run" : spec.label},尾碼 ${suffix})`);
-      const r = await runTask(task, spec, { dryRun, timeoutMs, budget, logDir, suffix });
+      const r = await runTask(task, spec, { dryRun, timeoutMs, budget, logDir, suffix, probes: parsed.flags.has("probes") });
       r.wallSeconds = Math.round((Date.now() - t0) / 1000);
       results.push(r);
       const cost = r.run ? ` $${r.run.costUsd.toFixed(4)}、${r.run.turns} 回合、${r.run.toolCalls} 次工具` : "";
       console.log(`  ${r.setupError ? "⚠️ 準備失敗" : r.passed ? "✅ 成功" : "❌ 失敗"}(${r.wallSeconds} 秒${cost})`);
       for (const d of [r.setupError, ...r.details].filter(Boolean)) console.log(`    - ${d}`);
       for (const c of r.cleanup.filter((x) => x.startsWith("❌"))) console.log(`    ${c}`);
+      if (r.baselineBroken) {
+        console.error(`\n⛔ 共用物件還原失敗,中止整個評測:${r.baselineBroken}\n   ZINV 基準可能已損壞,請用 baseline zip 還原(見 eval/README)。`);
+        aborted = true;
+        process.exitCode = 3;
+      }
     }
   }
   const files = writeReports(outDir, { startedAt, stamp, dryRun, models: dryRun ? ["dry-run"] : specs.map((s) => s.label), results });
